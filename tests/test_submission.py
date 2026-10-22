@@ -72,3 +72,67 @@ def test_missing_class_filled_with_most_common(tmp_path, sample_clf):
 def test_validate_catches_format_errors(broken, expected):
     problems = validate_submission(broken, IDS, ["id", "y"])
     assert any(expected in p for p in problems)
+
+
+# ---------- Форматы скрытых задач ----------
+
+def write_sample(tmp_path, frame, name="sample.csv"):
+    path = tmp_path / name
+    frame.to_csv(path, index=False)
+    return path
+
+
+def test_probabilities_written_and_rounding_clipped(tmp_path):
+    sample = write_sample(tmp_path, pd.DataFrame({"id": IDS, "default": 0.5}))
+    out = tmp_path / "submission.csv"
+    assert make_submission([0.1, 1 + 1e-9, -1e-9, 0.7], IDS, sample, out, probabilities=True) == []
+    assert pd.read_csv(out)["default"].between(0, 1).all()
+
+
+def test_labels_instead_of_probabilities_rejected(tmp_path):
+    sample = write_sample(tmp_path, pd.DataFrame({"id": IDS, "default": 0.5}))
+    out = tmp_path / "submission.csv"
+    problems = make_submission([0, 1, 3, 1], IDS, sample, out, probabilities=True)
+    assert any("вне [0, 1]" in p for p in problems) and not out.exists()
+
+
+def test_class_probabilities_from_array_with_class_order(tmp_path):
+    sample = write_sample(tmp_path, pd.DataFrame({"id": IDS, "cat": 0.0, "dog": 0.0, "fox": 0.0}))
+    out = tmp_path / "submission.csv"
+    proba = np.array([[0.7, 0.2, 0.1]] * 4)  # столбцы в порядке dog, cat, fox
+    assert make_submission(proba, IDS, sample, out, class_order=["dog", "cat", "fox"]) == []
+    written = pd.read_csv(out)
+    assert list(written.columns) == ["id", "cat", "dog", "fox"]
+    assert written.loc[0, "dog"] == 0.7 and written.loc[0, "cat"] == 0.2
+
+
+def test_class_probabilities_from_dataframe_renormalized(tmp_path):
+    sample = write_sample(tmp_path, pd.DataFrame({"id": IDS, "A": 0.0, "B": 0.0}))
+    out = tmp_path / "submission.csv"
+    proba = pd.DataFrame({"B": [0.5, 0.3, 0.6, 0.1], "A": [0.501, 0.7, 0.4, 0.9]})
+    assert make_submission(proba, IDS, sample, out) == []
+    sums = pd.read_csv(out)[["A", "B"]].sum(axis=1)
+    assert np.allclose(sums, 1)
+
+
+def test_class_probabilities_bad_sum_rejected(tmp_path):
+    sample = write_sample(tmp_path, pd.DataFrame({"id": IDS, "A": 0.0, "B": 0.0}))
+    problems = make_submission(np.full((4, 2), 0.9), IDS, sample, tmp_path / "submission.csv")
+    assert any("сумма" in p for p in problems)
+
+
+def test_integer_labels_from_floats_and_bools(tmp_path):
+    sample = write_sample(tmp_path, pd.DataFrame({"id": IDS, "label": 0}))
+    out = tmp_path / "submission.csv"
+    assert make_submission(np.array([1.0, 0.0, 1.0, 1.0]), IDS, sample, out, allowed_labels={0, 1}) == []
+    assert pd.read_csv(out)["label"].tolist() == [1, 0, 1, 1]
+    assert make_submission(np.array([True, False, False, True]), IDS, sample, out, allowed_labels={0, 1}) == []
+    assert pd.read_csv(out)["label"].tolist() == [1, 0, 0, 1]
+
+
+def test_id_column_found_by_name_not_position(tmp_path):
+    sample = write_sample(tmp_path, pd.DataFrame({"price": 0.0, "row_id": IDS}))
+    out = tmp_path / "submission.csv"
+    assert make_submission([1.0, 2.0, 3.0, 4.0], IDS.rename("row_id"), sample, out) == []
+    written = pd.read_csv(out)
+    assert list(written.columns) == ["price", "row_id"] and written["row_id"].tolist() == IDS.tolist()
