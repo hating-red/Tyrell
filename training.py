@@ -112,7 +112,10 @@ def _pr_auc(y_true, proba):
 
 
 def _logloss(y_true, proba):
-    return float(log_loss(y_true, proba, labels=np.arange(proba.shape[1])))
+    # Быстрее sklearn, результат тот же: нормировка строк и клиппинг на машинный eps
+    eps = np.finfo(proba.dtype).eps
+    p = proba[np.arange(len(y_true)), y_true] / proba.sum(1)
+    return float(-np.mean(np.log(np.clip(p, eps, 1 - eps))))
 
 
 def _rmse(y_true, y_pred):
@@ -198,7 +201,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "params": {},                 # переопределение гиперпараметров модели
     "features": None,             # список признаков, None - все колонки
     "n_folds": 5,
-    "seed": 42,
+    "seed": 42,                   # сид модели
+    "fold_seed": None,            # сид разбиения на фолды, None - равен seed
+    "clip_target": True,          # регрессия: клиппинг предсказаний в диапазон таргета train
     "num_boost_round": 3000,
     "early_stopping_rounds": 100,
     "log_target": None,           # log1p таргета в регрессии, None - авто (только для rmsle)
@@ -226,6 +231,8 @@ def _resolve_config(config: dict | None) -> dict:
     cfg["model"] = str(cfg["model"]).strip().lower()
     if cfg["n_jobs"] is None:
         cfg["n_jobs"] = min(8, os.cpu_count() or 1)
+    if cfg["fold_seed"] is None:
+        cfg["fold_seed"] = cfg["seed"]
     return cfg
 
 
@@ -454,12 +461,16 @@ _BACKENDS = {"lightgbm": _fit_lightgbm, "xgboost": _fit_xgboost, "catboost": _fi
 _WEIGHT_GRID = np.exp(np.linspace(-3, 3, 41))
 
 
-def fit_class_weights(proba: np.ndarray, y: np.ndarray, metric: Metric,
-                      n_passes: int = 3) -> tuple[np.ndarray, float]:
+def fit_class_weights(proba: np.ndarray, y: np.ndarray, metric: Metric, n_passes: int = 3,
+                      max_rows: int = 200_000) -> tuple[np.ndarray, float]:
     """Покоординатный поиск множителей классов: pred = argmax(proba * w).
 
-    Для бинарной задачи это эквивалент подбора порога.
+    Для бинарной задачи это эквивалент подбора порога. На больших данных поиск идет
+    по случайной подвыборке из max_rows строк, чтобы время не росло с размером.
     """
+    if len(y) > max_rows:
+        idx = np.random.default_rng(0).choice(len(y), max_rows, replace=False)
+        proba, y = proba[idx], y[idx]
     n, k = proba.shape
     rows = np.arange(n)
     w = np.ones(k)
@@ -484,6 +495,34 @@ def fit_class_weights(proba: np.ndarray, y: np.ndarray, metric: Metric,
 
 def _apply_weights(proba: np.ndarray, w: np.ndarray) -> np.ndarray:
     return (proba * w).argmax(1)
+
+
+def _cross_fit_class_weights(oof: np.ndarray, y_enc: np.ndarray, folds: list, metric: Metric,
+                             score_raw: float) -> tuple[np.ndarray, list | None, dict]:
+    """Честная оценка весов классов: для каждого фолда веса подбираются на остальных.
+
+    folds - только выполненные фолды. Финальные веса подбираются на всех OOF.
+    Если веса не улучшают скор, возвращаются единичные веса и None вместо скоров.
+    """
+    done_mask = np.zeros(len(y_enc), dtype=bool)
+    for _, va_idx in folds:
+        done_mask[va_idx] = True
+    cross_scores = []
+    for _, va_idx in folds:
+        fit_mask = done_mask.copy()
+        fit_mask[va_idx] = False
+        w, _ = fit_class_weights(oof[fit_mask], y_enc[fit_mask], metric)
+        cross_scores.append(metric.func(y_enc[va_idx], _apply_weights(oof[va_idx], w)))
+    score_pp = float(np.mean(cross_scores))
+    weights, _ = fit_class_weights(oof[done_mask], y_enc[done_mask], metric)
+    accepted = _is_better(score_pp, score_raw, metric.greater_is_better)
+    logger.info("Веса классов: %s %.5f -> %.5f (кросс-фиттинг), %s", metric.name,
+                score_raw, score_pp, "применяю" if accepted else "не улучшает, отключаю")
+    info = {"type": "class_weights", "applied": accepted, "score_after": score_pp,
+            "weights_raw": weights}
+    if not accepted:
+        return np.ones(oof.shape[1]), None, info
+    return weights, cross_scores, info
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +611,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     elif cfg["class_weight"] not in (None, "balanced"):
         logger.warning("class_weight=%r не поддерживается, игнорирую", cfg["class_weight"])
 
-    folds = _make_folds(y_fit, task_type, cfg["n_folds"], cfg["seed"])
+    folds = _make_folds(y_fit, task_type, cfg["n_folds"], cfg["fold_seed"])
+    clip = task_type == "regression" and bool(cfg["clip_target"])
     cfg["n_folds"] = len(folds)
     fit_fn = _BACKENDS[cfg["model"]]
     extra = {"cat_cols": cat_cols} if cfg["model"] == "catboost" else {}
@@ -584,7 +624,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     n = len(y_fit)
     oof = np.full((n, n_classes), np.nan) if n_classes else np.full(n, np.nan)
     test_sum = np.zeros((len(Xtp), n_classes)) if n_classes else np.zeros(len(Xtp))
-    fold_scores_raw, fold_times, best_iters, done_folds = [], [], [], []
+    fold_scores_raw, fold_scores, fold_times, best_iters, done_folds = [], [], [], [], []
     time_stopped_any = False
 
     for i, (tr_idx, va_idx) in enumerate(folds):
@@ -606,6 +646,13 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                                f"{type(e).__name__}: {e}") from e
         if log_target:
             pva, pte = np.expm1(pva), np.expm1(pte)
+        fold_scores_raw.append(_score_fold(y_fit[va_idx], pva, metric_obj))
+        if clip:
+            # Диапазон только по train фолда, чтобы скор оставался честным
+            fold_scores.append(_score_fold(
+                y_fit[va_idx], np.clip(pva, y_fit[tr_idx].min(), y_fit[tr_idx].max()), metric_obj))
+        else:
+            fold_scores.append(fold_scores_raw[-1])
         oof[va_idx] = pva
         test_sum += pte
         time_stopped_any |= stopped
@@ -613,55 +660,47 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         best_iters.append(int(best_iter))
         fold_times.append(time.monotonic() - now)
 
-        fold_scores_raw.append(_score_fold(y_fit[va_idx], pva, metric_obj))
         logger.info("Фолд %d/%d: %s=%.5f, итераций %d, %.1f с%s", i + 1, len(folds), metric_obj.name,
-                    fold_scores_raw[-1], best_iter, fold_times[-1],
+                    fold_scores[-1], best_iter, fold_times[-1],
                     " (урезано по времени)" if stopped else "")
 
     if time_stopped_any:
         logger.warning("Часть фолдов остановлена по бюджету времени, раунды урезаны")
+    t_post = time.monotonic()
     test_pred = test_sum / len(done_folds)
-    done_mask = np.zeros(n, dtype=bool)
-    for i in done_folds:
-        done_mask[folds[i][1]] = True
-
     score_raw = float(np.nanmean(fold_scores_raw))
-    fold_scores = list(fold_scores_raw)
     postprocess_info = None
+    weights = np.ones(n_classes) if n_classes else None
+
+    # Клиппинг регрессии оставляем, только если он улучшает скор по фолдам
+    if clip:
+        score_clip = float(np.nanmean(fold_scores))
+        clip = _is_better(score_clip, score_raw, metric_obj.greater_is_better)
+        logger.info("Клиппинг в диапазон таргета: %s %.5f -> %.5f, %s", metric_obj.name, score_raw,
+                    score_clip, "применяю" if clip else "не улучшает, отключаю")
+        if clip:
+            for i in done_folds:
+                tr_idx, va_idx = folds[i]
+                oof[va_idx] = np.clip(oof[va_idx], y_fit[tr_idx].min(), y_fit[tr_idx].max())
+        else:
+            fold_scores = list(fold_scores_raw)
+        postprocess_info = {"type": "clip", "applied": clip, "score_after": score_clip,
+                            "range": [float(y_fit.min()), float(y_fit.max())]}
 
     # Постобработка для метрик по меткам: веса классов, честная оценка через кросс-фиттинг
     if (task_type in CLASSIFICATION and not metric_obj.needs_proba and cfg["postprocess"]
             and len(done_folds) >= 2):
-        cross_scores = []
-        for i in done_folds:
-            va_idx = folds[i][1]
-            fit_mask = done_mask.copy()
-            fit_mask[va_idx] = False
-            w, _ = fit_class_weights(oof[fit_mask], y_fit[fit_mask], metric_obj)
-            cross_scores.append(metric_obj.func(y_fit[va_idx], _apply_weights(oof[va_idx], w)))
-        score_pp = float(np.mean(cross_scores))
-        weights, _ = fit_class_weights(oof[done_mask], y_fit[done_mask], metric_obj)
-        accepted = _is_better(score_pp, score_raw, metric_obj.greater_is_better)
-        logger.info("Веса классов: %s %.5f -> %.5f (кросс-фиттинг), %s", metric_obj.name,
-                    score_raw, score_pp, "применяю" if accepted else "не улучшает, отключаю")
-        postprocess_info = {
-            "type": "class_weights", "applied": accepted, "score_after": score_pp,
-            "weights": dict(zip(encoder.classes_.tolist(), weights.round(4).tolist())),
-        }
-        if accepted:
+        weights, cross_scores, postprocess_info = _cross_fit_class_weights(
+            oof, y_fit, [folds[i] for i in done_folds], metric_obj, score_raw)
+        postprocess_info["weights"] = dict(zip(
+            encoder.classes_.tolist(), postprocess_info.pop("weights_raw").round(4).tolist()))
+        if cross_scores is not None:
             fold_scores = cross_scores
-        else:
-            weights = np.ones(n_classes)
-    else:
-        weights = np.ones(n_classes) if n_classes else None
 
     # Финальные предсказания
     if task_type == "regression":
-        bad = ~np.isfinite(test_pred)
-        if bad.any():
-            logger.warning("В предсказаниях %d нечисловых значений, заменяю средним таргета", bad.sum())
-            test_pred[bad] = float(np.mean(y_fit))
-        predictions, probabilities, class_order = test_pred, None, None
+        predictions = _finalize_regression(test_pred, y_fit, clip)
+        probabilities, class_order = None, None
     else:
         probabilities = test_pred
         predictions = encoder.inverse_transform(_apply_weights(test_pred, weights))
@@ -693,6 +732,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "fit_time": fit_time,
         "config": cfg,
         # Дополнительно для журнала экспериментов
+        "postprocess_time": time.monotonic() - t_post,
         "fold_scores": [float(s) for s in fold_scores],
         "fold_scores_raw": [float(s) for s in fold_scores_raw],
         "fold_times": fold_times,
@@ -700,6 +740,17 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "greater_is_better": metric_obj.greater_is_better,
         "postprocess": postprocess_info,
     }
+
+
+def _finalize_regression(pred: np.ndarray, y_fit: np.ndarray, clip: bool) -> np.ndarray:
+    pred = pred.copy()
+    bad = ~np.isfinite(pred)
+    if bad.any():
+        logger.warning("В предсказаниях %d нечисловых значений, заменяю средним таргета", bad.sum())
+        pred[bad] = float(np.mean(y_fit))
+    if clip:
+        pred = np.clip(pred, y_fit.min(), y_fit.max())
+    return pred
 
 
 def _score_fold(y_true: np.ndarray, pred: np.ndarray, metric: Metric) -> float:
@@ -711,6 +762,385 @@ def _score_fold(y_true: np.ndarray, pred: np.ndarray, metric: Metric) -> float:
         # Например, roc_auc на фолде без одного из классов
         logger.warning("Метрика %s не посчиталась на фолде: %s", metric.name, e)
         return float("nan")
+
+
+# ---------------------------------------------------------------------------
+# Бленд результатов
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _BlendData:
+    task_type: str
+    metric: Metric
+    labeled: np.ndarray           # маска строк y с таргетом
+    y_enc: np.ndarray             # таргет по размеченным строкам, классы как индексы class_order
+    class_order: list | None
+    oofs: np.ndarray              # (моделей, строк[, классов])
+    tests: np.ndarray             # (моделей, строк test[, классов])
+    folds: list                   # только фолды с полными OOF у всех моделей
+    cfg0: dict
+
+
+def _prepare_blend(results: list[dict], y: pd.Series, metric: str) -> _BlendData:
+    if not results:
+        raise ValueError("Пустой список результатов для бленда")
+    task_types = {r["config"]["task_type"] for r in results}
+    if len(task_types) != 1:
+        raise ValueError(f"Нельзя блендить разные типы задач: {task_types}")
+    task_type = task_types.pop()
+    metric_obj = get_metric(metric, task_type)
+
+    y_series = pd.Series(np.asarray(y))
+    labeled = y_series.notna().to_numpy()
+    y_lab = y_series[labeled]
+    class_order = results[0]["class_order"]
+    if task_type == "regression":
+        y_enc = pd.to_numeric(y_lab).to_numpy(dtype=float)
+        test_key = "predictions"
+    else:
+        if any(r["class_order"] != class_order for r in results):
+            raise ValueError("У результатов разный порядок классов, бленд невозможен")
+        y_enc = y_lab.map({c: i for i, c in enumerate(class_order)})
+        if y_enc.isna().any():
+            raise ValueError("В y есть классы, которых нет в class_order")
+        y_enc = y_enc.to_numpy(dtype=int)
+        test_key = "probabilities"
+
+    oofs = np.stack([np.asarray(r["oof"], dtype=float)[labeled] for r in results])
+    tests = np.stack([np.asarray(r[test_key], dtype=float) for r in results])
+    if oofs.shape[1] != len(y_enc):
+        raise ValueError("Длина OOF не совпадает с длиной y")
+
+    cfg0 = results[0]["config"]
+    fold_key = lambda c: (c.get("n_folds"), c.get("fold_seed", c.get("seed")))
+    if any(fold_key(r["config"]) != fold_key(cfg0) for r in results):
+        logger.warning("У результатов разные фолды, оценка бленда идет по фолдам первого результата")
+    folds = _make_folds(y_enc, task_type, cfg0["n_folds"], cfg0.get("fold_seed", cfg0["seed"]))
+    finite = np.isfinite(oofs).reshape(len(results), len(y_enc), -1).all(axis=(0, 2))
+    folds = [f for f in folds if finite[f[1]].all()]
+    if not folds:
+        raise ValueError("Нет фолдов с полными OOF у всех моделей")
+    return _BlendData(task_type, metric_obj, labeled, y_enc, class_order, oofs, tests, folds, cfg0)
+
+
+def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, config: dict,
+                  t_start: float, members_fit_time: float) -> dict:
+    """Скор по фолдам, постобработка и итоговый словарь в формате train_and_predict."""
+    metric_obj, y_enc, folds = data.metric, data.y_enc, data.folds
+    oof = oof.copy()
+    fold_scores_raw = [_score_fold(y_enc[va], oof[va], metric_obj) for _, va in folds]
+    score_raw = float(np.nanmean(fold_scores_raw))
+    fold_scores = fold_scores_raw
+    postprocess_info = None
+
+    if data.task_type == "regression":
+        # Клиппинг по диапазону train фолда, оставляем только при улучшении
+        clipped = [np.clip(oof[va], y_enc[tr].min(), y_enc[tr].max()) for tr, va in folds]
+        clip_scores = [_score_fold(y_enc[va], p, metric_obj) for (_, va), p in zip(folds, clipped)]
+        clip = _is_better(float(np.nanmean(clip_scores)), score_raw, metric_obj.greater_is_better)
+        if clip:
+            fold_scores = clip_scores
+            for (_, va), p in zip(folds, clipped):
+                oof[va] = p
+        postprocess_info = {"type": "clip", "applied": clip,
+                            "score_after": float(np.nanmean(clip_scores))}
+        predictions = _finalize_regression(test_pred, y_enc, clip)
+        probabilities = None
+    else:
+        cls_w = np.ones(len(data.class_order))
+        if not metric_obj.needs_proba and len(folds) >= 2:
+            cls_w, cross_scores, postprocess_info = _cross_fit_class_weights(
+                oof, y_enc, folds, metric_obj, score_raw)
+            postprocess_info["weights"] = dict(zip(
+                data.class_order, postprocess_info.pop("weights_raw").round(4).tolist()))
+            if cross_scores is not None:
+                fold_scores = cross_scores
+        probabilities = test_pred
+        predictions = np.asarray(data.class_order, dtype=object)[_apply_weights(test_pred, cls_w)]
+
+    if data.labeled.all():
+        oof_full = oof
+    else:
+        oof_full = np.full((len(data.labeled),) + oof.shape[1:], np.nan)
+        oof_full[data.labeled] = oof
+
+    cfg0 = data.cfg0
+    config = config | {"task_type": data.task_type, "metric": metric_obj.name,
+                       "n_folds": cfg0["n_folds"], "n_folds_done": len(folds), "seed": cfg0["seed"],
+                       "fold_seed": cfg0.get("fold_seed", cfg0["seed"])}
+    score, score_std = float(np.nanmean(fold_scores)), float(np.nanstd(fold_scores))
+    return {
+        "score": score,
+        "score_std": score_std,
+        "score_raw": score_raw,
+        "predictions": predictions,
+        "probabilities": probabilities,
+        "class_order": data.class_order,
+        "oof": oof_full,
+        "fit_time": time.monotonic() - t_start,
+        "config": config,
+        "fold_scores": [float(s) for s in fold_scores],
+        "fold_scores_raw": [float(s) for s in fold_scores_raw],
+        "greater_is_better": metric_obj.greater_is_better,
+        "postprocess": postprocess_info,
+        "members_fit_time": members_fit_time,
+    }
+
+
+def blend_results(results: list[dict], y: pd.Series, metric: str,
+                  weights: list[float] | None = None) -> dict:
+    """Бленд с заданными весами (по умолчанию равными) OOF и test нескольких результатов.
+
+    Для классификации усредняются вероятности и заново подбираются веса классов
+    через кросс-фиттинг. Скор считается по фолдам первого результата.
+    """
+    t_start = time.monotonic()
+    data = _prepare_blend(results, y, metric)
+    w = np.ones(len(results)) if weights is None else np.asarray(weights, dtype=float)
+    if len(w) != len(results) or (w < 0).any() or w.sum() <= 0:
+        raise ValueError("Веса бленда должны быть неотрицательны и совпадать по длине с results")
+    w = w / w.sum()
+    res = _finish_blend(data, np.tensordot(w, data.oofs, axes=1), np.tensordot(w, data.tests, axes=1),
+                        {"blend_of": [r["config"] for r in results], "blend_weights": w.tolist()},
+                        t_start, float(sum(r["fit_time"] for r in results)))
+    logger.info("Бленд %d результатов: %s=%.5f +- %.5f (до постобработки %.5f)", len(results),
+                res["config"]["metric"], res["score"], res["score_std"], res["score_raw"])
+    return res
+
+
+def _blend_objective(data: _BlendData) -> Metric:
+    # Метрика по меткам кусочно-постоянна, для весов бленда берем гладкий logloss
+    if data.task_type in CLASSIFICATION and not data.metric.needs_proba:
+        return METRICS["logloss"]
+    return data.metric
+
+
+def _greedy_blend_weights(oofs: np.ndarray, y: np.ndarray, objective: Metric,
+                          n_iter: int = 50, patience: int = 10) -> np.ndarray:
+    """Жадный отбор моделей с повторениями (Caruana): веса неотрицательны, сумма 1."""
+    counts = np.zeros(len(oofs))
+    total = np.zeros_like(oofs[0])
+    best_score, best_counts, stale = None, None, 0
+    for it in range(1, n_iter + 1):
+        step_score, step_model = None, 0
+        for m in range(len(oofs)):
+            s = _score_fold(y, (total + oofs[m]) / it, objective)
+            if step_score is None or _is_better(s, step_score, objective.greater_is_better):
+                step_score, step_model = s, m
+        total += oofs[step_model]
+        counts[step_model] += 1
+        if best_score is None or _is_better(step_score, best_score, objective.greater_is_better):
+            best_score, best_counts, stale = step_score, counts.copy(), 0
+        else:
+            stale += 1
+            if stale >= patience:
+                break
+    return best_counts / best_counts.sum()
+
+
+def optimize_blend_weights(results: list[dict], y: pd.Series, metric: str) -> dict:
+    """Взвешенный бленд с честной оценкой через кросс-фиттинг.
+
+    Для каждого фолда веса подбираются на OOF остальных фолдов и применяются к отложенному.
+    Веса для test подбираются на всех OOF. Если бленд не лучше лучшей одиночной модели,
+    возвращается она сама.
+    """
+    t_start = time.monotonic()
+    data = _prepare_blend(results, y, metric)
+    objective = _blend_objective(data)
+    greater = data.metric.greater_is_better
+    best_single = max(results, key=lambda r: r["score"] if greater else -r["score"])
+    if len(results) == 1:
+        return dict(best_single)
+
+    done_mask = np.zeros(len(data.y_enc), dtype=bool)
+    for _, va in data.folds:
+        done_mask[va] = True
+    oof_cf = np.full_like(data.oofs[0], np.nan)
+    fold_weights = []
+    for _, va in data.folds:
+        fit_mask = done_mask.copy()
+        fit_mask[va] = False
+        fit_idx = np.flatnonzero(fit_mask)
+        w = _greedy_blend_weights(data.oofs[:, fit_idx], data.y_enc[fit_idx], objective)
+        oof_cf[va] = np.tensordot(w, data.oofs[:, va], axes=1)
+        fold_weights.append(w.round(4).tolist())
+    done_idx = np.flatnonzero(done_mask)
+    w_all = _greedy_blend_weights(data.oofs[:, done_idx], data.y_enc[done_idx], objective)
+
+    members_time = float(sum(r["fit_time"] for r in results))
+    configs = [r["config"] for r in results]
+    weighted = _finish_blend(
+        data, oof_cf, np.tensordot(w_all, data.tests, axes=1),
+        {"blend_of": configs, "blend_weights": w_all.round(4).tolist(), "blend_type": "weighted",
+         "blend_fold_weights": fold_weights, "blend_objective": objective.name},
+        t_start, members_time)
+    # Равные веса ничего не подбирают, их оценка честная и часто лучше шумных подобранных весов
+    w_eq = np.full(len(results), 1 / len(results))
+    equal = _finish_blend(
+        data, np.tensordot(w_eq, data.oofs, axes=1), np.tensordot(w_eq, data.tests, axes=1),
+        {"blend_of": configs, "blend_weights": w_eq.round(4).tolist(), "blend_type": "equal"},
+        t_start, members_time)
+    logger.info("Бленд %d моделей: взвешенный %s=%.5f (веса %s), равный %.5f, лучшая одиночная %.5f",
+                len(results), data.metric.name, weighted["score"], w_all.round(3).tolist(),
+                equal["score"], best_single["score"])
+    res = weighted if _is_better(weighted["score"], equal["score"], greater) else equal
+    if not _is_better(res["score"], best_single["score"], greater):
+        logger.info("Бленд не лучше лучшей одиночной модели, возвращаю ее")
+        return best_single | {"blend_rejected_score": res["score"]}
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Сравнение результатов: правило принятия гипотез
+# ---------------------------------------------------------------------------
+
+def compare_results(a: dict, b: dict) -> dict:
+    """Попарное сравнение b с a по одинаковым фолдам.
+
+    diffs положительны, когда b лучше. accept=True, только если b лучше на большинстве фолдов
+    и средняя разница больше половины std разниц.
+    """
+    fa, fb = np.asarray(a["fold_scores"], float), np.asarray(b["fold_scores"], float)
+    if len(fa) != len(fb):
+        raise ValueError(f"Разное число фолдов: {len(fa)} и {len(fb)}, сравнение некорректно")
+    ca, cb = a.get("config", {}), b.get("config", {})
+    if ca.get("fold_seed", ca.get("seed")) != cb.get("fold_seed", cb.get("seed")):
+        logger.warning("У результатов разные сиды фолдов, попарное сравнение неточно")
+    greater = a.get("greater_is_better", True)
+    diffs = fb - fa if greater else fa - fb
+    n_better = int((diffs > 0).sum())
+    diff_mean = float(diffs.mean())
+    diff_std = float(diffs.std(ddof=1)) if len(diffs) > 1 else 0.0
+    accept = n_better > len(diffs) / 2 and diff_mean > 0.5 * diff_std and diff_mean > 0
+    return {"accept": bool(accept), "diff_mean": diff_mean, "diff_std": diff_std,
+            "n_better": n_better, "n_folds": len(diffs), "diffs": diffs.round(6).tolist()}
+
+
+# ---------------------------------------------------------------------------
+# Автоматический рецепт
+# ---------------------------------------------------------------------------
+
+_AUTO_MIN_STEP = 20.0             # меньше стольких секунд на модель не запускаем (не больше 10% бюджета)
+_AUTO_MAX_SEEDS = 3               # максимум моделей одного типа с разными сидами
+_AUTO_SAFETY = 1.3                # запас к оценке времени следующей модели
+
+
+def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
+               time_budget: float, config: dict | None = None, use_catboost: bool = False) -> dict:
+    """Рецепт: LightGBM и XGBoost, затем их сиды, пока укладываемся, затем взвешенный бленд.
+
+    Все модели на одних и тех же фолдах. Перед каждой моделью оцениваем ее время по прошлому
+    запуску того же типа и держим запас под финальный бленд, поэтому на больших данных
+    рецепт обучает меньше моделей, а не выходит за бюджет. CatBoost по умолчанию выключен:
+    на публичных задачах он долгий и почти ничего не добавляет. С use_catboost=True он идет
+    в конце, если осталось больше половины бюджета. config - общие ключи для всех моделей.
+    Возвращает словарь в формате train_and_predict плюс members и member_results.
+    """
+    t_start = time.monotonic()
+    deadline = t_start + time_budget
+    base = dict(config or {})
+    seed0 = base.get("seed", DEFAULT_CONFIG["seed"])
+    base.setdefault("fold_seed", seed0)
+    remaining = lambda: deadline - time.monotonic()
+    members: dict[str, dict] = {}
+    kind_time: dict[str, float] = {}
+    blend_time = [0.0]
+    min_step = min(_AUTO_MIN_STEP, 0.1 * time_budget)
+
+    def blend_estimate() -> float:
+        # До первого замера оцениваем бленд по постобработке моделей: в нем она идет дважды
+        post = max((r.get("postprocess_time", 0.0) for r in members.values()), default=0.0)
+        return max(blend_time[0], 3.0 * post)
+
+    def reserve() -> float:
+        # Запас под финальный бленд, растет вместе с оценкой времени бленда
+        return max(0.05 * time_budget, 1.5 * blend_estimate())
+
+    def run(name: str, extra: dict, budget: float | None = None, force: bool = False) -> bool:
+        avail = remaining() - reserve()
+        if force:
+            # Первая модель обязательна: без нее нет результата
+            avail = max(avail, min(remaining(), min_step))
+        budget = avail if budget is None else min(budget, avail)
+        kind = extra.get("model", "lightgbm")
+        est = kind_time.get(kind)
+        if not force:
+            if budget < min_step:
+                logger.info("auto_train: %s пропущен, доступно %.0f с", name, budget)
+                return False
+            if est is not None and est * _AUTO_SAFETY > budget:
+                logger.info("auto_train: %s пропущен, оценка %.0f с больше доступных %.0f с",
+                            name, est * _AUTO_SAFETY, budget)
+                return False
+        cfg = base | extra | {"params": base.get("params", {}) | extra.get("params", {})}
+        logger.info("auto_train: %s, бюджет %.0f с, осталось %.0f с", name, budget, remaining())
+        try:
+            res = train_and_predict(X, y, X_test, task_type, metric, cfg, time_budget=budget)
+        except Exception:
+            logger.exception("auto_train: модель %s упала, продолжаю без нее", name)
+            return False
+        members[name] = res
+        kind_time[kind] = res["fit_time"]
+        return True
+
+    def blend(previous: dict | None) -> dict | None:
+        if len(members) < 2:
+            return previous
+        if remaining() < 1.2 * blend_estimate():
+            logger.warning("auto_train: на бленд не хватает времени, оставляю прошлый результат")
+            return previous
+        t0 = time.monotonic()
+        try:
+            res = optimize_blend_weights(list(members.values()), y, metric)
+        except Exception:
+            logger.exception("auto_train: бленд упал, оставляю прошлый результат")
+            return previous
+        blend_time[0] = time.monotonic() - t0
+        res["config"] = res["config"] | {"members": list(members)}
+        if previous is not None and not _is_better(res["score"], previous["score"],
+                                                   res["greater_is_better"]):
+            return previous
+        return res
+
+    # Шаг 1: два бустинга с дефолтами, LightGBM первым как самый быстрый
+    run("lgb", {"model": "lightgbm"}, budget=0.4 * (remaining() - reserve()), force=True)
+    if not members:
+        raise RuntimeError("auto_train: базовая модель не обучилась")
+    run("xgb", {"model": "xgboost"})
+    best = blend(None)
+
+    # Шаг 2: сиды XGBoost и LightGBM, пока следующая модель укладывается в остаток
+    is_clf = next(iter(members.values()))["config"]["task_type"] in CLASSIFICATION
+    queue = [("lgb_balanced", {"model": "lightgbm", "class_weight": "balanced"})] if is_clf else []
+    for k in range(1, _AUTO_MAX_SEEDS):
+        queue += [(f"xgb_seed{k + 1}", {"model": "xgboost", "seed": seed0 + k}),
+                  (f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k})]
+    added = [run(name, extra) for name, extra in queue]
+    if any(added):
+        best = blend(best)
+
+    # Шаг 3: CatBoost только по флагу, в самом конце и только при большом запасе
+    if use_catboost:
+        if remaining() > 0.5 * time_budget:
+            if run("catboost", {"model": "catboost"}):
+                best = blend(best)
+        else:
+            logger.info("auto_train: CatBoost пропущен, осталось %.0f%% бюджета",
+                        100 * max(remaining(), 0) / time_budget)
+
+    if best is None:
+        greater = next(iter(members.values()))["greater_is_better"]
+        best = dict(max(members.values(), key=lambda r: r["score"] if greater else -r["score"]))
+    best["members"] = {k: {"score": r["score"], "score_std": r["score_std"], "fit_time": r["fit_time"],
+                           "model": r["config"]["model"]} for k, r in members.items()}
+    # Полные результаты моделей, чтобы финализатор мог пересобрать бленд без переобучения
+    best["member_results"] = members
+    best["fit_time"] = time.monotonic() - t_start
+    logger.info("auto_train: итог %s=%.5f +- %.5f за %.0f с из %.0f, модели %s",
+                best["config"]["metric"], best["score"], best["score_std"], best["fit_time"],
+                time_budget, {k: round(v["score"], 5) for k, v in best["members"].items()})
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -744,7 +1174,11 @@ if __name__ == "__main__":
     Xr_te.loc[0, "cat"] = "unseen"
     res = train_and_predict(Xr_tr, yr_tr, Xr_te, "regression", "rmse")
     assert res["predictions"].shape == (1000,) and np.isfinite(res["predictions"]).all()
+    assert yr_tr.min() <= res["predictions"].min() and res["predictions"].max() <= yr_tr.max()
     report("regression rmse", res)
+    res_noclip = train_and_predict(Xr_tr, yr_tr, Xr_te, "regression", "rmse", {"clip_target": False})
+    report("regression rmse без клиппинга", res_noclip)
+    report("blend регрессии", blend_results([res, res_noclip], yr_tr, "rmse"))
 
     # Регрессия с тяжелым хвостом и log1p
     y_heavy = pd.Series(np.expm1((yr[:5000] - yr.min()) / 150))
@@ -771,6 +1205,40 @@ if __name__ == "__main__":
     enc = LabelEncoder().fit(labels)
     assert abs(_macro_f1(enc.transform(yc_te), enc.transform(res["predictions"]))
                - f1_score(yc_te, res["predictions"], average="macro")) < 1e-12
+
+    # Бленд двух сидов модели на одинаковых фолдах
+    res2 = train_and_predict(Xc_tr, yc_tr, Xc_te, "multiclass", "macro_f1", {"seed": 7, "fold_seed": 42})
+    blend = blend_results([res, res2], yc_tr, "macro_f1")
+    assert blend["probabilities"].shape == (1500, 5) and set(blend["predictions"]) <= set(labels)
+    report("blend 2 сида", blend)
+    log.info("  holdout macro_f1 бленда %.5f", f1_score(yc_te, blend["predictions"], average="macro"))
+    assert abs(_logloss(enc.transform(yc_te), res["probabilities"])
+               - log_loss(enc.transform(yc_te), res["probabilities"], labels=np.arange(5))) < 1e-9
+
+    # Сравнение по фолдам: результат сам с собой не принимается
+    cmp = compare_results(res, res2)
+    log.info("  compare default -> seed7: %s", cmp)
+    assert not compare_results(res, res)["accept"]
+
+    # Взвешенный бленд с явно слабой моделью: ее вес должен быть мал
+    res_weak = train_and_predict(Xc_tr[["f0", "f1"]], yc_tr, Xc_te[["f0", "f1"]], "multiclass", "macro_f1")
+    wblend = optimize_blend_weights([res, res2, res_weak], yc_tr, "macro_f1")
+    report("weighted blend", wblend)
+    if wblend["config"].get("blend_type") == "weighted":
+        log.info("  веса бленда %s", wblend["config"]["blend_weights"])
+        assert wblend["config"]["blend_weights"][2] <= 0.2
+    log.info("  holdout macro_f1 взвешенного бленда %.5f",
+             f1_score(yc_te, wblend["predictions"], average="macro"))
+
+    # auto_train на мультиклассе и регрессии с маленьким бюджетом
+    auto = auto_train(Xc_tr, yc_tr, Xc_te, "multiclass", "macro_f1", time_budget=60)
+    assert auto["probabilities"].shape == (1500, 5) and auto["fit_time"] < 75
+    report("auto_train multiclass 60s", auto)
+    log.info("  holdout macro_f1 auto_train %.5f", f1_score(yc_te, auto["predictions"], average="macro"))
+    auto = auto_train(Xr_tr, yr_tr, Xr_te, "regression", "rmse", time_budget=40)
+    assert auto["predictions"].shape == (1000,) and np.isfinite(auto["predictions"]).all()
+    assert auto["fit_time"] < 40 * 1.1
+    report("auto_train regression 40s", auto)
 
     # Бинарная задача с roc_auc
     Xb, yb = make_classification(n_samples=6000, n_features=20, n_informative=8, weights=[0.85, 0.15],
