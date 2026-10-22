@@ -3,3 +3,8 @@ __pycache__/
 .env
 .idea/
 .vscode/
+
+# Данные кейса и результаты прогонов
+data/
+submission.csv
+runs/
