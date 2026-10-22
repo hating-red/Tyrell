@@ -7,25 +7,40 @@ import time
 
 from openai import OpenAI
 
+from data_tools import inspect_data
+from pipeline import check_result
+
 
 INSTRUCTION = """Ты — агент для решения задач машинного обучения.
-Прочитай условие и исследуй train.csv, test.csv, data_dictionary.csv
-и sample_submission.csv через инструмент run_python.
+Тебе даны условие и сводка CSV от data_tools.inspect_data.
+Определи целевую колонку, ID, тип задачи и ОСНОВНУЮ метрику по условию.
+Не выбирай тип задачи только по числовому типу target: числа бывают метками классов.
 
-Определи целевую колонку, тип задачи и метрику из условия и данных.
-Раздели обучающие данные на обучение и валидацию с учётом условий задачи.
-Обучай предобработку только на обучающей части. Оцени модель на валидации.
-Сначала получи простое решение: обучи модель на всех обучающих данных,
-предскажи ответы для test.csv и сохрани submission.csv рядом с task.md.
-Соблюдай колонки, идентификаторы и порядок строк из sample_submission.csv.
+Вызывай run_experiment: он соединяет data_tools.load_data,
+training.train_and_predict и submission.make_submission.
+task_spec содержит target_column, id_columns (список из одной колонки),
+task_type (regression, binary или multiclass), metric, probabilities (нужны ли
+вероятности В ФАЙЛЕ ответа). Для бинарных вероятностей можно задать positive_class.
+Метрики: rmse, mse, mae, r2, rmsle, mape, macro_f1, weighted_f1, f1,
+accuracy, balanced_accuracy, mcc, roc_auc, gini, pr_auc, logloss.
+config задаёт model (lightgbm, catboost, xgboost), params, num_boost_round,
+early_stopping_rounds, class_weight, features. Начни с простой быстрой модели.
+Валидация — одинаковые случайные фолды с фиксированным seed; для классификации
+они стратифицированы. Не считай такую оценку подходящей для временного/группового
+разбиения, если оно требуется условием; сообщи об этом ограничении.
 
-Затем попробуй улучшить результат. Сравнивай модели на одной валидации,
-сохраняй результаты экспериментов и оставляй лучший вариант предсказаний.
-Не удаляй готовый submission.csv во время новых экспериментов.
+Сначала сохрани базовый submission, затем предложи гипотезу улучшения и запусти
+следующий эксперимент. Инструмент возвращает score, saved и problems.
+Чем лучше метрика, тем лучше эксперимент; направление возвращается инструментом.
+Файл перезаписывается только при улучшении сравнимого результата валидации.
+Не меняй task_spec между экспериментами. Анализируй ошибки и исправляй config.
+Не пиши submission.csv вручную: сборкой и проверкой занимается submission.py.
 
 Каждый вызов run_python запускает отдельный процесс: переменные не сохраняются,
 но файлы сохраняются. Все относительные пути отсчитываются от папки задачи.
-Модули проекта доступны для импорта. Используй только установленные библиотеки.
+run_python нужен для дополнительного анализа и генерации признаков.
+Для обучения используй run_experiment. Модули проекта доступны для импорта.
+Используй только установленные библиотеки.
 Не устанавливай пакеты, не обращайся в интернет и не читай ключи или .env.
 Доступно 8 CPU и 32 ГБ памяти. На один запуск кода — до 30 минут,
 на всю задачу — чуть меньше 3 часов. Сначала сохрани базовые предсказания.
@@ -45,6 +60,36 @@ TOOLS = [{
         },
     },
 }]
+
+TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "run_experiment",
+        "description": "Загрузить данные, обучить модель, оценить и сохранить лучший submission.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_spec": {
+                    "type": "object",
+                    "properties": {
+                        "target_column": {"type": "string"},
+                        "id_columns": {"type": "array", "items": {"type": "string"}},
+                        "task_type": {"type": "string", "enum": ["regression", "binary", "multiclass"]},
+                        "metric": {"type": "string"},
+                        "probabilities": {"type": "boolean"},
+                        "positive_class": {"type": ["string", "number", "boolean"]},
+                    },
+                    "required": ["target_column", "id_columns", "task_type", "metric", "probabilities"],
+                    "additionalProperties": False,
+                },
+                "config": {"type": "object"},
+                "time_budget": {"type": "number", "minimum": 10, "maximum": 1500},
+            },
+            "required": ["task_spec", "config", "time_budget"],
+            "additionalProperties": False,
+        },
+    },
+})
 
 
 def run_python(code, task_dir, timeout):
@@ -76,10 +121,16 @@ def run_python(code, task_dir, timeout):
 
 def run_agent(task_path):
     deadline = time.monotonic() + 3 * 60 * 60 - 60
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
+        if not os.environ.get(name, "").strip():
+            raise ValueError(f"Задайте переменную окружения {name} перед запуском.")
     task_path = task_path.resolve()
+    task = task_path.read_text(encoding="utf-8")
+    summary = inspect_data(task_path.parent)
+    (task_path.parent / ".tyrell_experiments.json").write_text("[]", encoding="utf-8")
     messages = [
         {"role": "system", "content": INSTRUCTION},
-        {"role": "user", "content": task_path.read_text(encoding="utf-8")},
+        {"role": "user", "content": task + "\n\nСводка данных:\n" + json.dumps(summary, ensure_ascii=False)},
     ]
 
     with OpenAI(max_retries=0) as client:
@@ -99,17 +150,31 @@ def run_agent(task_path):
             messages.append(message.model_dump(exclude_none=True))
 
             if not message.tool_calls:
-                if not (task_path.parent / "submission.csv").is_file():
-                    raise RuntimeError("Агент завершил работу, но не создал submission.csv.")
+                check_result(task_path.parent)
                 print(message.content or "Готово: submission.csv сохранён.")
                 return
 
             for call in message.tool_calls:
                 try:
-                    if call.function.name != "run_python":
-                        raise ValueError("Неизвестный инструмент.")
                     arguments = json.loads(call.function.arguments)
-                    code = arguments["code"]
+                    remaining = deadline - time.monotonic()
+                    if call.function.name == "run_experiment":
+                        budget = min(float(arguments.get("time_budget", 300)), 1500, remaining - 5)
+                        if budget <= 0:
+                            raise ValueError("Время на новый эксперимент закончилось.")
+                        payload = json.dumps({
+                            "task_spec": arguments["task_spec"],
+                            "config": arguments.get("config", {}), "time_budget": budget,
+                        }, ensure_ascii=False)
+                        code = (
+                            "import json; from pipeline import run_experiment; "
+                            f"args = json.loads({payload!r}); "
+                            "print(json.dumps(run_experiment('.', **args), ensure_ascii=False))"
+                        )
+                    elif call.function.name == "run_python":
+                        code = arguments["code"]
+                    else:
+                        raise ValueError("Неизвестный инструмент.")
                     if not isinstance(code, str):
                         raise ValueError("Аргумент code должен быть строкой.")
                     remaining = deadline - time.monotonic()
@@ -125,8 +190,7 @@ def run_agent(task_path):
                     "content": json.dumps(result, ensure_ascii=False),
                 })
 
-    if not (task_path.parent / "submission.csv").is_file():
-        raise RuntimeError("Лимит работы достигнут, submission.csv не создан.")
+    check_result(task_path.parent)
     print("Лимит работы достигнут. Оставлен сохранённый submission.csv.")
 
 
