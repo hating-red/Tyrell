@@ -1086,7 +1086,8 @@ _AUTO_UNSEEN_MAX = 0.01           # при большей доле новых к
 
 
 def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
-               time_budget: float, config: dict | None = None, use_catboost: bool = False) -> dict:
+               time_budget: float, config: dict | None = None, use_catboost: bool = False,
+               max_seeds: int = _AUTO_MAX_SEEDS) -> dict:
     """Рецепт: LightGBM и XGBoost, затем их сиды, пока укладываемся, затем взвешенный бленд.
 
     Все модели на одних и тех же фолдах. Перед каждой моделью оцениваем ее время по прошлому
@@ -1122,7 +1123,8 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
             # Первая модель обязательна: без нее нет результата
             avail = max(avail, min(remaining(), min_step))
         budget = avail if budget is None else min(budget, avail)
-        kind = extra.get("model", "lightgbm")
+        # Медленные модели учатся в разы дольше, их время оцениваем отдельно
+        kind = extra.get("model", "lightgbm") + ("_slow" if name.endswith("_slow") else "")
         est = kind_time.get(kind)
         if not force:
             if budget < min_step:
@@ -1189,10 +1191,20 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         if len(y_num) and y_num.min() >= 0 and y_num.skew() > 1:
             # Тяжелый хвост: log1p-модель как кандидат в бленд, веса решат, нужна ли она
             queue.append(("lgb_log1p", {"model": "lightgbm", "log_target": True}))
-    for k in range(1, _AUTO_MAX_SEEDS):
+    def add_seeds(first: int, last: int) -> None:
+        for k in range(first, last):
+            if use_xgb:
+                queue.append((f"xgb_seed{k + 1}", {"model": "xgboost", "seed": seed0 + k}))
+            queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
+
+    add_seeds(1, min(max_seeds, _AUTO_MAX_SEEDS))
+    if max_seeds > _AUTO_MAX_SEEDS:
+        # Запас времени: медленные модели с маленьким learning rate, затем еще сиды
+        slow = {"early_stopping_rounds": 300, "num_boost_round": 10000}
         if use_xgb:
-            queue.append((f"xgb_seed{k + 1}", {"model": "xgboost", "seed": seed0 + k}))
-        queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
+            queue.append(("xgb_slow", {"model": "xgboost", "params": {"eta": 0.02}} | slow))
+        queue.append(("lgb_slow", {"model": "lightgbm", "params": {"learning_rate": 0.02}} | slow))
+        add_seeds(_AUTO_MAX_SEEDS, max_seeds)
     added = [run(name, extra) for name, extra in queue]
     if any(added):
         best = blend(best)

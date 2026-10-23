@@ -35,7 +35,7 @@ def apply_feature_code(feature_code, X_train, X_test):
 
 
 def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="single", feature_code=None):
-    from training import METRICS, auto_train, train_and_predict
+    from training import METRICS, auto_train, compare_results, train_and_predict
 
     task_dir = Path(task_dir)
     data = load_data(task_dir, task_spec)
@@ -69,6 +69,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     cfg = dict(config or {})
     for key in ("n_folds", "fold_seed", "split", "n_jobs"):
         cfg.pop(key, None)
+    max_seeds = int(cfg.pop("max_seeds", None) or 3)
     cfg["params"] = dict(cfg.get("params") or {})
     for key in ("num_threads", "nthread", "thread_count", "n_jobs"):
         if key in cfg["params"]:
@@ -79,6 +80,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         result = auto_train(
             X_train, y_train, X_test, task_type, metric, time_budget,
             config={k: cfg[k] for k in AUTO_KEYS if k in cfg} | fixed,
+            max_seeds=max_seeds,
         )
     else:
         result = train_and_predict(
@@ -93,11 +95,17 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     previous = saved[-1] if saved else None
     complete = n_folds_done == n_folds
     better = previous is None
+    comparison = None
     if previous is not None:
         same_folds = n_folds_done == previous["n_folds_done"]
-        improved = (result["score"] > previous["score"] if result["greater_is_better"]
-                    else result["score"] < previous["score"])
-        better = (complete and not previous["complete"]) or (same_folds and improved)
+        if same_folds:
+            # Не берем «везучую» модель: новый результат должен быть лучше на большинстве
+            # фолдов и с приростом больше шума, а не просто чуть выше в среднем
+            comparison = compare_results(
+                {"fold_scores": previous["fold_scores"], "greater_is_better": previous["greater_is_better"]},
+                {"fold_scores": result["fold_scores"], "greater_is_better": result["greater_is_better"]},
+            )
+        better = (complete and not previous["complete"]) or (same_folds and comparison["accept"])
     problems = []
     if better:
         probabilities = task_spec.get("probabilities", False)
@@ -130,6 +138,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         "greater_is_better": result["greater_is_better"], "complete": complete,
         "n_folds_done": n_folds_done, "split": split,
         "saved": better and not problems, "problems": problems, "best_saved_score": best_score,
+        "vs_saved": comparison and {k: comparison[k] for k in ("accept", "diff_mean", "diff_std", "n_better")},
         "members": result.get("members"),
         "config": {k: v for k, v in cfg.items() if k != "features"}, "fit_time": result["fit_time"],
     }

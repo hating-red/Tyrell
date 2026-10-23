@@ -19,6 +19,7 @@ LLM_ATTEMPTS = 4                      # попыток на один запро�
 KEEP_TOOL_MESSAGES = 4                # столько последних ответов инструментов отдаем LLM целиком
 TOOL_MESSAGE_LIMIT = 1500             # до скольких символов обрезаем старые ответы
 MAX_NUDGES = 3                        # сколько раз просим LLM продолжать, если время осталось
+FINAL_MAX_SEEDS = 8                   # сидов на тип модели в финальном auto_train
 
 INSTRUCTION = """Ты — агент для решения задач машинного обучения на табличных данных.
 Тебе даны условие, сводка CSV и уже определённый task_spec (target, id, тип задачи, метрика).
@@ -40,8 +41,10 @@ task_spec менять нельзя, он передаётся в экспери
 
 Валидация — 5 фолдов, одинаковых во всех экспериментах; если test похож на новый период,
 фолды строятся группами по этой колонке. Результат сохраняется в submission.csv, только
-если он лучше сохранённого. Инструмент возвращает score, fold_scores, saved и best_saved_score.
+если он лучше сохранённого на большинстве фолдов и прирост больше шума (поле vs_saved).
+Инструмент возвращает score, fold_scores, saved, vs_saved и best_saved_score.
 Сравнивай гипотезы по score с одинаковым recipe; разница меньше разброса fold_scores — шум.
+В конце решение само запустит расширенный auto_train на лучших найденных признаках.
 
 run_python запускает отдельный процесс для анализа данных; файлы сохраняются, переменные нет.
 Относительные пути — от папки задачи. Не устанавливай пакеты, не ходи в интернет,
@@ -247,19 +250,24 @@ def run_agent(task_path):
     if client is not None:
         run_llm_loop(client, task, summary, spec, task_dir, deadline)
 
-    # Шаг 3: финальный auto_train с лучшими признаками, если они нашлись
+    # Шаг 3: все оставшееся время - расширенный auto_train (больше сидов и медленные модели)
+    # на лучших признаках. Сабмит заменится, только если результат лучше с учетом шума
     history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
     saved = [h for h in history if h["saved"]]
     best = saved[-1] if saved else None
     budget = remaining() - 120
-    if best and best.get("feature_code") and best["recipe"] != "auto" and budget > 300:
-        report, _ = experiment(task_dir, spec, budget=budget, recipe="auto",
-                               config={k: v for k, v in best["config"].items() if k == "cat_encoding"},
-                               feature_code=best["feature_code"])
-        log(f"Финальный auto_train с признаками: {report and report['score']}")
+    if budget > 300:
+        config = {"max_seeds": FINAL_MAX_SEEDS}
+        if best:
+            config |= {k: v for k, v in best["config"].items() if k == "cat_encoding"}
+        report, _ = experiment(task_dir, spec, budget=budget, recipe="auto", config=config,
+                               feature_code=best and best.get("feature_code"))
+        log(f"Финальный auto_train: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
 
     try:
         check_result(task_dir)
+        history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
+        saved = [h for h in history if h["saved"]]
         print(f"Готово: submission.csv сохранён, лучший результат валидации "
               f"{saved and saved[-1]['score']}.")
     except Exception as error:
