@@ -94,6 +94,10 @@ def inspect_data(task_dir) -> dict:
         summary["warnings"].append("Количество строк sample_submission и test различается.")
     if len(targets) != 1:
         summary["warnings"].append("Нужно явно выбрать целевую колонку по условию задачи.")
+    features = [c for c in train if c in test and c not in targets and c not in ids]
+    summary["warnings"] += data_warnings(train, test, features, targets[0] if len(targets) == 1 else None)
+    split = detect_split(train[features], test[features])
+    summary["validation_split"] = split
     return summary
 
 
@@ -145,3 +149,127 @@ def load_data(task_dir, task_spec) -> dict:
         "id_column": identifier,
         "feature_columns": features,
     }
+
+
+def detect_split(X_train, X_test, max_groups=50, min_unseen=0.9):
+    """Колонка для групповой валидации: значения в test почти все новые для train.
+
+    Типичный случай - код периода (год 6 в test при годах 1-5 в train). Тогда случайные
+    фолды завышают оценку, а группа целиком в одном фолде похожа на test.
+    Возвращает {"type": "group", "column": имя} или None.
+    """
+    best, best_share = None, 0.0
+    for name in X_test.columns:
+        if name not in X_train:
+            continue
+        n_groups = X_train[name].nunique()
+        if not 2 <= n_groups <= max_groups:
+            continue
+        values = X_test[name].dropna()
+        if values.empty:
+            continue
+        share = float((~values.isin(set(X_train[name].dropna()))).mean())
+        if share >= min_unseen and share > best_share:
+            best, best_share = name, share
+    return {"type": "group", "column": best} if best else None
+
+
+def data_warnings(train, test, features, target=None):
+    """Короткие предупреждения о данных для LLM: сдвиг, новые категории, утечки, константы."""
+    warnings = []
+    for name in features:
+        column, test_column = train[name], test[name]
+        if column.nunique(dropna=False) <= 1:
+            warnings.append(f"'{name}' константа в train, бесполезна для модели.")
+            continue
+        is_text = not pd.api.types.is_numeric_dtype(column)
+        if is_text:
+            unseen = float((test_column.notna() & ~test_column.isin(set(column.dropna()))).mean())
+            if unseen >= 0.01:
+                warnings.append(f"'{name}': {unseen:.0%} строк test с категориями, которых нет в train.")
+            if column.nunique() > 0.5 * len(column):
+                warnings.append(f"'{name}': почти уникальна в каждой строке, похоже на id или текст.")
+        if target is not None and not is_text and pd.api.types.is_numeric_dtype(train[target]):
+            corr = column.corr(train[target])
+            if pd.notna(corr) and abs(corr) > 0.98:
+                warnings.append(f"'{name}' почти совпадает с таргетом (корреляция {corr:.3f}), возможна утечка.")
+    split = detect_split(train[features], test[features])
+    if split:
+        warnings.append(f"Значения '{split['column']}' в test новые для train: валидация идет "
+                        f"группами по этой колонке, как будущий период.")
+    return warnings
+
+
+# Шаблоны метрик в тексте task.md. Порядок важен: частные случаи раньше общих
+METRIC_PATTERNS = [
+    ("macro_f1", r"macro[\s_-]*f1|f1[\s_-]*macro|average\s*=\s*[\"']macro"),
+    ("weighted_f1", r"weighted[\s_-]*f1|f1[\s_-]*weighted"),
+    ("rmsle", r"\brmsle\b|root mean squared log"),
+    ("rmse", r"\brmse\b|root mean squared error"),
+    ("mse", r"\bmse\b|mean squared error"),
+    ("mae", r"\bmae\b|mean absolute error"),
+    ("mape", r"\bmape\b"),
+    ("r2", r"\br2\b|r²|r\^2"),
+    ("pr_auc", r"pr[\s_-]*auc|average[\s_-]*precision"),
+    ("gini", r"\bgini\b|джини"),
+    ("roc_auc", r"roc[\s_-]*auc|\bauc\b"),
+    ("logloss", r"log[\s_-]*loss|cross[\s_-]*entropy"),
+    ("balanced_accuracy", r"balanced[\s_-]*accuracy"),
+    ("mcc", r"\bmcc\b|matthews"),
+    ("f1", r"\bf1\b"),
+    ("accuracy", r"\baccuracy\b|доля верных"),
+]
+PROBA_METRICS = {"roc_auc", "gini", "pr_auc", "logloss"}
+REGRESSION_METRICS = {"rmse", "rmsle", "mse", "mae", "mape", "r2"}
+
+
+def detect_metric(task_text):
+    """Основная метрика по тексту: сначала строки со словами «основная метрика» или «оценки»."""
+    import re
+
+    lowered = task_text.lower()
+    focus = [line for line in lowered.splitlines()
+             if "метрик" in line and ("основн" in line or "оценк" in line)]
+    for text in ("\n".join(focus), lowered):
+        for name, pattern in METRIC_PATTERNS:
+            if re.search(pattern, text):
+                return name
+    return None
+
+
+def guess_task_spec(task_dir, task_text=""):
+    """task_spec без LLM: таргет и id из data_dictionary, метрика из task.md, тип по данным.
+
+    Возвращает (spec, confident). confident=False, если таргет или метрику пришлось угадывать.
+    """
+    folder, train, test, sample, dictionary = _read_files(task_dir)
+    targets, ids = _candidates(train, test, sample, dictionary)
+    confident = len(targets) == 1 and bool(ids)
+    if not targets or not ids:
+        raise ValueError("Не удалось найти таргет или id по данным.")
+    target, identifier = targets[0], ids[0]
+    y = train[target].dropna()
+
+    metric = detect_metric(task_text)
+    confident = confident and metric is not None
+    if metric is not None:
+        is_regression = metric in REGRESSION_METRICS
+    else:
+        is_integer = pd.api.types.is_numeric_dtype(y) and (y.round() == y).all()
+        is_regression = pd.api.types.is_numeric_dtype(y) and not (is_integer and y.nunique() <= 20)
+    if is_regression:
+        task_type = "regression"
+    else:
+        task_type = "binary" if y.nunique() == 2 else "multiclass"
+    if metric is None or (metric in REGRESSION_METRICS) != is_regression:
+        metric = {"regression": "rmse", "binary": "roc_auc", "multiclass": "macro_f1"}[task_type]
+    if metric in ("f1", "gini", "pr_auc") and task_type == "multiclass":
+        metric = "macro_f1"
+    spec = {
+        "target_column": target,
+        "id_columns": [identifier],
+        "task_type": task_type,
+        "metric": metric,
+        "probabilities": metric in PROBA_METRICS or len(sample.columns) > 2,
+    }
+    return spec, confident

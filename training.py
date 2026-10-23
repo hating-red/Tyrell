@@ -27,7 +27,7 @@ from sklearn.metrics import (
     r2_score,
     roc_auc_score,
 )
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
 logger = logging.getLogger(__name__)
@@ -210,6 +210,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "class_weight": None,         # None или "balanced"
     "postprocess": True,          # подбор весов классов под метрику по меткам
     "n_jobs": None,               # None - min(8, число CPU)
+    "split": None,                # None - случайные фолды; {"type": "group", "column": c} - группы
+    "cat_encoding": "native",     # native - категории как есть; frequency - доля значения в train
 }
 
 _ROUND_KEYS = ("n_estimators", "num_iterations", "num_boost_round", "iterations", "num_rounds")
@@ -256,9 +258,28 @@ def _check_backend(name: str) -> str:
 # Подготовка данных
 # ---------------------------------------------------------------------------
 
-def _prepare_features(X: pd.DataFrame, X_test: pd.DataFrame,
-                      features: list | None) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Отбор признаков и приведение типов. Одна копия на датафрейм, исходники не меняются."""
+def _is_categorical(s: pd.Series) -> bool:
+    return (isinstance(s.dtype, pd.CategoricalDtype) or pd.api.types.is_object_dtype(s)
+            or pd.api.types.is_string_dtype(s))
+
+
+def unseen_category_share(X: pd.DataFrame, X_test: pd.DataFrame) -> dict[str, float]:
+    """Доля строк test с категорией, которой нет в train, по каждой категориальной колонке."""
+    shares = {}
+    for col in X.columns:
+        if col in X_test.columns and _is_categorical(X[col]):
+            t = X_test[col]
+            shares[col] = float((t.notna() & ~t.isin(set(X[col].dropna()))).mean())
+    return shares
+
+
+def _prepare_features(X: pd.DataFrame, X_test: pd.DataFrame, features: list | None,
+                      cat_encoding: str = "native") -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Отбор признаков и приведение типов. Одна копия на датафрейм, исходники не меняются.
+
+    cat_encoding="frequency" заменяет категорию ее долей в train, новые значения test получают 0.
+    Это устойчивее к категориям, которых не было в обучении: они ведут себя как самые редкие.
+    """
     if features is None:
         features = list(X.columns)
     missing = [c for c in features if c not in X.columns or c not in X_test.columns]
@@ -276,8 +297,12 @@ def _prepare_features(X: pd.DataFrame, X_test: pd.DataFrame,
             for df in (Xp, Xtp):
                 d = pd.to_datetime(df[col], errors="coerce")
                 df[col] = np.where(d.isna(), np.nan, d.astype("int64") / 1e9)
-        elif isinstance(s.dtype, pd.CategoricalDtype) or pd.api.types.is_object_dtype(s) \
-                or pd.api.types.is_string_dtype(s):
+        elif _is_categorical(s) and cat_encoding == "frequency":
+            freq = s.value_counts(normalize=True)
+            Xp[col] = s.map(freq).astype(float)
+            t = Xtp[col]
+            Xtp[col] = t.map(freq).astype(float).where(t.isna() | t.isin(freq.index), 0.0)
+        elif _is_categorical(s):
             cat = Xp[col].astype("category")
             Xp[col] = cat
             # Категории test строго по train, новые значения становятся NaN
@@ -299,9 +324,20 @@ def _to_catboost_frame(df: pd.DataFrame, cat_cols: list[str]) -> pd.DataFrame:
     return out
 
 
-def _make_folds(y_enc: np.ndarray, task_type: str, n_folds: int, seed: int) -> list:
+def _make_folds(y_enc: np.ndarray, task_type: str, n_folds: int, seed: int,
+                groups: np.ndarray | None = None) -> list:
     n = len(y_enc)
     n_folds = max(2, min(int(n_folds), n))
+    if groups is not None:
+        # Группа целиком в одном фолде: валидация похожа на test с новыми значениями группы
+        n_groups = len(pd.unique(groups))
+        if n_groups >= 2:
+            n_folds = min(n_folds, n_groups)
+            if task_type in CLASSIFICATION:
+                splitter = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+                return list(splitter.split(np.zeros(n), y_enc, groups))
+            return list(GroupKFold(n_splits=n_folds).split(np.zeros(n), groups=groups))
+        logger.warning("В колонке разбиения меньше двух групп, использую случайные фолды")
     if task_type in CLASSIFICATION:
         min_count = int(np.bincount(y_enc).min())
         if min_count < n_folds:
@@ -596,8 +632,14 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     cfg["log_target"] = bool(log_target)
     y_train_scale = np.log1p(y_fit) if log_target else y_fit
 
-    Xp, Xtp, cat_cols = _prepare_features(X, X_test, cfg["features"])
+    Xp, Xtp, cat_cols = _prepare_features(X, X_test, cfg["features"], cfg["cat_encoding"])
     cfg["features"] = list(Xp.columns)
+    groups = None
+    if cfg["split"]:
+        split_col = cfg["split"].get("column")
+        if cfg["split"].get("type") != "group" or split_col not in X.columns:
+            raise ValueError(f"Некорректный split: {cfg['split']}, нужна колонка из X")
+        groups = X[split_col].to_numpy()[labeled]
     if not labeled.all():
         Xp = Xp.iloc[np.flatnonzero(labeled)]
     if cfg["model"] == "catboost":
@@ -611,7 +653,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     elif cfg["class_weight"] not in (None, "balanced"):
         logger.warning("class_weight=%r не поддерживается, игнорирую", cfg["class_weight"])
 
-    folds = _make_folds(y_fit, task_type, cfg["n_folds"], cfg["fold_seed"])
+    folds = _make_folds(y_fit, task_type, cfg["n_folds"], cfg["fold_seed"], groups)
     clip = task_type == "regression" and bool(cfg["clip_target"])
     cfg["n_folds"] = len(folds)
     fit_fn = _BACKENDS[cfg["model"]]
@@ -733,6 +775,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "config": cfg,
         # Дополнительно для журнала экспериментов
         "postprocess_time": time.monotonic() - t_post,
+        "fold_ids": _fold_ids(folds, done_folds, labeled),
         "fold_scores": [float(s) for s in fold_scores],
         "fold_scores_raw": [float(s) for s in fold_scores_raw],
         "fold_times": fold_times,
@@ -740,6 +783,16 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "greater_is_better": metric_obj.greater_is_better,
         "postprocess": postprocess_info,
     }
+
+
+def _fold_ids(folds: list, done_folds: list, labeled: np.ndarray) -> np.ndarray:
+    """Номер фолда валидации для каждой строки X, -1 для строк без таргета и невыполненных фолдов."""
+    ids_lab = np.full(int(labeled.sum()), -1, dtype=np.int16)
+    for i in done_folds:
+        ids_lab[folds[i][1]] = i
+    ids = np.full(len(labeled), -1, dtype=np.int16)
+    ids[labeled] = ids_lab
+    return ids
 
 
 def _finalize_regression(pred: np.ndarray, y_fit: np.ndarray, clip: bool) -> np.ndarray:
@@ -812,10 +865,15 @@ def _prepare_blend(results: list[dict], y: pd.Series, metric: str) -> _BlendData
         raise ValueError("Длина OOF не совпадает с длиной y")
 
     cfg0 = results[0]["config"]
-    fold_key = lambda c: (c.get("n_folds"), c.get("fold_seed", c.get("seed")))
-    if any(fold_key(r["config"]) != fold_key(cfg0) for r in results):
-        logger.warning("У результатов разные фолды, оценка бленда идет по фолдам первого результата")
-    folds = _make_folds(y_enc, task_type, cfg0["n_folds"], cfg0.get("fold_seed", cfg0["seed"]))
+    if "fold_ids" in results[0]:
+        fold_ids = np.asarray(results[0]["fold_ids"])
+        if any("fold_ids" in r and not np.array_equal(r["fold_ids"], fold_ids) for r in results):
+            logger.warning("У результатов разные фолды, оценка бленда идет по фолдам первого результата")
+        fid = fold_ids[labeled]
+        folds = [(np.flatnonzero((fid >= 0) & (fid != k)), np.flatnonzero(fid == k))
+                 for k in np.unique(fid[fid >= 0])]
+    else:
+        folds = _make_folds(y_enc, task_type, cfg0["n_folds"], cfg0.get("fold_seed", cfg0["seed"]))
     finite = np.isfinite(oofs).reshape(len(results), len(y_enc), -1).all(axis=(0, 2))
     folds = [f for f in folds if finite[f[1]].all()]
     if not folds:
@@ -1024,6 +1082,7 @@ def compare_results(a: dict, b: dict) -> dict:
 _AUTO_MIN_STEP = 20.0             # меньше стольких секунд на модель не запускаем (не больше 10% бюджета)
 _AUTO_MAX_SEEDS = 3               # максимум моделей одного типа с разными сидами
 _AUTO_SAFETY = 1.3                # запас к оценке времени следующей модели
+_AUTO_UNSEEN_MAX = 0.01           # при большей доле новых категорий в test XGBoost не используем
 
 
 def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
@@ -1103,19 +1162,37 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
             return previous
         return res
 
+    # XGBoost катастрофически ошибается на категориях, которых не было в train, а CV этого
+    # не видит: в OOF новых категорий не бывает. Поэтому при их заметной доле обходимся без него
+    features = base.get("features") or list(X.columns)
+    unseen = unseen_category_share(X[features], X_test[features])
+    use_xgb = max(unseen.values(), default=0.0) < _AUTO_UNSEEN_MAX
+    if not use_xgb:
+        logger.warning("auto_train: в test новые категории %s, XGBoost не используем",
+                       {k: round(v, 3) for k, v in unseen.items() if v >= _AUTO_UNSEEN_MAX})
+
     # Шаг 1: два бустинга с дефолтами, LightGBM первым как самый быстрый
     run("lgb", {"model": "lightgbm"}, budget=0.4 * (remaining() - reserve()), force=True)
     if not members:
         raise RuntimeError("auto_train: базовая модель не обучилась")
-    run("xgb", {"model": "xgboost"})
+    if use_xgb:
+        run("xgb", {"model": "xgboost"})
     best = blend(None)
 
     # Шаг 2: сиды XGBoost и LightGBM, пока следующая модель укладывается в остаток
-    is_clf = next(iter(members.values()))["config"]["task_type"] in CLASSIFICATION
-    queue = [("lgb_balanced", {"model": "lightgbm", "class_weight": "balanced"})] if is_clf else []
+    task_final = next(iter(members.values()))["config"]["task_type"]
+    queue = []
+    if task_final in CLASSIFICATION:
+        queue.append(("lgb_balanced", {"model": "lightgbm", "class_weight": "balanced"}))
+    else:
+        y_num = pd.to_numeric(pd.Series(np.asarray(y)), errors="coerce").dropna()
+        if len(y_num) and y_num.min() >= 0 and y_num.skew() > 1:
+            # Тяжелый хвост: log1p-модель как кандидат в бленд, веса решат, нужна ли она
+            queue.append(("lgb_log1p", {"model": "lightgbm", "log_target": True}))
     for k in range(1, _AUTO_MAX_SEEDS):
-        queue += [(f"xgb_seed{k + 1}", {"model": "xgboost", "seed": seed0 + k}),
-                  (f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k})]
+        if use_xgb:
+            queue.append((f"xgb_seed{k + 1}", {"model": "xgboost", "seed": seed0 + k}))
+        queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
     added = [run(name, extra) for name, extra in queue]
     if any(added):
         best = blend(best)

@@ -7,44 +7,46 @@ import time
 
 from openai import OpenAI
 
-from data_tools import inspect_data
+from data_tools import guess_task_spec, inspect_data
 from pipeline import check_result
 
+# Лимит платформы с запасом на завершение; TYRELL_TIME_LIMIT - только для локальных прогонов
+TOTAL_SECONDS = float(os.environ.get("TYRELL_TIME_LIMIT", 3 * 60 * 60)) - 90
+SAFETY_SHARE = 0.06                   # быстрый страховочный ответ
+AUTO_SHARE = 0.25                     # базовый auto_train до LLM
+FINAL_SHARE = 0.2                     # остаток на финальный auto_train с лучшими признаками
+LLM_ATTEMPTS = 4                      # попыток на один запрос к LLM
+KEEP_TOOL_MESSAGES = 4                # столько последних ответов инструментов отдаем LLM целиком
+TOOL_MESSAGE_LIMIT = 1500             # до скольких символов обрезаем старые ответы
+MAX_NUDGES = 3                        # сколько раз просим LLM продолжать, если время осталось
 
-INSTRUCTION = """Ты — агент для решения задач машинного обучения.
-Тебе даны условие и сводка CSV от data_tools.inspect_data.
-Определи целевую колонку, ID, тип задачи и ОСНОВНУЮ метрику по условию.
-Не выбирай тип задачи только по числовому типу target: числа бывают метками классов.
+INSTRUCTION = """Ты — агент для решения задач машинного обучения на табличных данных.
+Тебе даны условие, сводка CSV и уже определённый task_spec (target, id, тип задачи, метрика).
+task_spec менять нельзя, он передаётся в эксперименты автоматически.
 
-Вызывай run_experiment: он соединяет data_tools.load_data,
-training.train_and_predict и submission.make_submission.
-task_spec содержит target_column, id_columns (список из одной колонки),
-task_type (regression, binary или multiclass), metric, probabilities (нужны ли
-вероятности В ФАЙЛЕ ответа). Для бинарных вероятностей можно задать positive_class.
-Метрики: rmse, mse, mae, r2, rmsle, mape, macro_f1, weighted_f1, f1,
-accuracy, balanced_accuracy, mcc, roc_auc, gini, pr_auc, logloss.
-config задаёт model (lightgbm, catboost, xgboost), params, num_boost_round,
-early_stopping_rounds, class_weight, features. Начни с простой быстрой модели.
-Валидация — одинаковые случайные фолды с фиксированным seed; для классификации
-они стратифицированы. Не считай такую оценку подходящей для временного/группового
-разбиения, если оно требуется условием; сообщи об этом ограничении.
+Базовое решение уже обучено и сохранено: auto_train (LightGBM и XGBoost с несколькими
+сидами и взвешенным блендом, для метрик по меткам ещё подбор весов классов).
+Твоя задача — улучшить результат валидации гипотезами. Самые полезные гипотезы:
+1. Новые признаки через feature_code: строка Python с функцией make_features(df) -> df.
+   df — признаки train и test одной таблицей, без target и id; верни df с теми же строками
+   (можно добавлять и удалять колонки). Доступны pd и np. Примеры: отношения и разности
+   числовых признаков, частота категорий (df[c].map(df[c].value_counts())), агрегаты
+   по группам (df.groupby(c)[x].transform("mean")), число пропусков в строке, части дат.
+2. Параметры модели через config: model (lightgbm, xgboost, catboost), params,
+   num_boost_round, early_stopping_rounds, class_weight, log_target, cat_encoding
+   (native или frequency), features (список колонок).
+3. recipe: "single" — одна модель (быстро, для проверки гипотезы), "auto" — полный рецепт
+   с блендом (медленнее, сильнее). Удачные признаки проверяй потом с recipe "auto".
 
-Сначала сохрани базовый submission, затем предложи гипотезу улучшения и запусти
-следующий эксперимент. Инструмент возвращает score, saved и problems.
-Чем лучше метрика, тем лучше эксперимент; направление возвращается инструментом.
-Файл перезаписывается только при улучшении сравнимого результата валидации.
-Не меняй task_spec между экспериментами. Анализируй ошибки и исправляй config.
-Не пиши submission.csv вручную: сборкой и проверкой занимается submission.py.
+Валидация — 5 фолдов, одинаковых во всех экспериментах; если test похож на новый период,
+фолды строятся группами по этой колонке. Результат сохраняется в submission.csv, только
+если он лучше сохранённого. Инструмент возвращает score, fold_scores, saved и best_saved_score.
+Сравнивай гипотезы по score с одинаковым recipe; разница меньше разброса fold_scores — шум.
 
-Каждый вызов run_python запускает отдельный процесс: переменные не сохраняются,
-но файлы сохраняются. Все относительные пути отсчитываются от папки задачи.
-run_python нужен для дополнительного анализа и генерации признаков.
-Для обучения используй run_experiment. Модули проекта доступны для импорта.
-Используй только установленные библиотеки.
-Не устанавливай пакеты, не обращайся в интернет и не читай ключи или .env.
-Доступно 8 CPU и 32 ГБ памяти. На один запуск кода — до 30 минут,
-на всю задачу — чуть меньше 3 часов. Сначала сохрани базовые предсказания.
-В конце кратко сообщи результат валидации и путь к submission.csv.
+run_python запускает отдельный процесс для анализа данных; файлы сохраняются, переменные нет.
+Относительные пути — от папки задачи. Не устанавливай пакеты, не ходи в интернет,
+не читай ключи и .env. Доступно 8 CPU и 32 ГБ памяти.
+Работай, пока есть время: после каждого результата предлагай следующую гипотезу.
 """
 
 TOOLS = [{
@@ -59,56 +61,46 @@ TOOLS = [{
             "additionalProperties": False,
         },
     },
-}]
-
-TOOLS.append({
+}, {
     "type": "function",
     "function": {
         "name": "run_experiment",
-        "description": "Загрузить данные, обучить модель, оценить и сохранить лучший submission.",
+        "description": "Обучить модель на текущем task_spec, оценить на фолдах и сохранить submission при улучшении.",
         "parameters": {
             "type": "object",
             "properties": {
-                "task_spec": {
-                    "type": "object",
-                    "properties": {
-                        "target_column": {"type": "string"},
-                        "id_columns": {"type": "array", "items": {"type": "string"}},
-                        "task_type": {"type": "string", "enum": ["regression", "binary", "multiclass"]},
-                        "metric": {"type": "string"},
-                        "probabilities": {"type": "boolean"},
-                        "positive_class": {"type": ["string", "number", "boolean"]},
-                    },
-                    "required": ["target_column", "id_columns", "task_type", "metric", "probabilities"],
-                    "additionalProperties": False,
-                },
                 "config": {"type": "object"},
-                "time_budget": {"type": "number", "minimum": 10, "maximum": 1500},
+                "recipe": {"type": "string", "enum": ["single", "auto"]},
+                "feature_code": {"type": "string"},
+                "time_budget": {"type": "number", "minimum": 30, "maximum": 2400},
             },
-            "required": ["task_spec", "config", "time_budget"],
+            "required": ["config", "recipe", "time_budget"],
             "additionalProperties": False,
         },
     },
-})
+}]
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
 
 
 def run_python(code, task_dir, timeout):
+    # Окружение наследуем, иначе часть библиотек не находит свои пакеты и HOME,
+    # но ключи LLM в код агента не передаем
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("OPENAI_")}
+    env |= {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(Path(__file__).resolve().parent),
+        "OMP_NUM_THREADS": "8",
+        "OPENBLAS_NUM_THREADS": "8",
+    }
+    env.setdefault("HOME", str(task_dir))
     try:
         result = subprocess.run(
             [sys.executable, "-u", "-c", code],
-            cwd=task_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env={
-                "PATH": os.defpath,
-                "PYTHONIOENCODING": "utf-8",
-                "PYTHONPATH": str(Path(__file__).resolve().parent),
-                "OMP_NUM_THREADS": "8",
-                "OPENBLAS_NUM_THREADS": "8",
-            },
+            cwd=task_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, env=env,
         )
         return {
             "stdout": result.stdout[-12000:],
@@ -119,79 +111,219 @@ def run_python(code, task_dir, timeout):
         return {"error": "Превышено время выполнения кода."}
 
 
+def experiment(task_dir, spec, budget, recipe="single", config=None, feature_code=None):
+    """Эксперимент в отдельном процессе: падение или утечка памяти не задевают агента."""
+    payload = json.dumps({"task_spec": spec, "config": config or {}, "time_budget": budget,
+                          "recipe": recipe, "feature_code": feature_code}, ensure_ascii=False)
+    code = (
+        "import json; from pipeline import run_experiment; "
+        f"args = json.loads({payload!r}); "
+        "print(json.dumps(run_experiment('.', **args), ensure_ascii=False, default=str))"
+    )
+    result = run_python(code, task_dir, timeout=budget * 1.2 + 180)
+    if result.get("exit_code") == 0:
+        try:
+            return json.loads(result["stdout"].strip().splitlines()[-1]), result
+        except (ValueError, IndexError):
+            pass
+    return None, result
+
+
+def fallback(task_dir, spec):
+    """Константный ответ, если не обучилась даже быстрая модель."""
+    payload = json.dumps(spec, ensure_ascii=False)
+    code = ("import json; from pipeline import write_fallback; "
+            f"print(write_fallback('.', json.loads({payload!r})))")
+    log(f"Константный ответ: {run_python(code, task_dir, timeout=600)}")
+    if not (task_dir / "submission.csv").exists():
+        # Последний рубеж: дочерний процесс не смог даже это, пишем из основного
+        from pipeline import write_fallback
+        try:
+            log(f"Константный ответ из основного процесса: {write_fallback(task_dir, spec)}")
+        except Exception as error:
+            log(f"Не удалось записать даже константный ответ: {error}")
+
+
+def ask_llm(client, messages, deadline):
+    """Запрос с повторами. None, если LLM недоступна: агент продолжит без нее."""
+    for attempt in range(LLM_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining < 60:
+            return None
+        try:
+            return client.chat.completions.create(
+                model=os.environ["OPENAI_MODEL"], messages=trim_history(messages),
+                tools=TOOLS, parallel_tool_calls=False, timeout=min(180, remaining - 30),
+            )
+        except Exception as error:  # сеть, лимиты, ошибки сервера: пробуем еще раз
+            log(f"LLM недоступна (попытка {attempt + 1}): {type(error).__name__}: {error}")
+            time.sleep(min(10 * 2 ** attempt, 90, max(0.0, (deadline - time.monotonic()) / 4)))
+    return None
+
+
+def trim_history(messages):
+    """Старые ответы инструментов обрезаем, чтобы история помещалась в контекст и не тратила лимит."""
+    tool_positions = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    old = set(tool_positions[:-KEEP_TOOL_MESSAGES])
+    trimmed = []
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if i in old and isinstance(content, str) and len(content) > TOOL_MESSAGE_LIMIT:
+            message = message | {"content": content[:TOOL_MESSAGE_LIMIT] + " ...(обрезано)"}
+        trimmed.append(message)
+    return trimmed
+
+
+def resolve_spec(client, task, summary, guess, deadline):
+    """Уверенной эвристике верим; иначе просим LLM уточнить task_spec и проверяем ответ."""
+    spec, confident = guess
+    if confident or client is None:
+        return spec
+    messages = [
+        {"role": "system", "content": "Определи task_spec задачи. Ответь только JSON с ключами "
+                                      "target_column, id_columns (список из одной колонки), task_type "
+                                      "(regression, binary, multiclass), metric, probabilities."},
+        {"role": "user", "content": task + "\n\nСводка данных:\n" + json.dumps(summary, ensure_ascii=False)[:30000]
+                                    + "\n\nПредположение по данным:\n" + json.dumps(spec, ensure_ascii=False)},
+    ]
+    for attempt in range(LLM_ATTEMPTS):
+        if deadline - time.monotonic() < 120:
+            break
+        try:
+            response = client.chat.completions.create(
+                model=os.environ["OPENAI_MODEL"], messages=messages, timeout=120,
+            )
+            text = response.choices[0].message.content or ""
+            answer = json.loads(text[text.index("{"):text.rindex("}") + 1])
+            candidate = spec | {k: answer[k] for k in spec if k in answer}
+            if candidate["target_column"] in summary.get("possible_targets", []) + [spec["target_column"]] \
+                    and candidate["task_type"] in ("regression", "binary", "multiclass"):
+                return candidate
+        except Exception as error:
+            log(f"Не удалось уточнить task_spec (попытка {attempt + 1}): {error}")
+            time.sleep(5)
+    return spec
+
+
 def run_agent(task_path):
-    deadline = time.monotonic() + 3 * 60 * 60 - 60
-    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"):
-        if not os.environ.get(name, "").strip():
-            raise ValueError(f"Задайте переменную окружения {name} перед запуском.")
+    start = time.monotonic()
+    deadline = start + TOTAL_SECONDS
+    remaining = lambda: deadline - time.monotonic()
     task_path = task_path.resolve()
+    task_dir = task_path.parent
     task = task_path.read_text(encoding="utf-8")
-    summary = inspect_data(task_path.parent)
-    (task_path.parent / ".tyrell_experiments.json").write_text("[]", encoding="utf-8")
+    summary = inspect_data(task_dir)
+    (task_dir / ".tyrell_experiments.json").write_text("[]", encoding="utf-8")
+
+    keys_ok = all(os.environ.get(n, "").strip() for n in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"))
+    client = OpenAI(max_retries=1) if keys_ok else None
+    if not keys_ok:
+        log("Ключи LLM не заданы, работаю без LLM.")
+
+    # Шаг 0: task_spec и страховочный ответ до любых долгих запросов к LLM
+    try:
+        guess = guess_task_spec(task_dir, task)
+    except ValueError as error:
+        log(f"Эвристика не определила task_spec: {error}")
+        guess = ({"target_column": None, "id_columns": [], "task_type": None, "metric": None,
+                  "probabilities": False}, False)
+    spec = resolve_spec(client, task, summary, guess, deadline)
+    log(f"task_spec: {spec}")
+    report, raw = experiment(task_dir, spec, budget=SAFETY_SHARE * TOTAL_SECONDS)
+    log(f"Страховочный ответ: {report and report['score']}")
+    if report is None or not report.get("saved"):
+        log(f"Быстрая модель не сохранилась: {str(raw)[-2000:]}")
+        fallback(task_dir, spec)
+
+    # Шаг 1: базовый auto_train
+    budget = min(AUTO_SHARE * TOTAL_SECONDS, remaining() - FINAL_SHARE * TOTAL_SECONDS)
+    if budget > 120:
+        report, raw = experiment(task_dir, spec, budget=budget, recipe="auto")
+        log(f"auto_train: {report and {k: report[k] for k in ('score', 'saved', 'members')}}")
+        if report is None:
+            log(f"auto_train упал: {str(raw)[-2000:]}")
+
+    # Шаг 2: цикл гипотез с LLM
+    if client is not None:
+        run_llm_loop(client, task, summary, spec, task_dir, deadline)
+
+    # Шаг 3: финальный auto_train с лучшими признаками, если они нашлись
+    history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
+    saved = [h for h in history if h["saved"]]
+    best = saved[-1] if saved else None
+    budget = remaining() - 120
+    if best and best.get("feature_code") and best["recipe"] != "auto" and budget > 300:
+        report, _ = experiment(task_dir, spec, budget=budget, recipe="auto",
+                               config={k: v for k, v in best["config"].items() if k == "cat_encoding"},
+                               feature_code=best["feature_code"])
+        log(f"Финальный auto_train с признаками: {report and report['score']}")
+
+    try:
+        check_result(task_dir)
+        print(f"Готово: submission.csv сохранён, лучший результат валидации "
+              f"{saved and saved[-1]['score']}.")
+    except Exception as error:
+        print(f"Проверка submission.csv: {error}")
+
+
+def run_llm_loop(client, task, summary, spec, task_dir, deadline):
+    llm_deadline = deadline - FINAL_SHARE * TOTAL_SECONDS
+    history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
+    context = {"task_spec": spec, "experiments": [
+        {k: h.get(k) for k in ("recipe", "score", "fold_scores", "saved", "members")} for h in history]}
     messages = [
         {"role": "system", "content": INSTRUCTION},
-        {"role": "user", "content": task + "\n\nСводка данных:\n" + json.dumps(summary, ensure_ascii=False)},
+        {"role": "user", "content": task + "\n\nСводка данных:\n" + json.dumps(summary, ensure_ascii=False)
+                                    + "\n\nУже сделано:\n" + json.dumps(context, ensure_ascii=False, default=str)},
     ]
+    nudges = 0
+    for step in range(200):
+        if llm_deadline - time.monotonic() < 120:
+            break
+        log(f"Шаг {step + 1}. До финала {int(llm_deadline - time.monotonic())} секунд.")
+        response = ask_llm(client, messages, llm_deadline)
+        if response is None:
+            log("LLM не отвечает, перехожу к финалу.")
+            return
+        message = response.choices[0].message
+        messages.append(message.model_dump(exclude_none=True))
 
-    with OpenAI(max_retries=0) as client:
-        for step in range(100):
-            remaining = deadline - time.monotonic()
-            if remaining <= 1:
-                break
-            print(f"Шаг {step + 1}. Осталось {int(remaining)} секунд.", file=sys.stderr)
-            response = client.chat.completions.create(
-                model=os.environ["OPENAI_MODEL"],
-                messages=messages,
-                tools=TOOLS,
-                parallel_tool_calls=False,
-                timeout=min(120, remaining),
-            )
-            message = response.choices[0].message
-            messages.append(message.model_dump(exclude_none=True))
-
-            if not message.tool_calls:
-                check_result(task_path.parent)
-                print(message.content or "Готово: submission.csv сохранён.")
+        if not message.tool_calls:
+            left = llm_deadline - time.monotonic()
+            if nudges >= MAX_NUDGES or left < 600:
                 return
+            nudges += 1
+            messages.append({"role": "user", "content": f"Осталось около {int(left // 60)} минут. "
+                             "Предложи и проверь следующую гипотезу: новые признаки или параметры."})
+            continue
 
-            for call in message.tool_calls:
-                try:
-                    arguments = json.loads(call.function.arguments)
-                    remaining = deadline - time.monotonic()
-                    if call.function.name == "run_experiment":
-                        budget = min(float(arguments.get("time_budget", 300)), 1500, remaining - 5)
-                        if budget <= 0:
-                            raise ValueError("Время на новый эксперимент закончилось.")
-                        payload = json.dumps({
-                            "task_spec": arguments["task_spec"],
-                            "config": arguments.get("config", {}), "time_budget": budget,
-                        }, ensure_ascii=False)
-                        code = (
-                            "import json; from pipeline import run_experiment; "
-                            f"args = json.loads({payload!r}); "
-                            "print(json.dumps(run_experiment('.', **args), ensure_ascii=False))"
-                        )
-                    elif call.function.name == "run_python":
-                        code = arguments["code"]
-                    else:
-                        raise ValueError("Неизвестный инструмент.")
+        for call in message.tool_calls:
+            try:
+                arguments = json.loads(call.function.arguments)
+                left = llm_deadline - time.monotonic()
+                if call.function.name == "run_experiment":
+                    budget = min(float(arguments.get("time_budget", 300)), 2400, left - 60)
+                    if budget < 30:
+                        raise ValueError("Время на новые эксперименты закончилось.")
+                    report, raw = experiment(
+                        task_dir, spec, budget=budget, recipe=arguments.get("recipe", "single"),
+                        config=arguments.get("config") or {}, feature_code=arguments.get("feature_code"),
+                    )
+                    result = report if report is not None else raw
+                elif call.function.name == "run_python":
+                    code = arguments["code"]
                     if not isinstance(code, str):
                         raise ValueError("Аргумент code должен быть строкой.")
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        result = {"error": "Общее время работы истекло."}
-                    else:
-                        result = run_python(code, task_path.parent, min(1800, remaining))
-                except (ValueError, KeyError, TypeError, OSError) as error:
-                    result = {"error": str(error)}
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
-
-    check_result(task_path.parent)
-    print("Лимит работы достигнут. Оставлен сохранённый submission.csv.")
+                    result = run_python(code, task_dir, min(1800, max(30, left)))
+                else:
+                    raise ValueError("Неизвестный инструмент.")
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                result = {"error": str(error)}
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(result, ensure_ascii=False, default=str),
+            })
 
 
 if __name__ == "__main__":

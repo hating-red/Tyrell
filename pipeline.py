@@ -2,14 +2,40 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from data_tools import load_data
+from data_tools import detect_split, load_data
 from submission import make_submission, validate_submission
 
+# Ключи конфига, которые имеют смысл для всего рецепта auto, а не для одной модели
+AUTO_KEYS = ("features", "cat_encoding")
 
-def run_experiment(task_dir, task_spec, config=None, time_budget=300):
-    from training import METRICS, train_and_predict
+
+def apply_feature_code(feature_code, X_train, X_test):
+    """Применяет код признаков от агента одинаково к train и test.
+
+    Код должен определять make_features(df) -> DataFrame с теми же строками. В df нет таргета,
+    поэтому утечки через него не будет. train и test идут одной таблицей, чтобы частоты и
+    агрегаты считались одинаково.
+    """
+    namespace = {"pd": pd, "np": np}
+    exec(feature_code, namespace)
+    make_features = namespace.get("make_features")
+    if not callable(make_features):
+        raise ValueError("feature_code должен определять функцию make_features(df).")
+    full = pd.concat([X_train, X_test], ignore_index=True)
+    result = make_features(full.copy())
+    if not isinstance(result, pd.DataFrame) or len(result) != len(full):
+        raise ValueError("make_features должна вернуть DataFrame с тем же числом строк.")
+    if result.columns.duplicated().any():
+        raise ValueError("make_features вернула повторяющиеся названия колонок.")
+    result = result.reset_index(drop=True)
+    return result.iloc[:len(X_train)].reset_index(drop=True), result.iloc[len(X_train):].reset_index(drop=True)
+
+
+def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="single", feature_code=None):
+    from training import METRICS, auto_train, train_and_predict
 
     task_dir = Path(task_dir)
     data = load_data(task_dir, task_spec)
@@ -24,29 +50,51 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300):
             raise ValueError("Для стратифицированной валидации нужно хотя бы 2 строки на класс.")
     if not math.isfinite(time_budget) or time_budget <= 0:
         raise ValueError("time_budget должен быть положительным конечным числом.")
+    if recipe not in ("single", "auto"):
+        raise ValueError("recipe должен быть single или auto.")
 
     history_path = task_dir / ".tyrell_experiments.json"
     history = json.loads(history_path.read_text()) if history_path.exists() else []
     if history and history[0]["task_spec"] != task_spec:
         raise ValueError("Не меняйте тип задачи, target, ID или метрику между экспериментами.")
-    cfg = {"num_boost_round": 300, "early_stopping_rounds": 30, **(config or {})}
-    cfg.update(n_folds=3, fold_seed=42, n_jobs=8)
+
+    X_train, X_test = data["X_train"].reset_index(drop=True), data["X_test"].reset_index(drop=True)
+    if feature_code:
+        X_train, X_test = apply_feature_code(feature_code, X_train, X_test)
+    y_train = data["y_train"].reset_index(drop=True)
+
+    # Фолды одинаковые во всех экспериментах, иначе скоры несравнимы: агент их не меняет.
+    # Разбиение группами включается само, если test похож на новый период
+    split = detect_split(X_train, X_test)
+    cfg = dict(config or {})
+    for key in ("n_folds", "fold_seed", "split", "n_jobs"):
+        cfg.pop(key, None)
     cfg["params"] = dict(cfg.get("params") or {})
     for key in ("num_threads", "nthread", "thread_count", "n_jobs"):
         if key in cfg["params"]:
             cfg["params"][key] = 8
-    result = train_and_predict(
-        data["X_train"], data["y_train"], data["X_test"], task_type, metric,
-        config=cfg, time_budget=time_budget,
-    )
+    fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": 8, "split": split}
+
+    if recipe == "auto":
+        result = auto_train(
+            X_train, y_train, X_test, task_type, metric, time_budget,
+            config={k: cfg[k] for k in AUTO_KEYS if k in cfg} | fixed,
+        )
+    else:
+        result = train_and_predict(
+            X_train, y_train, X_test, task_type, metric, config=cfg | fixed, time_budget=time_budget,
+        )
     if not math.isfinite(result["score"]):
         raise ValueError("Валидация вернула нечисловой результат.")
+    n_folds = result["config"]["n_folds"]
+    n_folds_done = result["config"].get("n_folds_done", n_folds)
+
     saved = [item for item in history if item["saved"]]
     previous = saved[-1] if saved else None
-    complete = result["config"]["n_folds_done"] == result["config"]["n_folds"]
+    complete = n_folds_done == n_folds
     better = previous is None
     if previous is not None:
-        same_folds = result["config"]["n_folds_done"] == previous["config"]["n_folds_done"]
+        same_folds = n_folds_done == previous["n_folds_done"]
         improved = (result["score"] > previous["score"] if result["greater_is_better"]
                     else result["score"] < previous["score"])
         better = (complete and not previous["complete"]) or (same_folds and improved)
@@ -74,15 +122,50 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300):
             predictions, data["test_ids"], data["sample_path"], task_dir / "submission.csv",
             allowed_labels=labels, probabilities=probabilities, class_order=result["class_order"],
         )
+    best_score = result["score"] if better and not problems else (previous["score"] if previous else None)
     report = {
-        "task_spec": task_spec, "score": result["score"], "metric": metric,
+        "task_spec": task_spec, "recipe": recipe, "feature_code": feature_code,
+        "score": result["score"], "score_std": result["score_std"], "metric": metric,
+        "fold_scores": [round(s, 6) for s in result.get("fold_scores", [])],
         "greater_is_better": result["greater_is_better"], "complete": complete,
-        "saved": better and not problems, "problems": problems,
-        "config": result["config"], "fit_time": result["fit_time"],
+        "n_folds_done": n_folds_done, "split": split,
+        "saved": better and not problems, "problems": problems, "best_saved_score": best_score,
+        "members": result.get("members"),
+        "config": {k: v for k, v in cfg.items() if k != "features"}, "fit_time": result["fit_time"],
     }
     history.append(report)
-    history_path.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+    history_path.write_text(json.dumps(history, ensure_ascii=False, default=str), encoding="utf-8")
     return report
+
+
+def write_fallback(task_dir, task_spec):
+    """Простой ответ без модели: среднее таргета или самый частый класс. Только если файла еще нет."""
+    task_dir = Path(task_dir)
+    if (task_dir / "submission.csv").exists():
+        return []
+    data = load_data(task_dir, task_spec)
+    y = data["y_train"].dropna()
+    sample = pd.read_csv(data["sample_path"], nrows=0)
+    n = len(data["test_ids"])
+    if task_spec["task_type"] == "regression":
+        predictions, probabilities, class_order, labels = np.full(n, float(y.mean())), False, None, None
+    else:
+        shares = y.value_counts(normalize=True).sort_index()
+        class_order = shares.index.tolist()
+        if task_spec.get("probabilities") or len(sample.columns) > 2:
+            probabilities = True
+            predictions = np.tile(shares.to_numpy(), (n, 1))
+            if len(sample.columns) == 2:
+                positive = task_spec.get("positive_class", class_order[-1])
+                predictions = predictions[:, class_order.index(positive)]
+            labels = None
+        else:
+            probabilities, labels = False, set(class_order)
+            predictions = np.full(n, shares.idxmax(), dtype=object)
+    return make_submission(
+        predictions, data["test_ids"], data["sample_path"], task_dir / "submission.csv",
+        allowed_labels=labels, probabilities=probabilities, class_order=class_order,
+    )
 
 
 def check_result(task_dir):
