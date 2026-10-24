@@ -11,7 +11,9 @@ from data_tools import guess_task_spec, inspect_data
 from pipeline import check_result
 
 # Лимит платформы с запасом на завершение; TYRELL_TIME_LIMIT - только для локальных прогонов
-TOTAL_SECONDS = float(os.environ.get("TYRELL_TIME_LIMIT", 3 * 60 * 60)) - 90
+# Запас 10 минут: платформа считает длительность вместе с запуском контейнера и данными
+TOTAL_SECONDS = float(os.environ.get("TYRELL_TIME_LIMIT", 3 * 60 * 60)) - 600
+HARD_DEADLINE = [None]                # общий дедлайн: ни один эксперимент его не переживет
 SAFETY_SHARE = 0.06                   # быстрый страховочный ответ
 AUTO_SHARE = 0.25                     # базовый auto_train до LLM
 FINAL_SHARE = 0.2                     # остаток на финальный auto_train с лучшими признаками
@@ -123,7 +125,13 @@ def experiment(task_dir, spec, budget, recipe="single", config=None, feature_cod
         f"args = json.loads({payload!r}); "
         "print(json.dumps(run_experiment('.', **args), ensure_ascii=False, default=str))"
     )
-    result = run_python(code, task_dir, timeout=budget * 1.2 + 180)
+    timeout = budget * 1.2 + 180
+    if HARD_DEADLINE[0] is not None:
+        # Не дольше общего дедлайна: сабмит пишется атомарно, недоделанный шаг его не испортит
+        timeout = min(timeout, HARD_DEADLINE[0] - time.monotonic())
+    if timeout < 30:
+        return None, {"error": "Общее время работы истекло."}
+    result = run_python(code, task_dir, timeout=timeout)
     if result.get("exit_code") == 0:
         try:
             return json.loads(result["stdout"].strip().splitlines()[-1]), result
@@ -211,6 +219,7 @@ def resolve_spec(client, task, summary, guess, deadline):
 def run_agent(task_path):
     start = time.monotonic()
     deadline = start + TOTAL_SECONDS
+    HARD_DEADLINE[0] = deadline
     remaining = lambda: deadline - time.monotonic()
     task_path = task_path.resolve()
     task_dir = task_path.parent
@@ -255,7 +264,8 @@ def run_agent(task_path):
     history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
     saved = [h for h in history if h["saved"]]
     best = saved[-1] if saved else None
-    budget = remaining() - 120
+    # Поправка на перерасход auto_train до 5% и загрузку данных в дочернем процессе
+    budget = (remaining() - 180) / 1.1
     if budget > 300:
         config = {"max_seeds": FINAL_MAX_SEEDS}
         if best:
