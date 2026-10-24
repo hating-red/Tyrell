@@ -8,6 +8,8 @@ import pandas as pd
 from data_tools import detect_split, load_data
 from submission import make_submission, validate_submission
 
+PREDS_DIR = ".tyrell_preds"       # OOF и предсказания test завершенных экспериментов для ансамбля
+
 # Ключи конфига, которые имеют смысл для всего рецепта auto, а не для одной модели
 AUTO_KEYS = ("features", "cat_encoding", "target_encoding", "refit_full")
 
@@ -115,11 +117,23 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         result = train_and_predict(
             X_train, y_train, X_test, task_type, metric, config=cfg | fixed, time_budget=time_budget,
         )
+    report = {
+        "task_spec": task_spec, "recipe": recipe, "feature_code": feature_code,
+        "auto_features": auto_features, "target_encoding": target_encoding or False, "te_keys": te_specs,
+        "split": split, "members": result.get("members"),
+        "config": {k: v for k, v in cfg.items() if k != "features"},
+    }
+    return _record(task_dir, task_spec, data, history, result, report)
+
+
+def _record(task_dir, task_spec, data, history, result, report):
+    """Сравнение с сохраненным, запись сабмита при улучшении, предсказания для ансамбля, журнал."""
+    from training import compare_results
+
     if not math.isfinite(result["score"]):
         raise ValueError("Валидация вернула нечисловой результат.")
     n_folds = result["config"]["n_folds"]
     n_folds_done = result["config"].get("n_folds_done", n_folds)
-
     saved = [item for item in history if item["saved"]]
     previous = saved[-1] if saved else None
     complete = n_folds_done == n_folds
@@ -135,46 +149,104 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
                 {"fold_scores": result["fold_scores"], "greater_is_better": result["greater_is_better"]},
             )
         better = (complete and not previous["complete"]) or (same_folds and comparison["accept"])
-    problems = []
-    if better:
-        probabilities = task_spec.get("probabilities", False)
-        predictions = result["predictions"]
-        sample = pd.read_csv(data["sample_path"], nrows=0)
-        answer_count = len(sample.columns) - 1
-        if probabilities or answer_count > 1:
-            predictions = result["probabilities"]
-            probabilities = True
-            if predictions is None:
-                raise ValueError("Регрессионная модель не возвращает вероятности классов.")
-            if answer_count == 1:
-                classes = result["class_order"]
-                if len(classes) != 2:
-                    raise ValueError("Одной колонки вероятностей недостаточно для нескольких классов.")
-                positive = task_spec.get("positive_class", classes[1])
-                if positive not in classes:
-                    raise ValueError("positive_class отсутствует среди меток обучения.")
-                predictions = predictions[:, classes.index(positive)]
-        labels = set(result["class_order"]) if task_type != "regression" and not probabilities else None
-        problems = make_submission(
-            predictions, data["test_ids"], data["sample_path"], task_dir / "submission.csv",
-            allowed_labels=labels, probabilities=probabilities, class_order=result["class_order"],
-        )
-    best_score = result["score"] if better and not problems else (previous["score"] if previous else None)
-    report = {
-        "task_spec": task_spec, "recipe": recipe, "feature_code": feature_code,
-        "auto_features": auto_features, "target_encoding": target_encoding or False, "te_keys": te_specs,
-        "score": result["score"], "score_std": result["score_std"], "metric": metric,
+    problems = _write_submission(task_dir, task_spec, data, result) if better else []
+
+    # Предсказания завершенных экспериментов храним на диске: в конце их можно смешать
+    preds_file = None
+    if complete and "fold_ids" in result:
+        preds_dir = task_dir / PREDS_DIR
+        preds_dir.mkdir(exist_ok=True)
+        preds_file = str(preds_dir / f"{len(history)}.npz")
+        test = result["probabilities"] if result["probabilities"] is not None else result["predictions"]
+        np.savez_compressed(preds_file, oof=np.asarray(result["oof"], dtype=np.float32),
+                            test=np.asarray(test, dtype=np.float32), fold_ids=result["fold_ids"])
+
+    report = report | {
+        "score": result["score"], "score_std": result["score_std"], "metric": task_spec["metric"],
         "fold_scores": [round(s, 6) for s in result.get("fold_scores", [])],
-        "greater_is_better": result["greater_is_better"], "complete": complete,
-        "n_folds_done": n_folds_done, "split": split,
-        "saved": better and not problems, "problems": problems, "best_saved_score": best_score,
+        "greater_is_better": result["greater_is_better"], "complete": complete, "n_folds_done": n_folds_done,
+        "saved": better and not problems, "problems": problems,
+        "best_saved_score": result["score"] if better and not problems else (previous["score"] if previous else None),
         "vs_saved": comparison and {k: comparison[k] for k in ("accept", "diff_mean", "diff_std", "n_better")},
-        "members": result.get("members"),
-        "config": {k: v for k, v in cfg.items() if k != "features"}, "fit_time": result["fit_time"],
+        "fit_time": result["fit_time"], "preds_file": preds_file, "class_order": result["class_order"],
     }
     history.append(report)
-    history_path.write_text(json.dumps(history, ensure_ascii=False, default=str), encoding="utf-8")
+    (task_dir / ".tyrell_experiments.json").write_text(json.dumps(history, ensure_ascii=False, default=str),
+                                                       encoding="utf-8")
     return report
+
+
+def _write_submission(task_dir, task_spec, data, result):
+    """Сабмит по формату sample_submission: метки, вероятность одного класса или всех классов."""
+    task_type = task_spec["task_type"]
+    probabilities = task_spec.get("probabilities", False)
+    predictions = result["predictions"]
+    sample = pd.read_csv(data["sample_path"], nrows=0)
+    answer_count = len(sample.columns) - 1
+    if probabilities or answer_count > 1:
+        predictions = result["probabilities"]
+        probabilities = True
+        if predictions is None:
+            raise ValueError("Регрессионная модель не возвращает вероятности классов.")
+        if answer_count == 1:
+            classes = result["class_order"]
+            if len(classes) != 2:
+                raise ValueError("Одной колонки вероятностей недостаточно для нескольких классов.")
+            positive = task_spec.get("positive_class", classes[1])
+            if positive not in classes:
+                raise ValueError("positive_class отсутствует среди меток обучения.")
+            predictions = predictions[:, classes.index(positive)]
+    labels = set(result["class_order"]) if task_type != "regression" and not probabilities else None
+    return make_submission(
+        predictions, data["test_ids"], data["sample_path"], Path(task_dir) / "submission.csv",
+        allowed_labels=labels, probabilities=probabilities, class_order=result["class_order"],
+    )
+
+
+def run_ensemble(task_dir, task_spec, max_members=8):
+    """Смесь лучших завершенных экспериментов: разные наборы признаков ошибаются по-разному.
+
+    Фолды у всех экспериментов одинаковые, поэтому OOF смешиваются честно; веса подбираются
+    с кросс-фиттингом, а сабмит заменяется по тому же правилу, что и после эксперимента.
+    """
+    from training import optimize_blend_weights
+
+    task_dir = Path(task_dir)
+    history_path = task_dir / ".tyrell_experiments.json"
+    history = json.loads(history_path.read_text()) if history_path.exists() else []
+    candidates = [h for h in history if h.get("preds_file") and Path(h["preds_file"]).exists()
+                  and h["recipe"] != "ensemble"]
+    if len(candidates) < 2:
+        raise ValueError("Для ансамбля нужно хотя бы два завершенных эксперимента.")
+    greater = candidates[0]["greater_is_better"]
+    candidates = sorted(candidates, key=lambda h: h["score"], reverse=greater)[:max_members]
+
+    data = load_data(task_dir, task_spec)
+    is_regression = task_spec["task_type"] == "regression"
+    results = []
+    for h in candidates:
+        stored = np.load(h["preds_file"])
+        results.append({
+            "oof": stored["oof"].astype(float), "fold_ids": stored["fold_ids"],
+            "predictions": stored["test"].astype(float) if is_regression else None,
+            "probabilities": None if is_regression else stored["test"].astype(float),
+            "class_order": h["class_order"], "score": h["score"], "score_std": h["score_std"],
+            "fold_scores": h["fold_scores"], "greater_is_better": greater, "fit_time": h["fit_time"],
+            "config": {"task_type": task_spec["task_type"], "n_folds": h["n_folds_done"],
+                       "n_folds_done": h["n_folds_done"], "seed": 42, "fold_seed": 42},
+        })
+    result = optimize_blend_weights(results, data["y_train"].reset_index(drop=True), task_spec["metric"])
+    if result.get("predictions") is None and result.get("probabilities") is not None:
+        # Лучшей оказалась одиночная модель из файла: метки восстанавливаем из вероятностей
+        order = np.asarray(result["class_order"], dtype=object)
+        result = result | {"predictions": order[np.asarray(result["probabilities"]).argmax(1)]}
+    result.setdefault("config", {})
+    result["config"] = result["config"] | {"n_folds": candidates[0]["n_folds_done"]}
+    report = {"task_spec": task_spec, "recipe": "ensemble", "feature_code": None,
+              "members": {f"exp{history.index(h)}": {"score": h["score"], "recipe": h["recipe"]} for h in candidates},
+              "config": {"blend_weights": result["config"].get("blend_weights"),
+                         "blend_type": result["config"].get("blend_type")}}
+    return _record(task_dir, task_spec, data, history, result, report)
 
 
 def write_fallback(task_dir, task_spec):

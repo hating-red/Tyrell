@@ -1070,6 +1070,7 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
         "greater_is_better": metric_obj.greater_is_better,
         "postprocess": postprocess_info,
         "members_fit_time": members_fit_time,
+        "fold_ids": _fold_ids(folds, list(range(len(folds))), data.labeled),
     }
 
 

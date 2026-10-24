@@ -26,6 +26,7 @@ TOOL_MESSAGE_LIMIT = 600              # до скольких символов �
 TOOL_RESULT_LIMIT = 4000              # потолок одного ответа инструмента: история растет на каждом шаге
 MAX_NUDGES = 3                        # сколько раз просим LLM продолжать, если время осталось
 FINAL_MAX_SEEDS = 8                   # сидов на тип модели в финальном auto_train
+ENSEMBLE_RESERVE = 300                # секунд на смесь экспериментов в конце
 
 INSTRUCTION = """Ты — агент для решения задач машинного обучения на табличных данных.
 Тебе даны условие, сводка CSV и уже определённый task_spec (target, id, тип задачи, метрика).
@@ -149,6 +150,23 @@ def experiment(task_dir, spec, budget, recipe="single", config=None, feature_cod
         except (ValueError, IndexError):
             pass
     return None, result
+
+
+def ensemble(task_dir, spec):
+    """Смесь лучших экспериментов в отдельном процессе; сабмит меняется только при приросте больше шума."""
+    payload = json.dumps(spec, ensure_ascii=False)
+    code = ("import json; from pipeline import run_ensemble; "
+            f"r = run_ensemble('.', json.loads({payload!r})); "
+            "print(json.dumps({k: r[k] for k in ('score', 'saved', 'vs_saved', 'members')}, "
+            "ensure_ascii=False, default=str))")
+    timeout = ENSEMBLE_RESERVE
+    if HARD_DEADLINE[0] is not None:
+        timeout = min(timeout, HARD_DEADLINE[0] - time.monotonic())
+    if timeout < 30:
+        return
+    result = run_python(code, task_dir, timeout=timeout)
+    output = result.get("stdout", "").strip().splitlines()
+    log(f"Ансамбль экспериментов: {output[-1] if result.get('exit_code') == 0 and output else str(result)[-1000:]}")
 
 
 def fallback(task_dir, spec):
@@ -357,14 +375,16 @@ def run_agent(task_path):
     # Шаг 2: цикл гипотез с LLM
     if client is not None:
         run_llm_loop(client, task, summary, spec, task_dir, deadline)
+    # Смесь уже сделанных экспериментов: если финальный шаг не успеет, она останется
+    ensemble(task_dir, spec)
 
     # Шаг 3: все оставшееся время - расширенный auto_train (больше сидов и медленные модели)
     # на лучших признаках. Сабмит заменится, только если результат лучше с учетом шума
     history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
-    saved = [h for h in history if h["saved"]]
+    saved = [h for h in history if h["saved"] and h["recipe"] != "ensemble"]
     best = saved[-1] if saved else None
-    # Поправка на перерасход auto_train до 5% и загрузку данных в дочернем процессе
-    budget = (remaining() - 180) / 1.1
+    # Поправка на перерасход auto_train до 5%, загрузку данных и итоговый ансамбль
+    budget = (remaining() - 180 - ENSEMBLE_RESERVE) / 1.1
     if budget > 300:
         config = {"max_seeds": FINAL_MAX_SEEDS}
         if best:
@@ -374,6 +394,7 @@ def run_agent(task_path):
         report, _ = experiment(task_dir, spec, budget=budget, recipe="auto", config=config,
                                feature_code=best and best.get("feature_code"))
         log(f"Финальный auto_train: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
+        ensemble(task_dir, spec)
 
     try:
         check_result(task_dir)
