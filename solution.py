@@ -32,10 +32,12 @@ INSTRUCTION = """Ты — агент для решения задач машин
 task_spec менять нельзя, он передаётся в эксперименты автоматически.
 
 Базовое решение уже обучено и сохранено: auto_train (LightGBM и XGBoost с несколькими
-сидами и взвешенным блендом, для метрик по меткам ещё подбор весов классов), а также
-тот же рецепт с автопризнаками (config auto_features: частоты категорий, число пропусков,
-части дат, средние и отклонения важных числовых признаков по категориям). Смотри в
-«Уже сделано», какой вариант сохранён, и строй гипотезы поверх него.
+сидами и взвешенным блендом, для метрик по меткам ещё подбор весов классов). Одной моделью
+уже проверены автопризнаки (config auto_features: частоты категорий, число пропусков,
+части дат, средние и отклонения важных числовых признаков по категориям) и кодирование
+по таргету (config target_encoding: среднее таргета по сущности, которая повторяется в
+train и test, например зданию или клиенту; считается внутри фолдов без утечки); выигравший вариант обучен
+полным рецептом. Смотри в «Уже сделано», какой вариант сохранён, и строй гипотезы поверх него.
 Твоя задача — улучшить результат валидации гипотезами. Самые полезные гипотезы:
 1. Новые признаки через feature_code: строка Python с функцией make_features(df) -> df.
    df — признаки train и test одной таблицей, без target и id; верни df с теми же строками
@@ -44,7 +46,9 @@ task_spec менять нельзя, он передаётся в экспери
    полей из условия. Автопризнаки добавляются поверх feature_code, если auto_features true.
 2. Параметры модели через config: model (lightgbm, xgboost, catboost), params,
    num_boost_round, early_stopping_rounds, class_weight, log_target, cat_encoding
-   (native или frequency), features (список колонок), auto_features (true или false).
+   (native или frequency), features (список колонок), auto_features (true или false),
+   target_encoding (true — ключи найти автоматически, или список исходных колонок; элемент
+   списка может быть списком колонок — тогда кодируется их сочетание).
 3. recipe: "single" — одна модель (быстро, для проверки гипотезы), "auto" — полный рецепт
    с блендом (медленнее, сильнее). Удачные признаки проверяй потом с recipe "auto".
 
@@ -260,6 +264,46 @@ def resolve_spec(client, task, summary, guess, deadline):
     return spec
 
 
+def choose_variant(task_dir, spec, baseline, deadline):
+    """Какие улучшения признаков брать в полный рецепт: проверка одной моделью против baseline.
+
+    baseline - страховочная модель (та же одна модель на тех же фолдах). Вариант принимается
+    по тому же правилу, что и сабмит: лучше на большинстве фолдов и прирост больше шума.
+    Если выиграли оба, проверяем их вместе. Возвращает config победителя или None.
+    """
+    from training import compare_results
+
+    if not baseline or not baseline.get("complete"):
+        return None
+    # На одну проверку - с запасом время страховочной модели, но не больше ее доли
+    budget = min(SAFETY_SHARE * TOTAL_SECONDS, max(120.0, 3 * baseline["fit_time"]))
+
+    def check(config):
+        if deadline - time.monotonic() < FINAL_SHARE * TOTAL_SECONDS + budget * 1.2:
+            return None
+        report, raw = experiment(task_dir, spec, budget=budget, config=config)
+        if report is None:
+            log(f"Проверка {config} не удалась: {str(raw)[-500:]}")
+            return None
+        if not report["complete"]:
+            log(f"Проверка {config}: не все фолды успели, сравнить нельзя")
+            return None
+        result = compare_results(baseline, report)
+        log(f"Проверка {config}: {report['score']} против {baseline['score']}, "
+            f"принят: {result['accept']}, ключи: {report.get('te_keys')}")
+        return result if result["accept"] else None
+
+    variants = [{"auto_features": True}, {"target_encoding": True}]
+    accepted = [(config, result) for config in variants if (result := check(config))]
+    if len(accepted) == 2:
+        both = {"auto_features": True, "target_encoding": True}
+        if result := check(both):
+            accepted.append((both, result))
+    if not accepted:
+        return None
+    return max(accepted, key=lambda item: item[1]["diff_mean"])[0]
+
+
 def run_agent(task_path):
     start = time.monotonic()
     deadline = start + TOTAL_SECONDS
@@ -286,6 +330,7 @@ def run_agent(task_path):
     spec = resolve_spec(client, task, summary, guess, deadline)
     log(f"task_spec: {spec}")
     report, raw = experiment(task_dir, spec, budget=SAFETY_SHARE * TOTAL_SECONDS)
+    safety = report
     log(f"Страховочный ответ: {report and report['score']}")
     if report is None or not report.get("saved"):
         log(f"Быстрая модель не сохранилась: {str(raw)[-2000:]}")
@@ -299,13 +344,15 @@ def run_agent(task_path):
         if report is None:
             log(f"auto_train упал: {str(raw)[-2000:]}")
 
-    # Шаг 1б: тот же рецепт с автопризнаками; сабмит заменится, только если прирост больше шума
+    # Шаг 1б: автопризнаки и кодирование по таргету сначала проверяем одной моделью на тех же
+    # фолдах - это минуты. Полный рецепт (десятки минут) запускаем только для победителя
+    winner = choose_variant(task_dir, spec, safety, deadline)
     budget = min(AUTO_SHARE * TOTAL_SECONDS, remaining() - FINAL_SHARE * TOTAL_SECONDS)
-    if budget > 120:
-        report, raw = experiment(task_dir, spec, budget=budget, recipe="auto", config={"auto_features": True})
-        log(f"auto_train с автопризнаками: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
+    if winner and budget > 120:
+        report, raw = experiment(task_dir, spec, budget=budget, recipe="auto", config=winner)
+        log(f"auto_train с {winner}: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
         if report is None:
-            log(f"auto_train с автопризнаками упал: {str(raw)[-2000:]}")
+            log(f"auto_train с {winner} упал: {str(raw)[-2000:]}")
 
     # Шаг 2: цикл гипотез с LLM
     if client is not None:
@@ -323,6 +370,7 @@ def run_agent(task_path):
         if best:
             config |= {k: v for k, v in best["config"].items() if k == "cat_encoding"}
             config["auto_features"] = bool(best.get("auto_features"))
+            config["target_encoding"] = best.get("target_encoding") or False
         report, _ = experiment(task_dir, spec, budget=budget, recipe="auto", config=config,
                                feature_code=best and best.get("feature_code"))
         log(f"Финальный auto_train: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
@@ -341,7 +389,8 @@ def run_llm_loop(client, task, summary, spec, task_dir, deadline):
     llm_deadline = deadline - FINAL_SHARE * TOTAL_SECONDS
     history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
     context = {"task_spec": spec, "experiments": [
-        {k: h.get(k) for k in ("recipe", "auto_features", "score", "fold_scores", "saved", "members")} for h in history]}
+        {k: h.get(k) for k in ("recipe", "auto_features", "target_encoding", "te_keys", "score",
+                               "fold_scores", "saved", "members")} for h in history]}
     messages = [
         {"role": "system", "content": INSTRUCTION},
         {"role": "user", "content": task + "\n\nСводка данных:\n" + compact_summary(summary)

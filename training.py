@@ -212,10 +212,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "n_jobs": None,               # None - min(8, число CPU)
     "split": None,                # None - случайные фолды; {"type": "group", "column": c} - группы
     "cat_encoding": "native",     # native - категории как есть; frequency - доля значения в train
+    "target_encoding": None,      # колонки-ключи X: среднее таргета по ключу считается внутри фолдов
+    "refit_full": False,          # дообучить модель на всем train и усреднить с моделями фолдов
 }
 
 _ROUND_KEYS = ("n_estimators", "num_iterations", "num_boost_round", "iterations", "num_rounds")
 _MIN_ROUNDS = 20                  # меньше этого по бюджету времени не урезаем
+_TE_SMOOTHING = 2.0               # сглаживание среднего по ключу к общему среднему, «виртуальных строк»
+_TE_INNER_FOLDS = 5               # внутренние фолды для кодирования строк обучающей части
+_REFIT_ROUNDS = 1.15              # на всем train раундов больше, чем в среднем на фолде: данных больше
 
 
 def _resolve_config(config: dict | None) -> dict:
@@ -348,6 +353,73 @@ def _make_folds(y_enc: np.ndarray, task_type: str, n_folds: int, seed: int,
         return list(splitter.split(np.zeros(n), y_enc))
     splitter = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
     return list(splitter.split(np.zeros(n)))
+
+
+# ---------------------------------------------------------------------------
+# Кодирование по таргету
+# ---------------------------------------------------------------------------
+
+def _te_targets(y_scaled: np.ndarray, y_enc: np.ndarray, task_type: str, n_classes: int) -> np.ndarray:
+    """Что усредняем по ключу: таргет регрессии, долю класса 1 или доли всех классов."""
+    if task_type == "regression":
+        return y_scaled.reshape(-1, 1).astype(float)
+    if task_type == "binary":
+        return (y_enc == 1).astype(float).reshape(-1, 1)
+    return np.eye(n_classes)[y_enc]
+
+
+def _te_stats(keys_fit: np.ndarray, Y_fit: np.ndarray, keys_apply: np.ndarray) -> np.ndarray:
+    """Сглаженное среднее Y по ключу и число строк с ключом. Новый ключ -> NaN и 0."""
+    prior = Y_fit.mean(axis=0)
+    frame = pd.DataFrame(Y_fit)
+    frame["__key"] = keys_fit
+    grouped = frame.groupby("__key", sort=False)
+    sums, counts = grouped.sum(), grouped.size()
+    pos = sums.index.get_indexer(keys_apply)
+    seen = pos >= 0
+    out = np.full((len(keys_apply), Y_fit.shape[1] + 1), np.nan)
+    n = counts.to_numpy()[pos[seen]].astype(float)
+    out[seen, :-1] = (sums.to_numpy()[pos[seen]] + _TE_SMOOTHING * prior) / (n[:, None] + _TE_SMOOTHING)
+    out[:, -1] = 0.0
+    out[seen, -1] = n
+    return out
+
+
+def _target_encode(keys: dict, keys_test: dict, Y: np.ndarray, tr_idx: np.ndarray, va_idx: np.ndarray,
+                   groups: np.ndarray | None, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Признаки по таргету для одного фолда: (обучающая часть, валидация, test).
+
+    Валидация и test кодируются статистикой всей обучающей части. Строки самой обучающей
+    части - внутренними фолдами, чтобы строка не видела свой таргет: иначе модель решит,
+    что признак точнее, чем он будет на test. Внутренние фолды повторяют внешнее разбиение
+    (группами, если оно групповое), чтобы признак вел себя так же, как на test.
+    """
+    inner_groups = None if groups is None else groups[tr_idx]
+    if inner_groups is not None and len(pd.unique(inner_groups)) >= 2:
+        n_inner = min(_TE_INNER_FOLDS, len(pd.unique(inner_groups)))
+        inner = list(GroupKFold(n_splits=n_inner).split(tr_idx, groups=inner_groups))
+    else:
+        inner = list(KFold(n_splits=min(_TE_INNER_FOLDS, len(tr_idx)), shuffle=True,
+                           random_state=seed).split(tr_idx))
+    parts_tr, parts_va, parts_te = [], [], []
+    for name in keys:
+        k_tr, Y_tr = keys[name][tr_idx], Y[tr_idx]
+        enc_tr = np.full((len(tr_idx), Y.shape[1] + 1), np.nan)
+        for fit, apply in inner:
+            enc_tr[apply] = _te_stats(k_tr[fit], Y_tr[fit], k_tr[apply])
+        parts_tr.append(enc_tr)
+        parts_va.append(_te_stats(k_tr, Y_tr, keys[name][va_idx]))
+        parts_te.append(_te_stats(k_tr, Y_tr, keys_test[name]))
+    return np.hstack(parts_tr), np.hstack(parts_va), np.hstack(parts_te)
+
+
+def _te_columns(names: list[str], width: int) -> list[str]:
+    return [f"{name}__te{j}" if j < width - 1 else f"{name}__te_count"
+            for name in names for j in range(width)]
+
+
+def _with_columns(X: pd.DataFrame, values: np.ndarray, columns: list[str]) -> pd.DataFrame:
+    return pd.concat([X, pd.DataFrame(values, index=X.index, columns=columns)], axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -632,8 +704,14 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     cfg["log_target"] = bool(log_target)
     y_train_scale = np.log1p(y_fit) if log_target else y_fit
 
-    Xp, Xtp, cat_cols = _prepare_features(X, X_test, cfg["features"], cfg["cat_encoding"])
+    # Колонки-ключи для кодирования по таргету сами в модель не идут, только их кодировки
+    te_cols = [c for c in (cfg["target_encoding"] or []) if c in X.columns and c in X_test.columns]
+    features = [c for c in (cfg["features"] or list(X.columns)) if c not in te_cols]
+    Xp, Xtp, cat_cols = _prepare_features(X, X_test, features, cfg["cat_encoding"])
     cfg["features"] = list(Xp.columns)
+    cfg["target_encoding"] = te_cols or None
+    te_keys = {c: X[c].to_numpy()[labeled] for c in te_cols}
+    te_keys_test = {c: X_test[c].to_numpy() for c in te_cols}
     groups = None
     if cfg["split"]:
         split_col = cfg["split"].get("column")
@@ -658,10 +736,26 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     cfg["n_folds"] = len(folds)
     fit_fn = _BACKENDS[cfg["model"]]
     extra = {"cat_cols": cat_cols} if cfg["model"] == "catboost" else {}
+    te_Y = _te_targets(y_train_scale, y_fit, task_type, n_classes) if te_cols else None
+    te_names = _te_columns(te_cols, te_Y.shape[1] + 1) if te_cols else []
 
-    logger.info("Старт: %s, %s, метрика %s, модель %s, %d фолдов, %d строк, %d признаков (%d кат.)",
+    def fold_frames(tr_idx, va_idx):
+        """Матрицы обучения, валидации и test фолда, с кодировками по таргету, если они заданы."""
+        Xtr, Xva, Xte = Xp.iloc[tr_idx], Xp.iloc[va_idx], Xtp
+        if te_cols:
+            enc_tr, enc_va, enc_te = _target_encode(te_keys, te_keys_test, te_Y, tr_idx, va_idx,
+                                                    groups, cfg["fold_seed"])
+            Xtr, Xva = _with_columns(Xtr, enc_tr, te_names), _with_columns(Xva, enc_va, te_names)
+            Xte = _with_columns(Xte, enc_te, te_names)
+        return Xtr, Xva, Xte
+
+    # Переобучение на всем train идет после фолдов, под него держим долю бюджета
+    refit_slot = 1.25 if cfg["refit_full"] else 0.0
+
+    logger.info("Старт: %s, %s, метрика %s, модель %s, %d фолдов, %d строк, %d признаков (%d кат.)%s",
                 task_type, "log1p" if log_target else "raw", metric_obj.name, cfg["model"],
-                len(folds), len(y_fit), Xp.shape[1], len(cat_cols))
+                len(folds), len(y_fit), Xp.shape[1], len(cat_cols),
+                f", кодирование по таргету {te_cols}" if te_cols else "")
 
     n = len(y_fit)
     oof = np.full((n, n_classes), np.nan) if n_classes else np.full(n, np.nan)
@@ -675,12 +769,13 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             logger.warning("Бюджет времени исчерпан, выполнено %d из %d фолдов", i, len(folds))
             break
         # Равная доля оставшегося бюджета на фолд, 10%% в запасе на постобработку
-        fold_deadline = now + 0.9 * (deadline - now) / (len(folds) - i)
+        fold_deadline = now + 0.9 * (deadline - now) / (len(folds) - i + refit_slot)
         try:
+            Xtr, Xva, Xte = fold_frames(tr_idx, va_idx)
             pva, pte, best_iter, stopped = fit_fn(
-                Xp.iloc[tr_idx], y_train_scale[tr_idx],
+                Xtr, y_train_scale[tr_idx],
                 None if sample_weight is None else sample_weight[tr_idx],
-                Xp.iloc[va_idx], y_train_scale[va_idx], Xtp,
+                Xva, y_train_scale[va_idx], Xte,
                 task_type, metric_obj, n_classes, cfg, fold_deadline, **extra,
             )
         except Exception as e:
@@ -708,8 +803,40 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
 
     if time_stopped_any:
         logger.warning("Часть фолдов остановлена по бюджету времени, раунды урезаны")
-    t_post = time.monotonic()
     test_pred = test_sum / len(done_folds)
+
+    # Модель на всем train: данных на 1/n_folds больше, чем у моделей фолдов. Скор CV она
+    # не меняет, поэтому в test идет пополам со средним фолдов, а не вместо него
+    refit_info = None
+    if cfg["refit_full"] and len(done_folds) == len(folds) and not time_stopped_any:
+        left = deadline - time.monotonic()
+        if left > refit_slot * float(np.mean(fold_times)):
+            t_refit = time.monotonic()
+            rounds = max(_MIN_ROUNDS, int(np.mean(best_iters) * _REFIT_ROUNDS))
+            # Ранней остановки нет: число раундов известно из фолдов. Валидация нужна бэкендам
+            # формально, берем небольшой кусок train
+            rcfg = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1}
+            all_idx = np.arange(n)
+            monitor = np.random.default_rng(cfg["seed"]).choice(n, min(n, 2000), replace=False)
+            try:
+                Xall, Xmon, Xte = fold_frames(all_idx, monitor)
+                _, pte, _, stopped = fit_fn(
+                    Xall, y_train_scale, sample_weight, Xmon, y_train_scale[monitor], Xte,
+                    task_type, metric_obj, n_classes, rcfg, deadline, **extra,
+                )
+                if log_target:
+                    pte = np.expm1(pte)
+                if not stopped:
+                    test_pred = 0.5 * test_pred + 0.5 * pte
+                refit_info = {"rounds": rounds, "applied": not stopped,
+                              "time": time.monotonic() - t_refit}
+                logger.info("Модель на всем train: %d раундов, %.1f с%s", rounds, refit_info["time"],
+                            "" if not stopped else ", остановлена по времени, не используется")
+            except Exception as e:  # noqa: BLE001 - без нее остается среднее фолдов
+                logger.warning("Модель на всем train не обучилась: %s: %s", type(e).__name__, e)
+        else:
+            logger.info("Модель на всем train пропущена: осталось %.0f с", left)
+    t_post = time.monotonic()
     score_raw = float(np.nanmean(fold_scores_raw))
     postprocess_info = None
     weights = np.ones(n_classes) if n_classes else None
@@ -782,6 +909,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "best_iterations": best_iters,
         "greater_is_better": metric_obj.greater_is_better,
         "postprocess": postprocess_info,
+        "refit": refit_info,
     }
 
 
@@ -1100,7 +1228,7 @@ def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     deadline = time.monotonic() + time_budget
     greater = get_metric(metric, task_type).greater_is_better
-    base = dict(config) | {"model": "lightgbm", "postprocess": False}
+    base = dict(config) | {"model": "lightgbm", "postprocess": False, "refit_full": False}
 
     def objective(trial):
         params = {

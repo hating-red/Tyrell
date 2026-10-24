@@ -9,7 +9,7 @@ from data_tools import detect_split, load_data
 from submission import make_submission, validate_submission
 
 # Ключи конфига, которые имеют смысл для всего рецепта auto, а не для одной модели
-AUTO_KEYS = ("features", "cat_encoding")
+AUTO_KEYS = ("features", "cat_encoding", "target_encoding", "refit_full")
 
 
 def apply_feature_code(feature_code, X_train, X_test):
@@ -71,6 +71,31 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     # Фолды одинаковые во всех экспериментах, иначе скоры несравнимы: агент их не меняет.
     # Разбиение группами включается само, если test похож на новый период
     split = detect_split(data["X_train"], data["X_test"])
+
+    # Кодирование по таргету: ключи ищем по исходным колонкам, само кодирование считается
+    # внутри фолдов в training.py. True - ключи найти автоматически, список - заданные колонки
+    target_encoding = cfg.pop("target_encoding", False)
+    te_specs = None
+    if target_encoding:
+        from features import add_key_columns, target_encoding_keys
+        if target_encoding is True:
+            exclude = [split["column"]] if split else []
+            periods = data["X_train"][split["column"]] if split else None
+            te_specs = target_encoding_keys(data["X_train"], data["X_test"], exclude, periods)
+        else:
+            items = target_encoding if isinstance(target_encoding, list) else [target_encoding]
+            te_specs = {"_".join(map(str, c)) if isinstance(c, list) else str(c): c if isinstance(c, list) else [c]
+                        for c in items}
+            if any(col not in data["X_train"] for cols in te_specs.values() for col in cols):
+                raise ValueError("target_encoding: колонки должны быть среди исходных признаков.")
+        if not te_specs:
+            raise ValueError("Ключей для кодирования по таргету не найдено: в train и test нет "
+                             "повторяющейся сущности. Можно задать колонки списком.")
+        X_train, X_test, cfg["target_encoding"] = add_key_columns(X_train, X_test, te_specs)
+    if recipe == "auto":
+        # Модель на всем train не меняет скор CV, поэтому включаем ее в сильном рецепте всегда
+        cfg.setdefault("refit_full", True)
+
     for key in ("n_folds", "fold_seed", "split", "n_jobs"):
         cfg.pop(key, None)
     max_seeds = int(cfg.pop("max_seeds", None) or 3)
@@ -137,7 +162,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     best_score = result["score"] if better and not problems else (previous["score"] if previous else None)
     report = {
         "task_spec": task_spec, "recipe": recipe, "feature_code": feature_code,
-        "auto_features": auto_features,
+        "auto_features": auto_features, "target_encoding": target_encoding or False, "te_keys": te_specs,
         "score": result["score"], "score_std": result["score_std"], "metric": metric,
         "fold_scores": [round(s, 6) for s in result.get("fold_scores", [])],
         "greater_is_better": result["greater_is_better"], "complete": complete,
