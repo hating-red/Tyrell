@@ -198,13 +198,17 @@ def clip_text(text, limit=TOOL_RESULT_LIMIT):
 
 
 def trim_history(messages):
-    """Старые ответы инструментов обрезаем, чтобы история помещалась в контекст и не тратила лимит."""
+    """Старые ответы инструментов и ассистента обрезаем, чтобы история не тратила лимит.
+
+    Целиком остается все, что после KEEP_TOOL_MESSAGES-го с конца ответа инструмента.
+    """
     tool_positions = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    old = set(tool_positions[:-KEEP_TOOL_MESSAGES])
+    cutoff = tool_positions[-KEEP_TOOL_MESSAGES] if len(tool_positions) >= KEEP_TOOL_MESSAGES else 0
     trimmed = []
     for i, message in enumerate(messages):
         content = message.get("content")
-        if i in old and isinstance(content, str) and len(content) > TOOL_MESSAGE_LIMIT:
+        old = i < cutoff and message.get("role") in ("tool", "assistant")
+        if old and isinstance(content, str) and len(content) > TOOL_MESSAGE_LIMIT:
             message = message | {"content": content[:TOOL_MESSAGE_LIMIT] + " ...(обрезано)"}
         trimmed.append(message)
     return trimmed
@@ -341,7 +345,11 @@ def run_llm_loop(client, task, summary, spec, task_dir, deadline):
             log("LLM не отвечает, перехожу к финалу.")
             return
         message = response.choices[0].message
-        messages.append(message.model_dump(exclude_none=True))
+        reply = message.model_dump(exclude_none=True)
+        # Рассуждения модели в историю не кладем: иначе каждый следующий запрос оплачивает их снова
+        for key in ("reasoning_content", "reasoning"):
+            reply.pop(key, None)
+        messages.append(reply)
 
         if not message.tool_calls:
             left = llm_deadline - time.monotonic()
