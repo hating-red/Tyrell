@@ -18,6 +18,9 @@ SAFETY_SHARE = 0.06                   # быстрый страховочный 
 AUTO_SHARE = 0.25                     # базовый auto_train до LLM
 FINAL_SHARE = 0.2                     # остаток на финальный auto_train с лучшими признаками
 LLM_ATTEMPTS = 4                      # попыток на один запрос к LLM
+# Лимит запросов к LLM за прогон; TYRELL_MAX_LLM_CALLS - чтобы локальные тесты не съели дневной бюджет
+MAX_LLM_CALLS = int(os.environ.get("TYRELL_MAX_LLM_CALLS", 150))
+LLM_USAGE = {"calls": 0, "prompt": 0, "completion": 0}
 KEEP_TOOL_MESSAGES = 4                # столько последних ответов инструментов отдаем LLM целиком
 TOOL_MESSAGE_LIMIT = 1500             # до скольких символов обрезаем старые ответы
 MAX_NUDGES = 3                        # сколько раз просим LLM продолжать, если время осталось
@@ -155,17 +158,30 @@ def fallback(task_dir, spec):
             log(f"Не удалось записать даже константный ответ: {error}")
 
 
+def track_usage(response):
+    """Считаем токены: лимит LLM дневной, и по логу видно, сколько стоит прогон."""
+    # Поля читаем осторожно: сервер может вернуть usage в другом виде, запрос это не должно ломать
+    usage = getattr(response, "usage", None)
+    LLM_USAGE["calls"] += 1
+    LLM_USAGE["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+    LLM_USAGE["completion"] += getattr(usage, "completion_tokens", 0) or 0
+    log(f"LLM: запросов {LLM_USAGE['calls']}, токенов на входе {LLM_USAGE['prompt']}, "
+        f"на выходе {LLM_USAGE['completion']}")
+
+
 def ask_llm(client, messages, deadline):
     """Запрос с повторами. None, если LLM недоступна: агент продолжит без нее."""
     for attempt in range(LLM_ATTEMPTS):
         remaining = deadline - time.monotonic()
-        if remaining < 60:
+        if remaining < 60 or LLM_USAGE["calls"] >= MAX_LLM_CALLS:
             return None
         try:
-            return client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=os.environ["OPENAI_MODEL"], messages=trim_history(messages),
                 tools=TOOLS, parallel_tool_calls=False, timeout=min(180, remaining - 30),
             )
+            track_usage(response)
+            return response
         except Exception as error:  # сеть, лимиты, ошибки сервера: пробуем еще раз
             log(f"LLM недоступна (попытка {attempt + 1}): {type(error).__name__}: {error}")
             time.sleep(min(10 * 2 ** attempt, 90, max(0.0, (deadline - time.monotonic()) / 4)))
@@ -185,6 +201,17 @@ def trim_history(messages):
     return trimmed
 
 
+def compact_summary(summary):
+    """Сводка для LLM без описаний колонок: они уже есть в task.md, а токены тратят дневной лимит."""
+    out = {k: v for k, v in summary.items() if k not in ("train", "test")}
+    out["columns_format"] = "name, dtype, missing, unique"
+    for part in ("train", "test"):
+        info = summary.get(part, {})
+        out[part] = {"rows": info.get("rows"), "columns": [
+            [c["name"], c["dtype"], c["missing"], c["unique"]] for c in info.get("columns", [])]}
+    return json.dumps(out, ensure_ascii=False)
+
+
 def resolve_spec(client, task, summary, guess, deadline):
     """Уверенной эвристике верим; иначе просим LLM уточнить task_spec и проверяем ответ."""
     spec, confident = guess
@@ -194,7 +221,7 @@ def resolve_spec(client, task, summary, guess, deadline):
         {"role": "system", "content": "Определи task_spec задачи. Ответь только JSON с ключами "
                                       "target_column, id_columns (список из одной колонки), task_type "
                                       "(regression, binary, multiclass), metric, probabilities."},
-        {"role": "user", "content": task + "\n\nСводка данных:\n" + json.dumps(summary, ensure_ascii=False)[:30000]
+        {"role": "user", "content": task + "\n\nСводка данных:\n" + compact_summary(summary)
                                     + "\n\nПредположение по данным:\n" + json.dumps(spec, ensure_ascii=False)},
     ]
     for attempt in range(LLM_ATTEMPTS):
@@ -204,6 +231,7 @@ def resolve_spec(client, task, summary, guess, deadline):
             response = client.chat.completions.create(
                 model=os.environ["OPENAI_MODEL"], messages=messages, timeout=120,
             )
+            track_usage(response)
             text = response.choices[0].message.content or ""
             answer = json.loads(text[text.index("{"):text.rindex("}") + 1])
             candidate = spec | {k: answer[k] for k in spec if k in answer}
@@ -291,7 +319,7 @@ def run_llm_loop(client, task, summary, spec, task_dir, deadline):
         {k: h.get(k) for k in ("recipe", "score", "fold_scores", "saved", "members")} for h in history]}
     messages = [
         {"role": "system", "content": INSTRUCTION},
-        {"role": "user", "content": task + "\n\nСводка данных:\n" + json.dumps(summary, ensure_ascii=False)
+        {"role": "user", "content": task + "\n\nСводка данных:\n" + compact_summary(summary)
                                     + "\n\nУже сделано:\n" + json.dumps(context, ensure_ascii=False, default=str)},
     ]
     nudges = 0
