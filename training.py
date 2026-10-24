@@ -1083,6 +1083,59 @@ _AUTO_MIN_STEP = 20.0             # меньше стольких секунд �
 _AUTO_MAX_SEEDS = 3               # максимум моделей одного типа с разными сидами
 _AUTO_SAFETY = 1.3                # запас к оценке времени следующей модели
 _AUTO_UNSEEN_MAX = 0.01           # при большей доле новых категорий в test XGBoost не используем
+_AUTO_TUNE_MIN_TRIALS = 8         # подбор параметров, только если влезает столько обучений LightGBM
+_AUTO_TUNE_MAX_TRIALS = 40        # и не дольше стольких обучений
+
+
+def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
+                  config: dict, time_budget: float) -> dict:
+    """Подбор гиперпараметров LightGBM через Optuna на тех же фолдах, что и остальные модели.
+
+    Во время подбора постобработка выключена ради скорости, ранжирование от этого почти
+    не меняется. Первой пробуется точка с дефолтами, поэтому результат не хуже базового.
+    Возвращает лучшие params или пустой словарь, если ни одна попытка не завершилась.
+    """
+    import optuna
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    deadline = time.monotonic() + time_budget
+    greater = get_metric(metric, task_type).greater_is_better
+    base = dict(config) | {"model": "lightgbm", "postprocess": False}
+
+    def objective(trial):
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 15, 255, log=True),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 200, log=True),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+            "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 30.0, log=True),
+        }
+        left = deadline - time.monotonic()
+        if left < 10:
+            trial.study.stop()
+            raise optuna.TrialPruned()
+        res = train_and_predict(X, y, X_test, task_type, metric, base | {"params": params},
+                                time_budget=left)
+        # Фолды, урезанные по времени, дают несравнимый скор
+        if res["config"]["n_folds_done"] < res["config"]["n_folds"]:
+            raise optuna.TrialPruned()
+        return res["score"]
+
+    study = optuna.create_study(direction="maximize" if greater else "minimize",
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    study.enqueue_trial({"learning_rate": 0.05, "num_leaves": 63, "min_child_samples": 20,
+                         "feature_fraction": 0.8, "bagging_fraction": 0.8, "lambda_l2": 1.0})
+    t0 = time.monotonic()
+    study.optimize(objective, timeout=time_budget, catch=(Exception,))
+    done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not done:
+        logger.warning("Подбор параметров: ни одна попытка не завершилась")
+        return {}
+    logger.info("Подбор параметров LightGBM: %d попыток за %.0f с, лучший %s=%.5f, параметры %s",
+                len(done), time.monotonic() - t0, metric, study.best_value,
+                {k: round(v, 4) if isinstance(v, float) else v for k, v in study.best_params.items()})
+    return dict(study.best_params) | {"bagging_freq": 1}
 
 
 def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
@@ -1191,6 +1244,7 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         if len(y_num) and y_num.min() >= 0 and y_num.skew() > 1:
             # Тяжелый хвост: log1p-модель как кандидат в бленд, веса решат, нужна ли она
             queue.append(("lgb_log1p", {"model": "lightgbm", "log_target": True}))
+
     def add_seeds(first: int, last: int) -> None:
         for k in range(first, last):
             if use_xgb:
@@ -1198,14 +1252,24 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
             queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
 
     add_seeds(1, min(max_seeds, _AUTO_MAX_SEEDS))
+    added = [run(name, extra) for name, extra in queue]
     if max_seeds > _AUTO_MAX_SEEDS:
-        # Запас времени: медленные модели с маленьким learning rate, затем еще сиды
+        # Запас времени: подбор параметров LightGBM, медленные модели, затем еще сиды
+        queue = []
+        avail = remaining() - reserve()
+        lgb_time = kind_time.get("lightgbm")
+        if lgb_time and avail > _AUTO_TUNE_MIN_TRIALS * lgb_time:
+            tuned = tune_lightgbm(X, y, X_test, task_type, metric, base,
+                                  min(0.4 * avail, _AUTO_TUNE_MAX_TRIALS * lgb_time))
+            if tuned:
+                queue += [("lgb_tuned", {"model": "lightgbm", "params": tuned}),
+                          ("lgb_tuned_seed2", {"model": "lightgbm", "params": tuned, "seed": seed0 + 1})]
         slow = {"early_stopping_rounds": 300, "num_boost_round": 10000}
         if use_xgb:
             queue.append(("xgb_slow", {"model": "xgboost", "params": {"eta": 0.02}} | slow))
         queue.append(("lgb_slow", {"model": "lightgbm", "params": {"learning_rate": 0.02}} | slow))
         add_seeds(_AUTO_MAX_SEEDS, max_seeds)
-    added = [run(name, extra) for name, extra in queue]
+        added += [run(name, extra) for name, extra in queue]
     if any(added):
         best = blend(best)
 
@@ -1328,6 +1392,12 @@ if __name__ == "__main__":
     assert auto["predictions"].shape == (1000,) and np.isfinite(auto["predictions"]).all()
     assert auto["fit_time"] < 40 * 1.1
     report("auto_train regression 40s", auto)
+
+    # Расширенный режим: подбор параметров, медленные модели, больше сидов, бюджет соблюдается
+    auto = auto_train(Xc_tr, yc_tr, Xc_te, "multiclass", "macro_f1", time_budget=150, max_seeds=4)
+    assert auto["fit_time"] < 150 * 1.1
+    report("auto_train multiclass extended 150s", auto)
+    log.info("  модели: %s", list(auto["members"]))
 
     # Бинарная задача с roc_auc
     Xb, yb = make_classification(n_samples=6000, n_features=20, n_informative=8, weights=[0.85, 0.15],

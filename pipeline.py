@@ -62,11 +62,15 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     if feature_code:
         X_train, X_test = apply_feature_code(feature_code, X_train, X_test)
     y_train = data["y_train"].reset_index(drop=True)
+    cfg = dict(config or {})
+    auto_features = bool(cfg.pop("auto_features", False))
+    if auto_features:
+        from features import add_auto_features, important_numeric
+        X_train, X_test = add_auto_features(X_train, X_test, important_numeric(X_train, y_train, task_type))
 
     # Фолды одинаковые во всех экспериментах, иначе скоры несравнимы: агент их не меняет.
     # Разбиение группами включается само, если test похож на новый период
-    split = detect_split(X_train, X_test)
-    cfg = dict(config or {})
+    split = detect_split(data["X_train"], data["X_test"])
     for key in ("n_folds", "fold_seed", "split", "n_jobs"):
         cfg.pop(key, None)
     max_seeds = int(cfg.pop("max_seeds", None) or 3)
@@ -133,6 +137,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     best_score = result["score"] if better and not problems else (previous["score"] if previous else None)
     report = {
         "task_spec": task_spec, "recipe": recipe, "feature_code": feature_code,
+        "auto_features": auto_features,
         "score": result["score"], "score_std": result["score_std"], "metric": metric,
         "fold_scores": [round(s, 6) for s in result.get("fold_scores", [])],
         "greater_is_better": result["greater_is_better"], "complete": complete,

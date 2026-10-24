@@ -32,16 +32,19 @@ INSTRUCTION = """Ты — агент для решения задач машин
 task_spec менять нельзя, он передаётся в эксперименты автоматически.
 
 Базовое решение уже обучено и сохранено: auto_train (LightGBM и XGBoost с несколькими
-сидами и взвешенным блендом, для метрик по меткам ещё подбор весов классов).
+сидами и взвешенным блендом, для метрик по меткам ещё подбор весов классов), а также
+тот же рецепт с автопризнаками (config auto_features: частоты категорий, число пропусков,
+части дат, средние и отклонения важных числовых признаков по категориям). Смотри в
+«Уже сделано», какой вариант сохранён, и строй гипотезы поверх него.
 Твоя задача — улучшить результат валидации гипотезами. Самые полезные гипотезы:
 1. Новые признаки через feature_code: строка Python с функцией make_features(df) -> df.
    df — признаки train и test одной таблицей, без target и id; верни df с теми же строками
-   (можно добавлять и удалять колонки). Доступны pd и np. Примеры: отношения и разности
-   числовых признаков, частота категорий (df[c].map(df[c].value_counts())), агрегаты
-   по группам (df.groupby(c)[x].transform("mean")), число пропусков в строке, части дат.
+   (можно добавлять и удалять колонки). Доступны pd и np. Ищи то, чего нет в автопризнаках:
+   отношения и разности числовых признаков, взаимодействия категорий, признаки по смыслу
+   полей из условия. Автопризнаки добавляются поверх feature_code, если auto_features true.
 2. Параметры модели через config: model (lightgbm, xgboost, catboost), params,
    num_boost_round, early_stopping_rounds, class_weight, log_target, cat_encoding
-   (native или frequency), features (список колонок).
+   (native или frequency), features (список колонок), auto_features (true или false).
 3. recipe: "single" — одна модель (быстро, для проверки гипотезы), "auto" — полный рецепт
    с блендом (медленнее, сильнее). Удачные признаки проверяй потом с recipe "auto".
 
@@ -296,6 +299,14 @@ def run_agent(task_path):
         if report is None:
             log(f"auto_train упал: {str(raw)[-2000:]}")
 
+    # Шаг 1б: тот же рецепт с автопризнаками; сабмит заменится, только если прирост больше шума
+    budget = min(AUTO_SHARE * TOTAL_SECONDS, remaining() - FINAL_SHARE * TOTAL_SECONDS)
+    if budget > 120:
+        report, raw = experiment(task_dir, spec, budget=budget, recipe="auto", config={"auto_features": True})
+        log(f"auto_train с автопризнаками: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
+        if report is None:
+            log(f"auto_train с автопризнаками упал: {str(raw)[-2000:]}")
+
     # Шаг 2: цикл гипотез с LLM
     if client is not None:
         run_llm_loop(client, task, summary, spec, task_dir, deadline)
@@ -311,6 +322,7 @@ def run_agent(task_path):
         config = {"max_seeds": FINAL_MAX_SEEDS}
         if best:
             config |= {k: v for k, v in best["config"].items() if k == "cat_encoding"}
+            config["auto_features"] = bool(best.get("auto_features"))
         report, _ = experiment(task_dir, spec, budget=budget, recipe="auto", config=config,
                                feature_code=best and best.get("feature_code"))
         log(f"Финальный auto_train: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
@@ -329,7 +341,7 @@ def run_llm_loop(client, task, summary, spec, task_dir, deadline):
     llm_deadline = deadline - FINAL_SHARE * TOTAL_SECONDS
     history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
     context = {"task_spec": spec, "experiments": [
-        {k: h.get(k) for k in ("recipe", "score", "fold_scores", "saved", "members")} for h in history]}
+        {k: h.get(k) for k in ("recipe", "auto_features", "score", "fold_scores", "saved", "members")} for h in history]}
     messages = [
         {"role": "system", "content": INSTRUCTION},
         {"role": "user", "content": task + "\n\nСводка данных:\n" + compact_summary(summary)
