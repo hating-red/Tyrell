@@ -21,8 +21,9 @@ LLM_ATTEMPTS = 4                      # попыток на один запро�
 # Лимит запросов к LLM за прогон; TYRELL_MAX_LLM_CALLS - чтобы локальные тесты не съели дневной бюджет
 MAX_LLM_CALLS = int(os.environ.get("TYRELL_MAX_LLM_CALLS", 150))
 LLM_USAGE = {"calls": 0, "prompt": 0, "completion": 0}
-KEEP_TOOL_MESSAGES = 4                # столько последних ответов инструментов отдаем LLM целиком
-TOOL_MESSAGE_LIMIT = 1500             # до скольких символов обрезаем старые ответы
+KEEP_TOOL_MESSAGES = 3                # столько последних ответов инструментов отдаем LLM целиком
+TOOL_MESSAGE_LIMIT = 600              # до скольких символов обрезаем старые ответы
+TOOL_RESULT_LIMIT = 4000              # потолок одного ответа инструмента: история растет на каждом шаге
 MAX_NUDGES = 3                        # сколько раз просим LLM продолжать, если время осталось
 FINAL_MAX_SEEDS = 8                   # сидов на тип модели в финальном auto_train
 
@@ -186,6 +187,14 @@ def ask_llm(client, messages, deadline):
             log(f"LLM недоступна (попытка {attempt + 1}): {type(error).__name__}: {error}")
             time.sleep(min(10 * 2 ** attempt, 90, max(0.0, (deadline - time.monotonic()) / 4)))
     return None
+
+
+def clip_text(text, limit=TOOL_RESULT_LIMIT):
+    """Начало и конец длинного ответа: в выводе Python самое важное в конце, ошибки и результат."""
+    if len(text) <= limit:
+        return text
+    head = limit // 4
+    return text[:head] + " ...(обрезано)... " + text[-(limit - head):]
 
 
 def trim_history(messages):
@@ -368,7 +377,7 @@ def run_llm_loop(client, task, summary, spec, task_dir, deadline):
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.id,
-                "content": json.dumps(result, ensure_ascii=False, default=str),
+                "content": clip_text(json.dumps(result, ensure_ascii=False, default=str)),
             })
 
 
