@@ -109,3 +109,20 @@ def test_target_encoding_multiclass():
     assert np.isfinite(res["score"])
     assert res["probabilities"].shape == (len(X_test), 3)
     assert set(res["predictions"]) <= {"low", "mid", "high"}
+
+
+def test_lag_beats_mean_when_entities_drift():
+    # Каждая сущность дрейфует со своей скоростью: прошлогоднее значение точнее среднего
+    rng = np.random.default_rng(3)
+    n_ent, n_per = 300, 6
+    level, speed = rng.normal(0, 20, n_ent), rng.normal(0, 8, n_ent)
+    area = rng.uniform(1_000, 100_000, n_ent).round()
+    rows = [{"period": p, "area": area[e], "y": level[e] + speed[e] * p + rng.normal(0, 1)}
+            for p in range(1, n_per + 2) for e in range(n_ent)]
+    frame = pd.DataFrame(rows)
+    train, test = frame[frame.period <= n_per], frame[frame.period == n_per + 1]
+    X, y, X_test = train.drop(columns="y").reset_index(drop=True), train["y"].reset_index(drop=True), \
+        test.drop(columns="y").reset_index(drop=True)
+    mean_only = fit(X, y, X_test, target_encoding=True, te_lag=False)
+    with_lag = fit(X, y, X_test, target_encoding=True)
+    assert with_lag["score"] < 0.8 * mean_only["score"]
