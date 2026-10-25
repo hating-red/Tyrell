@@ -126,3 +126,19 @@ def test_lag_beats_mean_when_entities_drift():
     mean_only = fit(X, y, X_test, target_encoding=True, te_lag=False)
     with_lag = fit(X, y, X_test, target_encoding=True)
     assert with_lag["score"] < 0.8 * mean_only["score"]
+
+
+def test_duplicate_key_when_test_rows_repeat_train():
+    # Половина строк test - точные копии строк train: ключ - все признаки, а не сущность
+    rng = np.random.default_rng(5)
+    X = pd.DataFrame({"a": rng.integers(0, 50, 2000), "b": rng.normal(size=2000).round(2)})
+    X_test = pd.concat([X.sample(500, random_state=1),
+                        pd.DataFrame({"a": rng.integers(0, 50, 500), "b": rng.normal(size=500).round(2) + 9})],
+                       ignore_index=True)
+    assert target_encoding_keys(X, X_test) == {"duplicate": ["a", "b"]}
+
+
+def test_no_duplicate_key_for_entity_data():
+    # Здания в новом году: погода другая, точных дубликатов нет - остается поиск сущности
+    X, _, X_test = entity_data()
+    assert "entity" in target_encoding_keys(X, X_test, exclude=["period"], periods=X["period"])

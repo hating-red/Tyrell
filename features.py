@@ -16,6 +16,7 @@ ENTITY_MAX_COLUMNS = 6            # из скольких колонок мак�
 ENTITY_CANDIDATES = 40            # сколько колонок перебираем при поиске ключа
 ENTITY_KEEP_REPEAT = 0.95         # колонка в ключе почти не должна снижать повторяемость сущности
 ENTITY_KEEP_COVERAGE = 0.9        # и покрытие test
+DUPLICATE_MIN_COVERAGE = 0.05     # доля строк test с точным дубликатом в train, чтобы кодировать по дубликатам
 TE_PREFIX = "__te_"
 DATE_PATTERN = r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
 
@@ -166,12 +167,26 @@ def detect_entity_key(X_train, X_test, exclude=(), periods=None):
     return {"columns": key, "groups": groups, "repeat": round(repeat, 4), "coverage": round(coverage, 4)}
 
 
-def target_encoding_keys(X_train, X_test, exclude=(), periods=None):
-    """Ключи для кодирования по таргету → {имя: список колонок}, пустой, если сущности нет.
+def duplicate_coverage(X_train, X_test, columns):
+    """Доля строк test, у которых в train есть строка с точно такими же значениями columns."""
+    full = pd.concat([X_train[columns], X_test[columns]], ignore_index=True)
+    keys = _hash_rows(full, columns)
+    return float(np.isin(keys[len(X_train):], keys[:len(X_train)]).mean())
 
-    Только сущность: на публичной регрессии кодирование отдельной категории ничего не дало,
-    LightGBM и так хорошо работает с категориями. Отдельные колонки агент может задать сам.
+
+def target_encoding_keys(X_train, X_test, exclude=(), periods=None):
+    """Ключи для кодирования по таргету → {имя: список колонок}, пустой, если кодировать нечего.
+
+    Если у заметной доли строк test есть точный дубликат в train (одинаковые записи трафика,
+    повторные заявки), ключ - все признаки: модель узнает, какие метки бывают у такой же
+    строки. Ключ детерминированный, в отличие от найденной сущности, и на UNSW дал на
+    отложенных строках Macro F1 0.6322 -> 0.6477 (сущность из 6 колонок: 0.6393 или хуже базы).
+    Иначе ищем сущность, которая повторяется по периодам (здание в разные годы).
+    Отдельные категории не кодируем: LightGBM и так хорошо с ними работает.
     """
+    columns = [c for c in X_train if c in X_test and c not in exclude]
+    if columns and duplicate_coverage(X_train, X_test, columns) >= DUPLICATE_MIN_COVERAGE:
+        return {"duplicate": columns}
     entity = detect_entity_key(X_train, X_test, exclude, periods)
     return {"entity": entity["columns"]} if entity else {}
 
