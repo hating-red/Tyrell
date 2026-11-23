@@ -214,7 +214,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cat_encoding": "native",     # native - категории как есть; frequency - доля значения в train
     "target_encoding": None,      # колонки-ключи X: среднее таргета по ключу считается внутри фолдов
     "refit_full": False,          # дообучить модель на всем train и усреднить с моделями фолдов
-    "te_lag": True,               # к кодированию по таргету - значение сущности в ближайшем периоде
 }
 
 _ROUND_KEYS = ("n_estimators", "num_iterations", "num_boost_round", "iterations", "num_rounds")
@@ -386,42 +385,14 @@ def _te_stats(keys_fit: np.ndarray, Y_fit: np.ndarray, keys_apply: np.ndarray) -
     return out
 
 
-def _te_lag(keys_fit: np.ndarray, periods_fit: np.ndarray, Y_fit: np.ndarray,
-            keys_apply: np.ndarray, periods_apply: np.ndarray) -> np.ndarray:
-    """Таргет той же сущности в ближайшем другом периоде и расстояние до него.
-
-    Для нового года прошлогоднее значение сущности обычно точнее ее среднего за все годы:
-    сущности со временем меняются. При равном расстоянии берем более ранний период.
-    Свой период не используется. Нет других периодов -> NaN.
-    """
-    width = Y_fit.shape[1]
-    fit = pd.DataFrame(Y_fit, columns=[f"y{j}" for j in range(width)])
-    fit["key"], fit["period"] = keys_fit, periods_fit
-    table = fit.groupby(["key", "period"], sort=False).mean().reset_index()
-    apply = pd.DataFrame({"key": keys_apply, "period": periods_apply, "row": np.arange(len(keys_apply))})
-    merged = apply.merge(table, on="key", suffixes=("", "_fit"))
-    merged = merged[merged["period_fit"] != merged["period"]]
-    distance = (merged["period_fit"] - merged["period"]).abs()
-    merged = merged.assign(order=distance + 0.1 * (merged["period_fit"] > merged["period"]), distance=distance)
-    best = merged.sort_values(["row", "order"]).drop_duplicates("row")
-    out = np.full((len(keys_apply), width + 1), np.nan)
-    rows = best["row"].to_numpy()
-    out[rows, :width] = best[[f"y{j}" for j in range(width)]].to_numpy()
-    out[rows, width] = best["distance"].to_numpy()
-    return out
-
-
 def _target_encode(keys: dict, keys_test: dict, Y: np.ndarray, tr_idx: np.ndarray, va_idx: np.ndarray,
-                   groups: np.ndarray | None, seed: int,
-                   periods: tuple | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                   groups: np.ndarray | None, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Признаки по таргету для одного фолда: (обучающая часть, валидация, test).
 
     Валидация и test кодируются статистикой всей обучающей части. Строки самой обучающей
     части - внутренними фолдами, чтобы строка не видела свой таргет: иначе модель решит,
     что признак точнее, чем он будет на test. Внутренние фолды повторяют внешнее разбиение
     (группами, если оно групповое), чтобы признак вел себя так же, как на test.
-    periods - (периоды размеченных строк, периоды test): тогда добавляется значение
-    сущности в ближайшем другом периоде.
     """
     inner_groups = None if groups is None else groups[tr_idx]
     if inner_groups is not None and len(pd.unique(inner_groups)) >= 2:
@@ -439,25 +410,12 @@ def _target_encode(keys: dict, keys_test: dict, Y: np.ndarray, tr_idx: np.ndarra
         parts_tr.append(enc_tr)
         parts_va.append(_te_stats(k_tr, Y_tr, keys[name][va_idx]))
         parts_te.append(_te_stats(k_tr, Y_tr, keys_test[name]))
-        if periods is not None:
-            p_lab, p_test = periods
-            p_tr = p_lab[tr_idx]
-            lag_tr = np.full((len(tr_idx), Y.shape[1] + 1), np.nan)
-            for fit, apply in inner:
-                lag_tr[apply] = _te_lag(k_tr[fit], p_tr[fit], Y_tr[fit], k_tr[apply], p_tr[apply])
-            parts_tr.append(lag_tr)
-            parts_va.append(_te_lag(k_tr, p_tr, Y_tr, keys[name][va_idx], p_lab[va_idx]))
-            parts_te.append(_te_lag(k_tr, p_tr, Y_tr, keys_test[name], p_test))
     return np.hstack(parts_tr), np.hstack(parts_va), np.hstack(parts_te)
 
 
-def _te_columns(names: list[str], width: int, lag: bool = False) -> list[str]:
-    columns = []
-    for name in names:
-        columns += [f"{name}__te{j}" for j in range(width - 1)] + [f"{name}__te_count"]
-        if lag:
-            columns += [f"{name}__lag{j}" for j in range(width - 1)] + [f"{name}__lag_distance"]
-    return columns
+def _te_columns(names: list[str], width: int) -> list[str]:
+    return [f"{name}__te{j}" if j < width - 1 else f"{name}__te_count"
+            for name in names for j in range(width)]
 
 
 def _with_columns(X: pd.DataFrame, values: np.ndarray, columns: list[str]) -> pd.DataFrame:
@@ -779,18 +737,14 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     fit_fn = _BACKENDS[cfg["model"]]
     extra = {"cat_cols": cat_cols} if cfg["model"] == "catboost" else {}
     te_Y = _te_targets(y_train_scale, y_fit, task_type, n_classes) if te_cols else None
-    # Значение сущности в ближайшем периоде - только при групповой валидации по числовому периоду
-    te_periods = None
-    if te_cols and cfg["te_lag"] and groups is not None and pd.api.types.is_numeric_dtype(X[split_col]):
-        te_periods = (groups.astype(float), X_test[split_col].to_numpy().astype(float))
-    te_names = _te_columns(te_cols, te_Y.shape[1] + 1, te_periods is not None) if te_cols else []
+    te_names = _te_columns(te_cols, te_Y.shape[1] + 1) if te_cols else []
 
     def fold_frames(tr_idx, va_idx):
         """Матрицы обучения, валидации и test фолда, с кодировками по таргету, если они заданы."""
         Xtr, Xva, Xte = Xp.iloc[tr_idx], Xp.iloc[va_idx], Xtp
         if te_cols:
             enc_tr, enc_va, enc_te = _target_encode(te_keys, te_keys_test, te_Y, tr_idx, va_idx,
-                                                    groups, cfg["fold_seed"], te_periods)
+                                                    groups, cfg["fold_seed"])
             Xtr, Xva = _with_columns(Xtr, enc_tr, te_names), _with_columns(Xva, enc_va, te_names)
             Xte = _with_columns(Xte, enc_te, te_names)
         return Xtr, Xva, Xte
