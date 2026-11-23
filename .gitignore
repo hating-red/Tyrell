@@ -1,10 +1,14 @@
-.venv/
-__pycache__/
-.env
-.idea/
-.vscode/
-
-# Данные кейса и результаты прогонов
-data/
-submission.csv
-runs/
+# В Git включаем только файлы конкурсного решения и сам .gitignore.
+/*
+!/.gitignore
+!/solution.py
+!/requirements.txt
+!/data_tools.py
+!/diagnostic_ablation.py
+!/features.py
+!/paired_research.py
+!/pipeline.py
+!/postgres_loader.py
+!/submission.py
+!/time_budget.py
+!/training.py

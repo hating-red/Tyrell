@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from data_tools import label_available_at as _label_available_at
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -213,6 +215,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "split": None,                # None - случайные фолды; {"type": "group", "column": c} - группы
     "cat_encoding": "native",     # native - категории как есть; frequency - доля значения в train
     "target_encoding": None,      # колонки-ключи X: среднее таргета по ключу считается внутри фолдов
+    "te_lag": True,
+    "categorical_ids": False,
+    "entity_history": False,
+    "profile_categories": False,
+    "label_delay_unit": None,     # duration target from event time until the label is known
     "refit_full": False,          # дообучить модель на всем train и усреднить с моделями фолдов
 }
 
@@ -236,8 +243,15 @@ def _resolve_config(config: dict | None) -> dict:
         if key in cfg["params"]:
             cfg["num_boost_round"] = int(cfg["params"].pop(key))
     cfg["model"] = str(cfg["model"]).strip().lower()
-    if cfg["n_jobs"] is None:
-        cfg["n_jobs"] = min(8, os.cpu_count() or 1)
+    max_jobs = min(8, os.cpu_count() or 1)
+    requested = int(cfg["n_jobs"] or max_jobs)
+    cfg["n_jobs"] = min(max_jobs, requested) if requested > 0 else max_jobs
+    for key in ("num_threads", "num_thread", "nthread", "nthreads", "n_jobs", "thread_count"):
+        cfg["params"].pop(key, None)
+    for key in ("device", "devices", "device_type", "task_type", "gpu_id", "predictor"):
+        cfg["params"].pop(key, None)
+    if cfg["params"].get("tree_method") == "gpu_hist":
+        cfg["params"]["tree_method"] = "hist"
     if cfg["fold_seed"] is None:
         cfg["fold_seed"] = cfg["seed"]
     return cfg
@@ -308,7 +322,7 @@ def _prepare_features(X: pd.DataFrame, X_test: pd.DataFrame, features: list | No
             t = Xtp[col]
             Xtp[col] = t.map(freq).astype(float).where(t.isna() | t.isin(freq.index), 0.0)
         elif _is_categorical(s):
-            cat = Xp[col].astype("category")
+            cat = Xp[col].astype("category").cat.remove_unused_categories()
             Xp[col] = cat
             # Категории test строго по train, новые значения становятся NaN
             Xtp[col] = pd.Categorical(Xtp[col], categories=cat.cat.categories)
@@ -327,6 +341,49 @@ def _to_catboost_frame(df: pd.DataFrame, cat_cols: list[str]) -> pd.DataFrame:
     for col in cat_cols:
         out[col] = df[col].astype(object).where(df[col].notna(), "__nan__").astype(str)
     return out
+
+
+def _time_values(series):
+    if pd.api.types.is_numeric_dtype(series):
+        return series.replace([np.inf, -np.inf], np.nan)
+    from data_tools import parse_event_datetime
+    return parse_event_datetime(series)
+
+
+def _time_folds(times, y_enc, n_folds, task_type, metric):
+    """Expanding windows of distinct event times; equal timestamps stay together."""
+    ranks, unique = pd.factorize(times, sort=True)
+    if len(unique) < 2:
+        raise ValueError("Chronological validation needs at least two distinct event times")
+    blocks = np.array_split(np.arange(len(unique)), min(len(unique), max(2, int(n_folds) + 1)))
+    folds = []
+    n_classes = len(np.unique(y_enc))
+    for block in blocks[1:]:
+        train = np.flatnonzero((ranks >= 0) & (ranks < block[0]))
+        valid = np.flatnonzero((ranks >= block[0]) & (ranks <= block[-1]))
+        if task_type in CLASSIFICATION and np.unique(y_enc[train]).size < n_classes:
+            continue
+        if metric in ("roc_auc", "gini") and np.unique(y_enc[valid]).size < n_classes:
+            continue
+        folds.append((train, valid))
+    if not folds:
+        raise ValueError("No chronological validation window has sufficient class coverage")
+    return folds
+
+
+def _past_monitor(train_idx, times, y_fit, task_type, available_at=None):
+    """Use a chronological training tail for early stopping without reading outer labels."""
+    ranks, distinct = pd.factorize(times.iloc[train_idx], sort=True)
+    cut = len(distinct) - max(1, (len(distinct) + 9) // 10)
+    prefix, tail = train_idx[ranks < cut], train_idx[ranks >= cut]
+    if available_at is not None and len(tail):
+        prefix = prefix[(available_at.iloc[prefix] < times.iloc[tail].min()).to_numpy()]
+    if len(prefix) >= 2 and (task_type not in CLASSIFICATION or
+                             np.unique(y_fit[prefix]).size == np.unique(y_fit[train_idx]).size):
+        return prefix, tail, "past_holdout"
+    # A single time group or a class first seen in the tail prevents an inner split.
+    # Bound the rounds and use a training-only monitor; no outer labels reach the backend.
+    return train_idx, train_idx[:2048], "training_monitor"
 
 
 def _make_folds(y_enc: np.ndarray, task_type: str, n_folds: int, seed: int,
@@ -385,8 +442,22 @@ def _te_stats(keys_fit: np.ndarray, Y_fit: np.ndarray, keys_apply: np.ndarray) -
     return out
 
 
+def _previous_target(keys, periods, target, apply_keys, apply_periods):
+    """Last observed target of the same entity in a strictly earlier numeric period."""
+    history = pd.DataFrame({"key": keys, "period": periods, "value": target.ravel()})
+    history = history.dropna().groupby(["period", "key"], as_index=False)["value"].mean()
+    queries = pd.DataFrame({"key": apply_keys, "period": apply_periods, "row": np.arange(len(apply_keys))})
+    queries = queries.dropna().sort_values("period")
+    output = np.full(len(apply_keys), np.nan)
+    if not history.empty and not queries.empty:
+        prior = pd.merge_asof(queries, history.sort_values("period"), on="period", by="key",
+                              direction="backward", allow_exact_matches=False)
+        output[prior["row"]] = prior["value"]
+    return output
+
+
 def _target_encode(keys: dict, keys_test: dict, Y: np.ndarray, tr_idx: np.ndarray, va_idx: np.ndarray,
-                   groups: np.ndarray | None, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                   groups: np.ndarray | None, seed: int, test_periods=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Признаки по таргету для одного фолда: (обучающая часть, валидация, test).
 
     Валидация и test кодируются статистикой всей обучающей части. Строки самой обучающей
@@ -404,12 +475,21 @@ def _target_encode(keys: dict, keys_test: dict, Y: np.ndarray, tr_idx: np.ndarra
     parts_tr, parts_va, parts_te = [], [], []
     for name in keys:
         k_tr, Y_tr = keys[name][tr_idx], Y[tr_idx]
-        enc_tr = np.full((len(tr_idx), Y.shape[1] + 1), np.nan)
+        def encode(fit, apply_keys, apply_periods):
+            stats = _te_stats(k_tr[fit], Y_tr[fit], apply_keys)
+            if test_periods is not None:
+                prior = _previous_target(k_tr[fit], inner_groups[fit], Y_tr[fit], apply_keys, apply_periods)
+                stats = np.column_stack([stats, prior])
+            return stats
+
+        width = Y.shape[1] + 1 + int(test_periods is not None)
+        enc_tr = np.full((len(tr_idx), width), np.nan)
         for fit, apply in inner:
-            enc_tr[apply] = _te_stats(k_tr[fit], Y_tr[fit], k_tr[apply])
+            enc_tr[apply] = encode(fit, k_tr[apply], None if inner_groups is None else inner_groups[apply])
         parts_tr.append(enc_tr)
-        parts_va.append(_te_stats(k_tr, Y_tr, keys[name][va_idx]))
-        parts_te.append(_te_stats(k_tr, Y_tr, keys_test[name]))
+        all_tr = np.arange(len(tr_idx))
+        parts_va.append(encode(all_tr, keys[name][va_idx], None if groups is None else groups[va_idx]))
+        parts_te.append(encode(all_tr, keys_test[name], test_periods))
     return np.hstack(parts_tr), np.hstack(parts_va), np.hstack(parts_te)
 
 
@@ -455,21 +535,25 @@ def _fit_lightgbm(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
         _, _, value, higher = env.evaluation_result_list[0][:4]
         if state["best"] is None or _is_better(value, state["best"], higher):
             state["best"], state["best_iter"] = value, env.iteration
-        if env.iteration + 1 >= _MIN_ROUNDS and time.monotonic() > deadline:
+        if time.monotonic() >= deadline:
             state["time_stopped"] = True
             raise lgb.callback.EarlyStopException(state["best_iter"], env.evaluation_result_list)
     time_callback.order = 40
 
+    evaluation = {}
     booster = lgb.train(
         params, dtrain, num_boost_round=cfg["num_boost_round"], valid_sets=[dvalid],
-        callbacks=[lgb.early_stopping(cfg["early_stopping_rounds"], verbose=False), time_callback],
+        callbacks=[lgb.record_evaluation(evaluation), lgb.early_stopping(cfg["early_stopping_rounds"], verbose=False),
+                   time_callback],
     )
     best = booster.best_iteration or booster.current_iteration()
-    pva = booster.predict(Xva, num_iteration=best)
-    pte = booster.predict(Xte, num_iteration=best)
+    pva = booster.predict(Xva, num_iteration=best, num_threads=cfg["n_jobs"])
+    pte = booster.predict(Xte, num_iteration=best, num_threads=cfg["n_jobs"])
     if task_type == "binary":
         pva, pte = np.column_stack([1 - pva, pva]), np.column_stack([1 - pte, pte])
-    return pva, pte, best, state["time_stopped"]
+    monitor_history = next(iter(evaluation.values()))
+    last = len(next(iter(monitor_history.values())))
+    return pva, pte, best, state["time_stopped"], last
 
 
 def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg, deadline):
@@ -495,7 +579,7 @@ def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg
         stopped = False
 
         def after_iteration(self, model, epoch, evals_log):
-            if epoch + 1 >= _MIN_ROUNDS and time.monotonic() > deadline:
+            if time.monotonic() >= deadline:
                 self.stopped = True
                 return True
             return False
@@ -517,7 +601,7 @@ def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg
     pte = booster.predict(dtest, iteration_range=(0, best))
     if task_type == "binary":
         pva, pte = np.column_stack([1 - pva, pva]), np.column_stack([1 - pte, pte])
-    return pva, pte, best, timer.stopped
+    return pva, pte, best, timer.stopped, booster.num_boosted_rounds()
 
 
 def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg, deadline,
@@ -542,8 +626,11 @@ def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
     class TimeCallback:
         stopped = False
 
+        last_round = 0
+
         def after_iteration(self, info):
-            if info.iteration + 1 >= _MIN_ROUNDS and time.monotonic() > deadline:
+            self.last_round = info.iteration
+            if time.monotonic() >= deadline:
                 self.stopped = True
                 return False
             return True
@@ -554,9 +641,9 @@ def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
     model.fit(Pool(Xtr, ytr, weight=wtr, cat_features=cats),
               eval_set=Pool(Xva, yva, cat_features=cats), callbacks=[timer])
     kind = "RawFormulaVal" if task_type == "regression" else "Probability"
-    pva = model.predict(Pool(Xva, cat_features=cats), prediction_type=kind)
-    pte = model.predict(Pool(Xte, cat_features=cats), prediction_type=kind)
-    return np.asarray(pva), np.asarray(pte), int(model.get_best_iteration() or 0) + 1, timer.stopped
+    pva = model.predict(Pool(Xva, cat_features=cats), prediction_type=kind, thread_count=cfg["n_jobs"])
+    pte = model.predict(Pool(Xte, cat_features=cats), prediction_type=kind, thread_count=cfg["n_jobs"])
+    return np.asarray(pva), np.asarray(pte), int(model.get_best_iteration() or 0) + 1, timer.stopped, timer.last_round
 
 
 _BACKENDS = {"lightgbm": _fit_lightgbm, "xgboost": _fit_xgboost, "catboost": _fit_catboost}
@@ -645,7 +732,9 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     Строки X и y сопоставляются по позиции. Порядок строк X_test сохраняется.
     """
     t_start = time.monotonic()
-    deadline = t_start + time_budget if time_budget else float("inf")
+    if time_budget is not None and (not np.isfinite(time_budget) or time_budget <= 0):
+        raise ValueError("Model time budget must be positive and finite")
+    deadline = t_start + time_budget if time_budget is not None else float("inf")
 
     task_type = str(task_type).strip().lower()
     if task_type not in TASK_TYPES:
@@ -656,11 +745,23 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         raise ValueError("X_test пустой")
 
     cfg = _resolve_config(config)
+    if "split" not in (config or {}):
+        from data_tools import detect_time_column
+        clock = detect_time_column(X, X_test)
+        if clock is not None:
+            cfg["split"] = {"type": "time", "column": clock}
     cfg["model"] = _check_backend(cfg["model"])
 
     # Строки без таргета не участвуют в обучении, в OOF у них будет NaN
     y_series = pd.Series(np.asarray(y))
     labeled = y_series.notna().to_numpy()
+    split = cfg["split"] or {}
+    temporal = split.get("type") == "time"
+    if split and (split.get("type") not in ("time", "group") or split.get("column") not in X):
+        raise ValueError("Validation split requires an existing input column and type time or group")
+    times = _time_values(X[split["column"]]) if temporal else None
+    if temporal:
+        labeled &= times.notna().to_numpy()
     if not labeled.all():
         logger.warning("Пропуски в таргете: %d строк исключены из обучения", int((~labeled).sum()))
     if labeled.sum() < 10:
@@ -698,53 +799,148 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     if log_target and task_type != "regression":
         logger.warning("log_target имеет смысл только для регрессии, отключаю")
         log_target = False
-    if log_target and y_fit.min() < 0:
+    if log_target and not temporal and y_fit.min() < 0:
         logger.warning("В таргете есть отрицательные значения, log1p отключен")
         log_target = False
     cfg["log_target"] = bool(log_target)
-    y_train_scale = np.log1p(y_fit) if log_target else y_fit
+    # Signed log1p agrees with log1p for positive durations. Its domain is independent
+    # of later validation targets and it has a well-defined inverse for negative values.
+    y_train_scale = np.sign(y_fit) * np.log1p(np.abs(y_fit)) if log_target else y_fit
 
     # Колонки-ключи для кодирования по таргету сами в модель не идут, только их кодировки
     te_cols = [c for c in (cfg["target_encoding"] or []) if c in X.columns and c in X_test.columns]
     features = [c for c in (cfg["features"] or list(X.columns)) if c not in te_cols]
-    Xp, Xtp, cat_cols = _prepare_features(X, X_test, features, cfg["cat_encoding"])
+    if temporal:
+        te_cols = []
+        # In a time split even categorical vocabularies and frequencies are fitted per window.
+        Xp, Xtp, cat_cols = X[features].copy(deep=False), X_test[features].copy(deep=False), []
+        clock = split["column"]
+        if clock in features and not pd.api.types.is_numeric_dtype(X[clock]):
+            Xp[clock] = times
+            Xtp[clock] = _time_values(X_test[clock])
+    else:
+        Xp, Xtp, cat_cols = _prepare_features(X, X_test, features, cfg["cat_encoding"])
     cfg["features"] = list(Xp.columns)
     cfg["target_encoding"] = te_cols or None
     te_keys = {c: X[c].to_numpy()[labeled] for c in te_cols}
     te_keys_test = {c: X_test[c].to_numpy() for c in te_cols}
     groups = None
-    if cfg["split"]:
-        split_col = cfg["split"].get("column")
-        if cfg["split"].get("type") != "group" or split_col not in X.columns:
-            raise ValueError(f"Некорректный split: {cfg['split']}, нужна колонка из X")
-        groups = X[split_col].to_numpy()[labeled]
+    if split.get("type") == "group":
+        groups = X[split["column"]].to_numpy()[labeled]
     if not labeled.all():
         Xp = Xp.iloc[np.flatnonzero(labeled)]
-    if cfg["model"] == "catboost":
+    if cfg["model"] == "catboost" and not temporal:
         Xp, Xtp = _to_catboost_frame(Xp, cat_cols), _to_catboost_frame(Xtp, cat_cols)
 
-    # Веса объектов
-    sample_weight = None
-    if cfg["class_weight"] == "balanced" and task_type in CLASSIFICATION:
-        counts = np.bincount(y_fit, minlength=n_classes)
-        sample_weight = (len(y_fit) / (n_classes * counts))[y_fit]
-    elif cfg["class_weight"] not in (None, "balanced"):
+    def training_weights(indices):
+        if cfg["class_weight"] != "balanced" or task_type not in CLASSIFICATION:
+            return None
+        local = y_fit[indices]
+        counts = np.bincount(local, minlength=n_classes)
+        return len(local) / (n_classes * counts[local])
+
+    if cfg["class_weight"] not in (None, "balanced"):
         logger.warning("class_weight=%r не поддерживается, игнорирую", cfg["class_weight"])
 
-    folds = _make_folds(y_fit, task_type, cfg["n_folds"], cfg["fold_seed"], groups)
+    labeled_times = times[labeled].reset_index(drop=True) if temporal else None
+    available_at = None
+    test_cutoff = None
+    refit_idx = np.arange(len(y_fit))
+    cutoff_details = []
+    if cfg["label_delay_unit"]:
+        if not temporal or task_type != "regression":
+            raise ValueError("A duration label requires chronological regression")
+        available_at = _label_available_at(labeled_times, y_fit, cfg["label_delay_unit"])
+        test_times = _time_values(X_test[split["column"]])
+        if test_times.isna().any():
+            raise ValueError("Missing test event time prevents a label-availability cutoff")
+        test_cutoff = test_times.min()
+        refit_idx = np.flatnonzero(available_at < test_cutoff)
+        if len(refit_idx) < 2:
+            raise ValueError("Insufficient labels observed before the prediction period")
+    if temporal:
+        folds = _time_folds(labeled_times, y_fit, cfg["n_folds"], task_type, metric_obj.name)
+        if available_at is not None:
+            eligible = []
+            for train, valid in folds:
+                cutoff = labeled_times.iloc[valid].min()
+                tr = train[(available_at.iloc[train] < min(test_cutoff, cutoff)).to_numpy()]
+                va = valid[(available_at.iloc[valid] < test_cutoff).to_numpy()]
+                if len(va) and len(tr) < 2:
+                    raise ValueError("Insufficient observed labels before a validation window")
+                if len(va):
+                    eligible.append((tr, va))
+                    cutoff_details.append({"cutoff": cutoff, "train_pending": len(train) - len(tr),
+                                           "validation_pending_at_prediction": len(valid) - len(va)})
+            if not eligible:
+                raise ValueError("No evaluable validation window before the prediction period")
+            folds = eligible
+    else:
+        folds = _make_folds(y_fit, task_type, cfg["n_folds"], cfg["fold_seed"], groups)
     clip = task_type == "regression" and bool(cfg["clip_target"])
     cfg["n_folds"] = len(folds)
     fit_fn = _BACKENDS[cfg["model"]]
     extra = {"cat_cols": cat_cols} if cfg["model"] == "catboost" else {}
     te_Y = _te_targets(y_train_scale, y_fit, task_type, n_classes) if te_cols else None
-    te_names = _te_columns(te_cols, te_Y.shape[1] + 1) if te_cols else []
+    test_periods = None
+    if (te_cols and cfg["te_lag"] and task_type == "regression" and groups is not None
+            and str(split["column"]).lower() in {"period", "year", "month", "week"}
+            and pd.api.types.is_numeric_dtype(groups.dtype)):
+        test_periods = X_test[split["column"]].to_numpy(dtype=float)
+        groups = groups.astype(float)
+    te_names = []
+    for col in te_cols:
+        te_names.extend(_te_columns([col], te_Y.shape[1] + 1))
+        if test_periods is not None:
+            te_names.append(f"{col}__lag")
 
-    def fold_frames(tr_idx, va_idx):
+    candidates = {"entity_history": [], "categorical_ids": []}
+    probe_columns = []
+    if temporal and clock in Xp:
+        from features import temporal_entity_candidates
+        first_fit, _, _ = _past_monitor(folds[0][0], labeled_times, y_fit, task_type, available_at)
+        initial = Xp.iloc[first_fit]
+        candidates = temporal_entity_candidates(initial, clock)
+        if cfg["profile_categories"] and metric_obj.name == "pr_auc" and task_type == "binary":
+            for column, values in initial.items():
+                if column == clock:
+                    continue
+                if (column in candidates["entity_history"] or _is_categorical(values) or
+                        (pd.api.types.is_integer_dtype(values) and 2 <= values.nunique() <= 32)):
+                    if len(probe_columns) < 12 and 2 <= values.nunique() <= min(50_000, len(initial) // 2):
+                        probe_columns.append(column)
+    for name, selected in candidates.items():
+        if cfg[name] and not selected:
+            raise ValueError(f"{name}: no eligible repeated IDs in the initial temporal fit prefix")
+    if cfg["categorical_ids"] and cfg["cat_encoding"] != "native":
+        raise ValueError("categorical_ids requires native category encoding")
+    category_probes = {c: [] for c in probe_columns}
+    model_inputs = {}
+    fold_diagnostics = []
+
+    def fold_frames(tr_idx, va_idx, predict_idx=None):
         """Матрицы обучения, валидации и test фолда, с кодировками по таргету, если они заданы."""
         Xtr, Xva, Xte = Xp.iloc[tr_idx], Xp.iloc[va_idx], Xtp
+        if temporal:
+            parts = [Xva]
+            if predict_idx is not None:
+                parts.append(Xp.iloc[predict_idx])
+            evaluation = pd.concat([*parts, Xte], ignore_index=True)
+            if cfg["entity_history"]:
+                from features import add_fold_entity_history
+                Xtr, evaluation = add_fold_entity_history(Xtr, evaluation, candidates["entity_history"], clock)
+            if cfg["categorical_ids"]:
+                Xtr = Xtr.copy()
+                for col in candidates["categorical_ids"]:
+                    Xtr[col] = Xtr[col].astype("category")
+            Xtr, prepared, cats = _prepare_features(Xtr, evaluation, list(Xtr.columns), cfg["cat_encoding"])
+            if cfg["model"] == "catboost":
+                extra["cat_cols"] = cats
+                Xtr, prepared = _to_catboost_frame(Xtr, cats), _to_catboost_frame(prepared, cats)
+            Xva, Xte = prepared.iloc[:len(va_idx)], prepared.iloc[len(va_idx):]
         if te_cols:
             enc_tr, enc_va, enc_te = _target_encode(te_keys, te_keys_test, te_Y, tr_idx, va_idx,
-                                                    groups, cfg["fold_seed"])
+                                                    groups, cfg["fold_seed"], test_periods)
             Xtr, Xva = _with_columns(Xtr, enc_tr, te_names), _with_columns(Xva, enc_va, te_names)
             Xte = _with_columns(Xte, enc_te, te_names)
         return Xtr, Xva, Xte
@@ -762,27 +958,72 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     test_sum = np.zeros((len(Xtp), n_classes)) if n_classes else np.zeros(len(Xtp))
     fold_scores_raw, fold_scores, fold_times, best_iters, done_folds = [], [], [], [], []
     time_stopped_any = False
+    monitor_windows = []
 
     for i, (tr_idx, va_idx) in enumerate(folds):
         now = time.monotonic()
-        if i > 0 and now > deadline:
+        if now >= deadline:
             logger.warning("Бюджет времени исчерпан, выполнено %d из %d фолдов", i, len(folds))
             break
         # Равная доля оставшегося бюджета на фолд, 10%% в запасе на постобработку
         fold_deadline = now + 0.9 * (deadline - now) / (len(folds) - i + refit_slot)
         try:
-            Xtr, Xva, Xte = fold_frames(tr_idx, va_idx)
-            pva, pte, best_iter, stopped = fit_fn(
-                Xtr, y_train_scale[tr_idx],
-                None if sample_weight is None else sample_weight[tr_idx],
-                Xva, y_train_scale[va_idx], Xte,
-                task_type, metric_obj, n_classes, cfg, fold_deadline, **extra,
+            fit_idx, monitor_idx, fold_config = tr_idx, va_idx, cfg
+            if temporal:
+                fit_idx, monitor_idx, mode = _past_monitor(tr_idx, labeled_times, y_fit, task_type, available_at)
+                monitor_windows.append({
+                    "mode": mode, "fit_rows": len(fit_idx), "monitor_rows": len(monitor_idx),
+                    "fit_max": str(labeled_times.iloc[fit_idx].max()),
+                    "monitor_min": str(labeled_times.iloc[monitor_idx].min()),
+                    "monitor_max": str(labeled_times.iloc[monitor_idx].max()),
+                })
+                if mode == "training_monitor":
+                    rounds = min(64, int(cfg["num_boost_round"]))
+                    fold_config = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1}
+            Xtr, Xmon, Xpred = fold_frames(fit_idx, monitor_idx, va_idx if temporal else None)
+            if not model_inputs:
+                model_inputs = {c: {"input_dtype": str(Xp[c].dtype) if c in Xp else "derived",
+                                    "model_dtype": str(Xtr[c].dtype),
+                                    "cardinality_in_fit": int(Xtr[c].nunique())} for c in Xtr}
+            fold_weight = training_weights(fit_idx)
+            pva, pte, best_iter, stopped, last_iter = fit_fn(
+                Xtr, y_train_scale[fit_idx], fold_weight, Xmon, y_train_scale[monitor_idx], Xpred,
+                task_type, metric_obj, n_classes, fold_config, fold_deadline, **extra,
             )
+            if temporal:
+                # Backend returns predictions for the monitor and for outer validation + test.
+                pva, pte = pte[:len(va_idx)], pte[len(va_idx):]
         except Exception as e:
             raise RuntimeError(f"Ошибка обучения {cfg['model']} на фолде {i + 1}: "
                                f"{type(e).__name__}: {e}") from e
         if log_target:
-            pva, pte = np.expm1(pva), np.expm1(pte)
+            pva, pte = np.sign(pva) * np.expm1(np.abs(pva)), np.sign(pte) * np.expm1(np.abs(pte))
+        if not np.isfinite(pva).all() or not np.isfinite(pte).all():
+            raise ValueError("Model returned nonfinite predictions")
+        prediction = pva[:, 1] if task_type == "binary" else pva
+        fold_diagnostics.append({"fold": i, "best_iteration": int(best_iter), "last_iteration": int(last_iter),
+                                 "stopped_for_time": bool(stopped), "prediction_std": float(prediction.std())})
+        if probe_columns:
+            prior = float(y_fit[fit_idx].mean())
+            for col in probe_columns:
+                entries = pd.DataFrame({"key": Xp[col].iloc[fit_idx].to_numpy(), "y": y_fit[fit_idx]})
+                stats = entries.groupby("key", observed=True)["y"].agg(["sum", "count"])
+                rates = (stats["sum"] + 20 * prior) / (stats["count"] + 20)
+                held = Xp[col].iloc[va_idx]
+                values = held.map(rates).astype(float)
+                score = average_precision_score(y_fit[va_idx], values.fillna(prior))
+                # Missing keys form a separate bucket in the total-variation distance.
+                fit_missing, validation_missing = entries["key"].isna().mean(), held.isna().mean()
+                fit_share = stats["count"] / len(fit_idx)
+                held_share = held.value_counts(dropna=True) / len(va_idx)
+                tv = (fit_share.sub(held_share, fill_value=0.).abs().sum() + abs(fit_missing - validation_missing)) / 2
+                category_probes[col].append({
+                    "fold": i, "ap": float(score), "baseline": float(y_fit[va_idx].mean()),
+                    "known_rows": int(values.notna().sum()), "validation_rows": len(va_idx),
+                    "unseen_nonmissing_share": float((held.notna() & values.isna()).mean()),
+                    "fit_missing_share": float(fit_missing), "validation_missing_share": float(validation_missing),
+                    "frequency_total_variation": float(tv),
+                })
         fold_scores_raw.append(_score_fold(y_fit[va_idx], pva, metric_obj))
         if clip:
             # Диапазон только по train фолда, чтобы скор оставался честным
@@ -803,6 +1044,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
 
     if time_stopped_any:
         logger.warning("Часть фолдов остановлена по бюджету времени, раунды урезаны")
+    if not done_folds:
+        raise TimeoutError("Training budget expired before the first fold")
     test_pred = test_sum / len(done_folds)
 
     # Модель на всем train: данных на 1/n_folds больше, чем у моделей фолдов. Скор CV она
@@ -816,16 +1059,18 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             # Ранней остановки нет: число раундов известно из фолдов. Валидация нужна бэкендам
             # формально, берем небольшой кусок train
             rcfg = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1}
-            all_idx = np.arange(n)
-            monitor = np.random.default_rng(cfg["seed"]).choice(n, min(n, 2000), replace=False)
+            all_idx = refit_idx
+            monitor = np.random.default_rng(cfg["seed"]).choice(all_idx, min(len(all_idx), 2000), replace=False)
             try:
                 Xall, Xmon, Xte = fold_frames(all_idx, monitor)
-                _, pte, _, stopped = fit_fn(
-                    Xall, y_train_scale, sample_weight, Xmon, y_train_scale[monitor], Xte,
+                _, pte, _, stopped, _ = fit_fn(
+                    Xall, y_train_scale[all_idx], training_weights(all_idx), Xmon, y_train_scale[monitor], Xte,
                     task_type, metric_obj, n_classes, rcfg, deadline, **extra,
                 )
                 if log_target:
-                    pte = np.expm1(pte)
+                    pte = np.sign(pte) * np.expm1(np.abs(pte))
+                if not np.isfinite(pte).all():
+                    raise ValueError("Refit returned nonfinite predictions")
                 if not stopped:
                     test_pred = 0.5 * test_pred + 0.5 * pte
                 refit_info = {"rounds": rounds, "applied": not stopped,
@@ -844,7 +1089,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     # Клиппинг регрессии оставляем, только если он улучшает скор по фолдам
     if clip:
         score_clip = float(np.nanmean(fold_scores))
-        clip = _is_better(score_clip, score_raw, metric_obj.greater_is_better)
+        # Temporal windows apply the configured rule without selecting it on future outcomes.
+        clip = temporal or _is_better(score_clip, score_raw, metric_obj.greater_is_better)
         logger.info("Клиппинг в диапазон таргета: %s %.5f -> %.5f, %s", metric_obj.name, score_raw,
                     score_clip, "применяю" if clip else "не улучшает, отключаю")
         if clip:
@@ -857,7 +1103,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                             "range": [float(y_fit.min()), float(y_fit.max())]}
 
     # Постобработка для метрик по меткам: веса классов, честная оценка через кросс-фиттинг
-    if (task_type in CLASSIFICATION and not metric_obj.needs_proba and cfg["postprocess"]
+    if (not temporal and task_type in CLASSIFICATION and not metric_obj.needs_proba and cfg["postprocess"]
             and len(done_folds) >= 2):
         weights, cross_scores, postprocess_info = _cross_fit_class_weights(
             oof, y_fit, [folds[i] for i in done_folds], metric_obj, score_raw)
@@ -868,7 +1114,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
 
     # Финальные предсказания
     if task_type == "regression":
-        predictions = _finalize_regression(test_pred, y_fit, clip)
+        predictions = _finalize_regression(test_pred, y_fit[refit_idx], clip)
         probabilities, class_order = None, None
     else:
         probabilities = test_pred
@@ -882,6 +1128,29 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         oof_full = np.full((len(X),) + oof.shape[1:], np.nan)
         oof_full[labeled] = oof
 
+    meta_known_from = None
+    if temporal:
+        windows = []
+        for i in done_folds:
+            train_idx, valid_idx = folds[i]
+            latest = labeled_times.iloc[train_idx].max()
+            earliest = labeled_times.iloc[valid_idx].min()
+            if not latest < earliest:
+                raise ValueError("Training time overlaps its validation window")
+            windows.append({"train_rows": len(train_idx), "validation_rows": len(valid_idx),
+                            "train_max": str(latest), "validation_min": str(earliest)})
+            if available_at is not None:
+                details = cutoff_details[i]
+                windows[-1].update(validation_cutoff=str(details["cutoff"]), train_pending=details["train_pending"],
+                                   validation_pending_at_prediction=details["validation_pending_at_prediction"])
+        if available_at is not None:
+            cfg["prediction_cutoff"] = str(test_cutoff)
+            cfg["observed_before_prediction"] = len(refit_idx)
+            cutoffs = pd.DatetimeIndex([d["cutoff"] for d in cutoff_details])
+            meta_known_from = np.full(len(labeled), len(cutoffs), dtype=np.int32)
+            meta_known_from[labeled] = cutoffs.searchsorted(available_at, side="right")
+        cfg["fold_windows"] = windows
+        cfg["early_stopping_windows"] = monitor_windows
     fit_time = time.monotonic() - t_start
     score = float(np.nanmean(fold_scores))
     score_std = float(np.nanstd(fold_scores))
@@ -903,10 +1172,17 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         # Дополнительно для журнала экспериментов
         "postprocess_time": time.monotonic() - t_post,
         "fold_ids": _fold_ids(folds, done_folds, labeled),
+        "meta_known_from": meta_known_from,
         "fold_scores": [float(s) for s in fold_scores],
         "fold_scores_raw": [float(s) for s in fold_scores_raw],
         "fold_times": fold_times,
         "best_iterations": best_iters,
+        "feature_candidates": candidates,
+        "model_inputs": model_inputs,
+        "fold_diagnostics": fold_diagnostics,
+        "category_probes": ({"smoothing_rows": 20, "source": "labels in model-fit prefix before monitor",
+                             "availability_assumption": "fit-prefix labels are observed at the prediction cutoff",
+                             "columns": category_probes} if probe_columns else None),
         "greater_is_better": metric_obj.greater_is_better,
         "postprocess": postprocess_info,
         "refit": refit_info,
@@ -960,6 +1236,7 @@ class _BlendData:
     tests: np.ndarray             # (моделей, строк test[, классов])
     folds: list                   # только фолды с полными OOF у всех моделей
     cfg0: dict
+    meta_known_from: np.ndarray | None
 
 
 def _prepare_blend(results: list[dict], y: pd.Series, metric: str) -> _BlendData:
@@ -993,20 +1270,31 @@ def _prepare_blend(results: list[dict], y: pd.Series, metric: str) -> _BlendData
         raise ValueError("Длина OOF не совпадает с длиной y")
 
     cfg0 = results[0]["config"]
+    if any((r["config"].get("split") or {}) != (cfg0.get("split") or {}) for r in results):
+        raise ValueError("Cannot blend results with different split strategies")
+    meta_known_from = results[0].get("meta_known_from")
+    if any(not np.array_equal(r.get("meta_known_from"), meta_known_from) for r in results):
+        raise ValueError("Cannot blend results with different label availability")
     if "fold_ids" in results[0]:
         fold_ids = np.asarray(results[0]["fold_ids"])
-        if any("fold_ids" in r and not np.array_equal(r["fold_ids"], fold_ids) for r in results):
-            logger.warning("У результатов разные фолды, оценка бленда идет по фолдам первого результата")
+        if any("fold_ids" not in r or not np.array_equal(r["fold_ids"], fold_ids) for r in results):
+            raise ValueError("Cannot blend results with different validation rows")
         fid = fold_ids[labeled]
-        folds = [(np.flatnonzero((fid >= 0) & (fid != k)), np.flatnonzero(fid == k))
-                 for k in np.unique(fid[fid >= 0])]
+        temporal = (cfg0.get("split") or {}).get("type") == "time"
+        folds = []
+        for k in np.unique(fid[fid >= 0]):
+            fit = (fid >= 0) & ((fid < k) if temporal else (fid != k))
+            if meta_known_from is not None:
+                fit &= meta_known_from[labeled] <= k
+            folds.append((np.flatnonzero(fit), np.flatnonzero(fid == k)))
     else:
+        if cfg0.get("split") or any("fold_ids" in r for r in results):
+            raise ValueError("Missing validation fold IDs")
         folds = _make_folds(y_enc, task_type, cfg0["n_folds"], cfg0.get("fold_seed", cfg0["seed"]))
     finite = np.isfinite(oofs).reshape(len(results), len(y_enc), -1).all(axis=(0, 2))
-    folds = [f for f in folds if finite[f[1]].all()]
-    if not folds:
-        raise ValueError("Нет фолдов с полными OOF у всех моделей")
-    return _BlendData(task_type, metric_obj, labeled, y_enc, class_order, oofs, tests, folds, cfg0)
+    if not folds or any(not finite[va].all() for _, va in folds):
+        raise ValueError("Missing predictions on validation rows")
+    return _BlendData(task_type, metric_obj, labeled, y_enc, class_order, oofs, tests, folds, cfg0, meta_known_from)
 
 
 def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, config: dict,
@@ -1019,7 +1307,11 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
     fold_scores = fold_scores_raw
     postprocess_info = None
 
-    if data.task_type == "regression":
+    temporal = (data.cfg0.get("split") or {}).get("type") == "time"
+    if data.task_type == "regression" and temporal:
+        predictions = _finalize_regression(test_pred, y_enc, False)
+        probabilities = None
+    elif data.task_type == "regression":
         # Клиппинг по диапазону train фолда, оставляем только при улучшении
         clipped = [np.clip(oof[va], y_enc[tr].min(), y_enc[tr].max()) for tr, va in folds]
         clip_scores = [_score_fold(y_enc[va], p, metric_obj) for (_, va), p in zip(folds, clipped)]
@@ -1034,7 +1326,7 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
         probabilities = None
     else:
         cls_w = np.ones(len(data.class_order))
-        if not metric_obj.needs_proba and len(folds) >= 2:
+        if not temporal and not metric_obj.needs_proba and len(folds) >= 2:
             cls_w, cross_scores, postprocess_info = _cross_fit_class_weights(
                 oof, y_enc, folds, metric_obj, score_raw)
             postprocess_info["weights"] = dict(zip(
@@ -1051,9 +1343,13 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
         oof_full[data.labeled] = oof
 
     cfg0 = data.cfg0
-    config = config | {"task_type": data.task_type, "metric": metric_obj.name,
+    config = config | {"task_type": data.task_type, "metric": metric_obj.name, "split": cfg0.get("split"),
                        "n_folds": cfg0["n_folds"], "n_folds_done": len(folds), "seed": cfg0["seed"],
                        "fold_seed": cfg0.get("fold_seed", cfg0["seed"])}
+    if temporal and cfg0.get("fold_windows"):
+        config["fold_windows"] = cfg0["fold_windows"]
+        for key in ("early_stopping_windows", "label_delay_unit", "prediction_cutoff", "observed_before_prediction"):
+            config[key] = cfg0.get(key)
     score, score_std = float(np.nanmean(fold_scores)), float(np.nanstd(fold_scores))
     return {
         "score": score,
@@ -1071,6 +1367,7 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
         "postprocess": postprocess_info,
         "members_fit_time": members_fit_time,
         "fold_ids": _fold_ids(folds, list(range(len(folds))), data.labeled),
+        "meta_known_from": data.meta_known_from,
     }
 
 
@@ -1145,11 +1442,11 @@ def optimize_blend_weights(results: list[dict], y: pd.Series, metric: str) -> di
         done_mask[va] = True
     oof_cf = np.full_like(data.oofs[0], np.nan)
     fold_weights = []
-    for _, va in data.folds:
-        fit_mask = done_mask.copy()
-        fit_mask[va] = False
-        fit_idx = np.flatnonzero(fit_mask)
-        w = _greedy_blend_weights(data.oofs[:, fit_idx], data.y_enc[fit_idx], objective)
+    for fit_idx, va in data.folds:
+        if len(fit_idx):
+            w = _greedy_blend_weights(data.oofs[:, fit_idx], data.y_enc[fit_idx], objective)
+        else:
+            w = np.full(len(results), 1 / len(results))
         oof_cf[va] = np.tensordot(w, data.oofs[:, va], axes=1)
         fold_weights.append(w.round(4).tolist())
     done_idx = np.flatnonzero(done_mask)
@@ -1188,12 +1485,17 @@ def compare_results(a: dict, b: dict) -> dict:
     diffs положительны, когда b лучше. accept=True, только если b лучше на большинстве фолдов
     и средняя разница больше половины std разниц.
     """
+    if ("fold_ids" in a or "fold_ids" in b) and not np.array_equal(a.get("fold_ids"), b.get("fold_ids")):
+        raise ValueError("Cannot compare results from different validation rows")
+    if a.get("fold_signature") != b.get("fold_signature"):
+        raise ValueError("Cannot compare results from different validation rows")
     fa, fb = np.asarray(a["fold_scores"], float), np.asarray(b["fold_scores"], float)
     if len(fa) != len(fb):
         raise ValueError(f"Разное число фолдов: {len(fa)} и {len(fb)}, сравнение некорректно")
     ca, cb = a.get("config", {}), b.get("config", {})
-    if ca.get("fold_seed", ca.get("seed")) != cb.get("fold_seed", cb.get("seed")):
-        logger.warning("У результатов разные сиды фолдов, попарное сравнение неточно")
+    if (a.get("fold_signature") is None and "fold_ids" not in a
+            and ca.get("fold_seed", ca.get("seed")) != cb.get("fold_seed", cb.get("seed"))):
+        raise ValueError("Cannot compare results from different validation seeds")
     greater = a.get("greater_is_better", True)
     diffs = fb - fa if greater else fa - fb
     n_better = int((diffs > 0).sum())
@@ -1218,18 +1520,45 @@ _AUTO_TUNE_MAX_TRIALS = 40        # и не дольше стольких обу
 
 def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
                   config: dict, time_budget: float) -> dict:
-    """Подбор гиперпараметров LightGBM через Optuna на тех же фолдах, что и остальные модели.
-
-    Во время подбора постобработка выключена ради скорости, ранжирование от этого почти
-    не меняется. Первой пробуется точка с дефолтами, поэтому результат не хуже базового.
-    Возвращает лучшие params или пустой словарь, если ни одна попытка не завершилась.
-    """
+    """Search before the first outer validation window and rescore winners on outer OOF."""
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     deadline = time.monotonic() + time_budget
     greater = get_metric(metric, task_type).greater_is_better
     base = dict(config) | {"model": "lightgbm", "postprocess": False, "refit_full": False}
+
+
+    split = base.get("split")
+    if "split" not in base:
+        from data_tools import detect_time_column
+        clock = detect_time_column(X, X_test)
+        split = {"type": "time", "column": clock} if clock else None
+    temporal = (split or {}).get("type") == "time"
+    if temporal:
+        clock = _time_values(X[split["column"]]).reset_index(drop=True)
+        targets = pd.Series(np.asarray(y))
+        eligible = targets.notna() & clock.notna()
+        times = pd.Index(clock[eligible].unique()).sort_values()
+        if len(times) < 2:
+            return {}
+        n_blocks = min(len(times), max(2, int(base.get("n_folds", DEFAULT_CONFIG["n_folds"])) + 1))
+        first_validation = times[(len(times) + n_blocks - 1) // n_blocks]
+        prefix = eligible & clock.lt(first_validation)
+        positions = np.flatnonzero(prefix)
+        if base.get("label_delay_unit"):
+            published = _label_available_at(clock.iloc[positions], targets.iloc[positions].to_numpy(),
+                                            base["label_delay_unit"])
+            positions = positions[published.lt(first_validation).to_numpy()]
+        X = X.iloc[positions].reset_index(drop=True)
+        y = targets.iloc[positions].reset_index(drop=True)
+        if len(y) < 12 or X[split["column"]].nunique() < 4 or (task_type in CLASSIFICATION and y.nunique() < 2):
+            return {}
+        # Use a historical placeholder with the real as-of cutoff. Physical row order
+        # within the training table must not set the outcome publication deadline.
+        X_test = X.iloc[[-1]].copy()
+        X_test[split["column"]] = first_validation
+        base.update(n_folds=3, split=split)
 
     def objective(trial):
         params = {
@@ -1244,7 +1573,7 @@ def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type
         if left < 10:
             trial.study.stop()
             raise optuna.TrialPruned()
-        res = train_and_predict(X, y, X_test, task_type, metric, base | {"params": params},
+        res = train_and_predict(X, y, X_test, task_type, metric, base | {"params": params | {"bagging_freq": 1}},
                                 time_budget=left)
         # Фолды, урезанные по времени, дают несравнимый скор
         if res["config"]["n_folds_done"] < res["config"]["n_folds"]:
@@ -1256,7 +1585,8 @@ def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type
     study.enqueue_trial({"learning_rate": 0.05, "num_leaves": 63, "min_child_samples": 20,
                          "feature_fraction": 0.8, "bagging_fraction": 0.8, "lambda_l2": 1.0})
     t0 = time.monotonic()
-    study.optimize(objective, timeout=time_budget, catch=(Exception,))
+    study.optimize(objective, timeout=max(0.0, deadline - time.monotonic()),
+                   n_trials=12 if temporal else None, catch=(Exception,))
     done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not done:
         logger.warning("Подбор параметров: ни одна попытка не завершилась")
@@ -1282,6 +1612,8 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     t_start = time.monotonic()
     deadline = t_start + time_budget
     base = dict(config or {})
+    candidate_params = dict(base.pop("params", {}) or {})
+    candidate_backend = _check_backend(base.pop("model", "lightgbm"))
     seed0 = base.get("seed", DEFAULT_CONFIG["seed"])
     base.setdefault("fold_seed", seed0)
     remaining = lambda: deadline - time.monotonic()
@@ -1316,12 +1648,16 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
                 logger.info("auto_train: %s пропущен, оценка %.0f с больше доступных %.0f с",
                             name, est * _AUTO_SAFETY, budget)
                 return False
-        cfg = base | extra | {"params": base.get("params", {}) | extra.get("params", {})}
+        inherited = candidate_params if extra.get("model", "lightgbm") == candidate_backend else {}
+        cfg = base | extra | {"params": inherited | extra.get("params", {})}
         logger.info("auto_train: %s, бюджет %.0f с, осталось %.0f с", name, budget, remaining())
         try:
             res = train_and_predict(X, y, X_test, task_type, metric, cfg, time_budget=budget)
         except Exception:
             logger.exception("auto_train: модель %s упала, продолжаю без нее", name)
+            return False
+        if res["config"]["n_folds_done"] != res["config"]["n_folds"] or not np.isfinite(res["score"]):
+            logger.info("auto_train: skipping incomplete result %s", name)
             return False
         members[name] = res
         kind_time[kind] = res["fit_time"]
@@ -1349,7 +1685,13 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     # XGBoost катастрофически ошибается на категориях, которых не было в train, а CV этого
     # не видит: в OOF новых категорий не бывает. Поэтому при их заметной доле обходимся без него
     features = base.get("features") or list(X.columns)
-    unseen = unseen_category_share(X[features], X_test[features])
+    if "split" not in base:
+        from data_tools import detect_time_column
+        clock = detect_time_column(X, X_test)
+        if clock:
+            base["split"] = {"type": "time", "column": clock}
+    temporal = (base.get("split") or {}).get("type") == "time"
+    unseen = {} if temporal else unseen_category_share(X[features], X_test[features])
     use_xgb = max(unseen.values(), default=0.0) < _AUTO_UNSEEN_MAX
     if not use_xgb:
         logger.warning("auto_train: в test новые категории %s, XGBoost не используем",
@@ -1357,10 +1699,12 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
 
     # Шаг 1: два бустинга с дефолтами, LightGBM первым как самый быстрый
     run("lgb", {"model": "lightgbm"}, budget=0.4 * (remaining() - reserve()), force=True)
-    if not members:
+    if not members and not use_xgb:
         raise RuntimeError("auto_train: базовая модель не обучилась")
     if use_xgb:
         run("xgb", {"model": "xgboost"})
+    if not members:
+        raise RuntimeError("No completed model fits within the experiment budget")
     best = blend(None)
 
     # Шаг 2: сиды XGBoost и LightGBM, пока следующая модель укладывается в остаток
@@ -1369,7 +1713,17 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     if task_final in CLASSIFICATION:
         queue.append(("lgb_balanced", {"model": "lightgbm", "class_weight": "balanced"}))
     else:
-        y_num = pd.to_numeric(pd.Series(np.asarray(y)), errors="coerce").dropna()
+        y_num = pd.to_numeric(pd.Series(np.asarray(y)), errors="coerce")
+        if temporal:
+            first = next(iter(members.values()))["config"]["fold_windows"][0]
+            times = _time_values(X[base["split"]["column"]]).reset_index(drop=True)
+            known_at = times
+            if base.get("label_delay_unit"):
+                known_at = _label_available_at(times, y_num, base["label_delay_unit"])
+            validation_start = first.get("validation_cutoff", first["validation_min"])
+            cutoff = float(validation_start) if pd.api.types.is_numeric_dtype(times) else pd.Timestamp(validation_start)
+            y_num = y_num[known_at < cutoff]
+        y_num = y_num.dropna()
         if len(y_num) and y_num.min() >= 0 and y_num.skew() > 1:
             # Тяжелый хвост: log1p-модель как кандидат в бленд, веса решат, нужна ли она
             queue.append(("lgb_log1p", {"model": "lightgbm", "log_target": True}))
@@ -1380,19 +1734,30 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
                 queue.append((f"xgb_seed{k + 1}", {"model": "xgboost", "seed": seed0 + k}))
             queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
 
-    add_seeds(1, min(max_seeds, _AUTO_MAX_SEEDS))
-    added = [run(name, extra) for name, extra in queue]
-    if max_seeds > _AUTO_MAX_SEEDS:
-        # Запас времени: подбор параметров LightGBM, медленные модели, затем еще сиды
-        queue = []
+    # The initial model gives a cost estimate before slower weighted fits or extra seeds.
+    compact_search = temporal and max_seeds == 1
+    added = []
+    if compact_search or max_seeds > _AUTO_MAX_SEEDS:
         avail = remaining() - reserve()
         lgb_time = kind_time.get("lightgbm")
-        if lgb_time and avail > _AUTO_TUNE_MIN_TRIALS * lgb_time:
-            tuned = tune_lightgbm(X, y, X_test, task_type, metric, base,
-                                  min(0.4 * avail, _AUTO_TUNE_MAX_TRIALS * lgb_time))
+        tune_seconds = min(0.25 * avail, _AUTO_TUNE_MAX_TRIALS * (lgb_time or 0.0))
+        if lgb_time and avail > (3 if temporal else _AUTO_TUNE_MIN_TRIALS) * lgb_time and tune_seconds > 10:
+            try:
+                tuned = tune_lightgbm(X, y, X_test, task_type, metric, base, tune_seconds)
+            except ImportError:
+                tuned = {}
             if tuned:
-                queue += [("lgb_tuned", {"model": "lightgbm", "params": tuned}),
-                          ("lgb_tuned_seed2", {"model": "lightgbm", "params": tuned, "seed": seed0 + 1})]
+                added.append(run("lgb_tuned", {"model": "lightgbm", "params": tuned}))
+                if not compact_search:
+                    queue.append(("lgb_tuned_seed2", {"model": "lightgbm", "params": tuned, "seed": seed0 + 1}))
+
+    add_seeds(1, min(max_seeds, _AUTO_MAX_SEEDS))
+    for name, extra in queue:
+        # Balanced weights can cost an order of magnitude more than a regular fit.
+        allowance = max(min_step, 3 * members["lgb"]["fit_time"]) if name == "lgb_balanced" and "lgb" in members else None
+        added.append(run(name, extra, budget=allowance))
+    if max_seeds > _AUTO_MAX_SEEDS:
+        queue = []
         slow = {"early_stopping_rounds": 300, "num_boost_round": 10000}
         if use_xgb:
             queue.append(("xgb_slow", {"model": "xgboost", "params": {"eta": 0.02}} | slow))
@@ -1415,7 +1780,9 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         greater = next(iter(members.values()))["greater_is_better"]
         best = dict(max(members.values(), key=lambda r: r["score"] if greater else -r["score"]))
     best["members"] = {k: {"score": r["score"], "score_std": r["score_std"], "fit_time": r["fit_time"],
-                           "model": r["config"]["model"]} for k, r in members.items()}
+                           "model": r["config"]["model"], "params": r["config"].get("params"),
+                           "seed": r["config"].get("seed"),
+                           "fold_diagnostics": r.get("fold_diagnostics")} for k, r in members.items()}
     # Полные результаты моделей, чтобы финализатор мог пересобрать бленд без переобучения
     best["member_results"] = members
     best["fit_time"] = time.monotonic() - t_start
