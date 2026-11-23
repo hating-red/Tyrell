@@ -12,7 +12,7 @@ from pipeline import check_result
 
 # Лимит платформы с запасом на завершение; TYRELL_TIME_LIMIT - только для локальных прогонов
 # Запас 10 минут: платформа считает длительность вместе с запуском контейнера и данными
-TOTAL_SECONDS = float(os.environ.get("TYRELL_TIME_LIMIT", 3 * 60 * 60)) - 600
+TOTAL_SECONDS = float(os.environ.get("TYRELL_TIME_LIMIT", 2 * 60 * 60)) - 300
 HARD_DEADLINE = [None]                # общий дедлайн: ни один эксперимент его не переживет
 SAFETY_SHARE = 0.06                   # быстрый страховочный ответ
 AUTO_SHARE = 0.25                     # базовый auto_train до LLM
