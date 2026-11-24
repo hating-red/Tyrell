@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -107,7 +108,7 @@ def _word(text, name):
     return re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.I) is not None
 
 
-def _local_sample(task_path, task_text):
+def _local_sample(task_path, task_text, *, reject_ambiguous=False):
     folder = task_path.parent.resolve()
     adjacent = folder / "sample_submission.csv"
     if adjacent.resolve().is_relative_to(folder) and adjacent.is_file():
@@ -133,6 +134,8 @@ def _local_sample(task_path, task_text):
             if resolved.is_relative_to(folder) and resolved.is_file():
                 candidates.add(resolved)
                 if len(candidates) > 1:
+                    if reject_ambiguous:
+                        raise ValueError("Несколько локальных шаблонов, task.md не определяет нужный файл.")
                     return None
     return next(iter(candidates), None)
 
@@ -150,7 +153,7 @@ def _sample_table(tables, text):
             scores.append(((bool(declared), int(_word(text, table.schema + "." + table.name)),
                             int(_word(text, table.name)), int(normalized == "sample_submission")), table))
     if not scores:
-        raise ValueError("Не найден локальный шаблон или таблица sample_submission.")
+        return None
     score = max(item[0] for item in scores)
     selected = [t for s, t in scores if s == score]
     if len(selected) != 1:
@@ -158,32 +161,118 @@ def _sample_table(tables, text):
     return selected[0]
 
 
+def _declared_submission_columns(text):
+    """Read an explicit output-column list or CSV header, preserving case and order."""
+    context = re.compile(r"submission(?:\.csv)?|output (?:format|columns|header)|"
+                         r"формат (?:ответа|результата)|(?:колонки|столбцы) (?:файла )?ответа", re.I)
+    marker = re.compile(r"(?:columns?|headers?|колонк\w*|столбц\w*|столбца|заголов\w*)"
+                        r"\s*(?::|=|—|-)?\s*", re.I)
+    separator = re.compile(r"\s*,\s*|\s+(?:и|and)\s+", re.I)
+    lines = text.splitlines()
+    found = set()
+
+    def collect(parts):
+        names = tuple(part.strip().strip(chr(96) + '"') for part in parts)
+        if (len(names) >= 2 and len(set(names)) == len(names)
+                and all(re.fullmatch(r"[\w-]+", name) for name in names)):
+            found.add(names)
+            return True
+        return False
+
+    for pos, line in enumerate(lines):
+        anchor = context.search(line)
+        if not anchor:
+            continue
+        tail = line[anchor.end():]
+        inline = tail.replace(chr(96), "").strip()
+        label = marker.search(inline)
+        if label:
+            inline = inline[label.end():]
+        has_inline = collect(separator.split(inline.strip(" :=—-").split(". ", 1)[0].rstrip(".")))
+        for code in re.findall(r"\x60([^\x60]*,[^\x60]*)\x60", tail):
+            has_inline = collect(code.split(",")) or has_inline
+        if has_inline:
+            continue
+
+        # Read the first literal header after the declaration. Stop before an unrelated
+        # section or the first data row. A Markdown list may also describe each column.
+        items = []
+        for following in lines[pos + 1:]:
+            item = following.strip()
+            if not item:
+                if items:
+                    break
+                continue
+            if item.startswith(chr(96) * 3):
+                if items:
+                    break
+                continue
+            if item.startswith("#"):
+                break
+            bullet = re.fullmatch(r"(?:[-*]|\d+[.)])\s+\x60?([\w-]+)\x60?(?:\s*(?:[—–:]|\s-)\s*.+)?", item)
+            if bullet:
+                items.append(bullet.group(1))
+                continue
+            if items:
+                if re.match(r"(?:[-*]|\d+[.)])\s", item):
+                    raise ValueError("Неполное описание списка колонок submission в task.md.")
+                break
+            if item.startswith("|"):
+                collect(item.strip("|").split("|"))
+                break
+            label = marker.search(item)
+            value = item[label.end():] if label else item
+            if collect(separator.split(value.strip(" :=—-").rstrip("."))):
+                break
+            if not label and not context.search(item) and "csv" not in item.lower():
+                break
+        if items:
+            collect(items)
+    if len(found) != 1:
+        raise ValueError("Без sample_submission требуется однозначный заголовок выходного CSV в task.md.")
+    return list(found.pop())
+
+
 _ORDINALS = {"row_number", "row_num", "row_index", "row_ordinal", "row_order", "row_position",
              "sample_order", "sample_position", "submission_order", "ordinal", "ordinal_position"}
 
 
-def _sample_order(table, text):
-    context = r"sample|submission|шаблон|сабмит|порядок строк"
+def _sample_order(table, text, *, optional=False):
+    context = r"sample|submission|шаблон|сабмит|порядок строк|output|(?:файл|формат) (?:ответа|результата)"
     lines = text.splitlines()
     order_lines = [line for i, line in enumerate(lines) if re.search(context, line, re.I) or
                    (i and re.search(context, lines[i - 1], re.I) and
                     re.match(r"\s*[`]*order\s+by\b", line, re.I))]
     explicit = set()
-    for col in table.columns:
-        name = r'[`"]?' + re.escape(col) + r'[`"]?(?!\w)'
-        pattern = (r"(?:order(?:ed)?\s+by|sorted\s+by|сортиров\w*\s+по|отсортир\w*\s+по)\s+" +
-                   name + r"(?:\s+(?:in\s+)?(desc(?:ending)?|asc(?:ending)?|по убыванию|по возрастанию))?")
-        for line in order_lines:
-            for match in re.finditer(pattern, line, re.I):
-                if re.search(r"\b(?:not|without|не|без)\s*$", line[:match.start()], re.I):
-                    continue
-                if re.match(r"\s*(?:[-+*/%(:]|collate\b)", line[match.end():], re.I):
-                    raise ValueError("Выражение ORDER BY шаблона не является простой колонкой.")
-                direction = (match.group(1) or "").lower()
-                explicit.add((col, direction.startswith("desc") or direction == "по убыванию"))
-            direct = re.search(r"(?:по |в порядке )(возрастани[юя]|убывани[юя])\s+" + name, line, re.I)
-            if direct:
-                explicit.add((col, direct.group(1).lower().startswith("убыв")))
+    by_spelling = {}
+    for column in table.columns:
+        by_spelling.setdefault(column.casefold(), []).append(column)
+    direction = r"desc(?:ending)?|asc(?:ending)?|по убыванию|по возрастанию"
+    directive = re.compile(
+        r"(?:\b(?:order(?:ed)?\s+by|sorted\s+by|сортиров\w*\s+по|отсортир\w*\s+по)|"
+        r"(?:по |в порядке )(?P<before>возрастани[юя]|убывани[юя]))"
+        r"\s+(?P<quote>[\x60\"]?)(?P<key>\w+)(?P=quote)(?:\s+(?:in\s+)?(?P<after>" + direction + r"))?", re.I)
+    order_words = re.compile(r"order(?:ed)?\s+by|sorted\s+by|сортиров\w*\s+по|отсортир\w*\s+по|"
+                             r"(?:по |в порядке )(?:убывани[юя]|возрастани[юя])\b", re.I)
+    for line in order_lines:
+        if order_words.search(directive.sub("", line)):
+            raise ValueError("Выражение ORDER BY шаблона не является одной известной колонкой.")
+        for match in directive.finditer(line):
+            if re.search(r"\b(?:not|without|не|без)\s*$", line[:match.start()], re.I):
+                continue
+            tail = line[match.end():].lstrip(chr(96)).strip()
+            spelling = match["key"]
+            keys = ([spelling] if spelling in table.columns or match["quote"] == '"' else
+                    by_spelling.get(spelling.casefold(), []))
+            # Permit sentences such as "sorted by ID, as in the input". Reject another
+            # sort key, SQL modifiers and expressions rather than silently dropping them.
+            note = re.match(r"^,?\s*(?:as (?:in|specified|described)|как в|как указано|для того чтобы|"
+                            r"чтобы|в (?:соответствии|исходном|шаблоне)|for reproducibility)\b", tail, re.I)
+            if (len(keys) != 1 or keys[0] not in table.columns or match["before"] and match["after"]
+                    or tail and not note and not re.match(r"^[.;](?:\s|$)", tail)):
+                raise ValueError("Выражение ORDER BY шаблона не является одной известной колонкой.")
+            value = (match["before"] or match["after"] or "").lower()
+            explicit.add((keys[0], value.startswith(("desc", "убыв", "по убыв"))))
     ordinal = [col for col in table.columns if
                table.column_types.get(col) in ("integer", "smallint", "bigint", "numeric") and
                (col.lower() in _ORDINALS or re.search(
@@ -195,6 +284,8 @@ def _sample_order(table, text):
         return key, descending, ordinal
     if not explicit and len(ordinal) == 1:
         return ordinal[0], False, ordinal
+    if optional and not explicit and not ordinal:
+        return None, False, []
     raise ValueError("Порядок sample_submission не определён однозначно. Нужен исходный CSV, "
                      "колонка порядка строк или заданный в task.md ORDER BY.")
 
@@ -296,7 +387,7 @@ def _fetch_size(rows, bytes_read):
 
 
 def _export(conn, table, columns, path, deadline, *, order=None, descending=False, check_order=False,
-            memory_budget=_FRAME_BUDGET, id_column=None, progress=None):
+            memory_budget=_FRAME_BUDGET, id_column=None, progress=None, template_columns=()):
     fields = list(columns)
     if order and order not in fields:
         fields.append(order)
@@ -317,7 +408,18 @@ def _export(conn, table, columns, path, deadline, *, order=None, descending=Fals
 
     report(False)
     _set_timeout(conn, deadline)
-    with conn.cursor(name="tyrell_export") as cursor, path.open("x", newline="", encoding="utf-8") as stream:
+    # For an absent sample, emit placeholders alongside this same test cursor. A second
+    # scan, even in a repeatable snapshot, need not return rows in the same order.
+    sample_path = path.with_name("sample_submission.csv")
+    sample_context = sample_path.open("x", newline="", encoding="utf-8") if template_columns else nullcontext()
+    with (sample_context as sample_stream, conn.cursor(name="tyrell_export") as cursor,
+          path.open("x", newline="", encoding="utf-8") as stream):
+        if sample_stream is not None:
+            sample_writer = csv.writer(sample_stream)
+            sample_writer.writerow(template_columns)
+            sample_row = [0] * len(template_columns)
+            output_id = template_columns.index(id_column)
+            input_id = fields.index(id_column)
         writer = csv.writer(stream)
         writer.writerow(columns)
         cursor.execute(sql)
@@ -341,9 +443,13 @@ def _export(conn, table, columns, path, deadline, *, order=None, descending=Fals
                 writer.writerows(row[:len(columns)] for row in rows)
             else:
                 writer.writerows(rows)
+            if sample_stream is not None:
+                for row in rows:
+                    sample_row[output_id] = row[input_id]
+                    sample_writer.writerow(sample_row)
             count += len(rows)
             written = stream.tell()
-            size = written + count * fixed_bytes
+            size = written + count * fixed_bytes + (sample_stream.tell() if sample_stream is not None else 0)
             # Adapt to measured row width. Fewer network round trips for narrow tables;
             # wide text/JSON stays in small batches instead of buffering an entire result.
             batch = _fetch_size(count, size)
@@ -355,7 +461,7 @@ def _export(conn, table, columns, path, deadline, *, order=None, descending=Fals
                                  f"(таблица {_relation(table)}, прочитано {count} строк).")
         written = stream.tell()
         report(True)
-        return written + count * fixed_bytes
+        return written + count * fixed_bytes + (sample_stream.tell() if sample_stream is not None else 0)
 
 
 def pg_error_reason(error):
@@ -435,9 +541,14 @@ def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core
                 log(f"Шаблон и порядок ID из CSV {local.name}.")
             else:
                 sample = _sample_table(tables, text)
-                order, desc, ordinals = _sample_order(sample, text)
-                columns = list(sample.columns)
-                log(f"Шаблон из {_relation(sample)}, порядок по {_identifier(order)} {'DESC' if desc else 'ASC'}.")
+                if sample is None:
+                    # Several competing local templates must never be treated as absent.
+                    _local_sample(task_path, text, reject_ambiguous=True)
+                    columns = _declared_submission_columns(text)
+                else:
+                    order, desc, ordinals = _sample_order(sample, text)
+                    columns = list(sample.columns)
+                    log(f"Шаблон из {_relation(sample)}, порядок по {_identifier(order)} {'DESC' if desc else 'ASC'}.")
             if len(columns) < 2 or any(not c for c in columns) or len(set(columns)) != len(columns):
                 raise ValueError("Некорректные имена колонок шаблона submission.")
             train, test, id_col, target = _choose_pair(tables, sample, columns, text, ordinals)
@@ -454,15 +565,29 @@ def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core
             if local:
                 shutil.copyfile(local, output_dir / "sample_submission.csv")
                 available -= local.stat().st_size
-            else:
+            elif sample is not None:
                 available -= _export(conn, sample, columns, output_dir / "sample_submission.csv", deadline,
                                      order=order, descending=desc, check_order=True, id_column=id_col,
                                      progress=export_progress)
             train_cols = [c for c in train.columns if c in test.columns or c == target]
             test_cols = [c for c in test.columns if c != target and (c in train_cols or c == id_col)]
             pair_order = id_col if os.environ.get("TYRELL_PAIR_ARM") in ("automl", "qwen") else None
+            reconstructed = local is None and sample is None
+            test_order, test_desc = pair_order, False
+            if reconstructed:
+                test_order, test_desc, _ = _sample_order(test, text, optional=True)
+                if test_order == target:
+                    raise ValueError("Нельзя определять порядок submission по тестовому таргету.")
+                provenance = (f"по {_identifier(test_order)} {'DESC' if test_desc else 'ASC'}"
+                              if test_order else "порядок текущей выгрузки; официальный порядок не подтверждён")
+                log(f"Шаблон отсутствует. Заголовок из task.md, ID из test, {provenance}.")
+                if on_stats:
+                    on_stats(template_source="task_header_and_test_ids", template_order=test_order,
+                             template_official=False)
             available -= _export(conn, test, test_cols, output_dir / "test.csv", deadline,
-                                 order=pair_order, memory_budget=available, id_column=id_col, progress=export_progress)
+                                 order=test_order, descending=test_desc, check_order=bool(reconstructed and test_order),
+                                 memory_budget=available, id_column=id_col, progress=export_progress,
+                                 template_columns=columns if reconstructed else ())
             _export(conn, train, train_cols, output_dir / "train.csv", deadline,
                     order=pair_order if id_col in train_cols else None,
                     memory_budget=available, id_column=id_col, progress=export_progress)
