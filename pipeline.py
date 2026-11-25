@@ -45,7 +45,7 @@ def apply_feature_code(feature_code, X_train, X_test):
 
 
 def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="single", feature_code=None):
-    from training import METRICS, auto_train, compare_results, train_and_predict
+    from training import METRICS, auto_train, train_and_predict
 
     deadline = time.monotonic() + time_budget
     task_dir = Path(task_dir)
@@ -63,8 +63,8 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
             raise ValueError("Для стратифицированной валидации нужно хотя бы 2 строки на класс.")
     if not math.isfinite(time_budget) or time_budget <= 0:
         raise ValueError("time_budget должен быть положительным конечным числом.")
-    if recipe not in ("single", "auto"):
-        raise ValueError("recipe должен быть single или auto.")
+    if recipe not in ("single", "auto", "bag"):
+        raise ValueError("recipe должен быть single, auto или bag.")
 
     history_path = task_dir / ".tyrell_experiments.json"
     history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else []
@@ -148,9 +148,11 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
             max_seeds=max_seeds,
         )
     else:
-        result = train_and_predict(
-            X_train, y_train, X_test, task_type, metric, config=cfg | fixed, time_budget=time_budget,
-        )
+        train = train_and_predict
+        if recipe == "bag":
+            from training import train_budget_bag
+            train = train_budget_bag
+        result = train(X_train, y_train, X_test, task_type, metric, config=cfg | fixed, time_budget=time_budget)
     report = {
         "training_seconds": round(time.monotonic() - model_start, 3),
         "task_spec": task_spec, "recipe": recipe, "feature_code": feature_code,
@@ -264,27 +266,29 @@ def _record(task_dir, task_spec, data, history, result, report):
     complete = n_folds_done == n_folds
     better = previous is None
     comparison = None
+    is_bag = report["recipe"] == "bag"
+    same_folds = True
     if previous is not None:
         same_folds = previous.get("fold_signature") == fold_signature
         previous_membership = (previous.get("cv_audit") or {}).get("membership_signature")
-        if previous_membership and audit and audit["membership_signature"]:
-            same_folds &= previous_membership == audit["membership_signature"]
-        if same_folds:
+        membership = (audit or {}).get("membership_signature")
+        if previous_membership and (membership or is_bag):
+            same_folds &= previous_membership == membership
+        if same_folds and (complete or not is_bag):
             # Не берем «везучую» модель: новый результат должен быть лучше на большинстве
             # фолдов и с приростом больше шума, а не просто чуть выше в среднем
             comparison = compare_results(
                 {"fold_scores": previous["fold_scores"], "greater_is_better": previous["greater_is_better"]},
                 {"fold_scores": result["fold_scores"], "greater_is_better": result["greater_is_better"]},
             )
-        better = (complete and not previous["complete"]) or (same_folds and comparison["accept"])
-    diagnostic_only = bool(report.get("diagnostic_group"))
-    if diagnostic_only:
-        better = False
+        better = (complete and not previous["complete"]) or bool(comparison and comparison["accept"])
+    eligible = not report.get("diagnostic_group") and (not is_bag or (complete and same_folds))
+    better = better and eligible
     problems = _write_submission(task_dir, task_spec, data, result) if better else []
 
     # Предсказания завершенных экспериментов храним на диске: в конце их можно смешать
     preds_file = None
-    if complete and "fold_ids" in result and not diagnostic_only:
+    if complete and "fold_ids" in result and eligible:
         preds_dir = task_dir / PREDS_DIR
         preds_dir.mkdir(exist_ok=True)
         preds_file = str(preds_dir / f"{len(history)}.npz")
@@ -511,3 +515,23 @@ def check_result(task_dir, task_spec=None):
             problems.append("invalid regression predictions")
     if problems:
         raise RuntimeError("Invalid submission: " + "; ".join(problems))
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) != 2 or sys.argv[1] not in ("experiment", "ensemble"):
+        raise SystemExit("Expected a pipeline operation: experiment or ensemble")
+
+    request = json.load(sys.stdin.buffer)
+    if sys.argv[1] == "experiment":
+        report = run_experiment(".", **request)
+        report["membership_signature"] = (report.get("cv_audit") or {}).get("membership_signature")
+        fields = ("score", "score_std", "members", "saved", "complete", "fold_scores", "fold_signature",
+                  "split", "greater_is_better", "fit_time", "config", "feature_candidates",
+                  "membership_signature", "te_keys", "vs_saved", "best_saved_score", "n_folds_done",
+                  "recipe", "metric")
+    else:
+        report = run_ensemble(".", request["task_spec"])
+        fields = ("score", "saved", "vs_saved", "members")
+    print(json.dumps({key: report.get(key) for key in fields}, ensure_ascii=False, default=str))

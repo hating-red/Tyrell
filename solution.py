@@ -34,7 +34,7 @@ from pipeline import check_result, write_fallback
 
 def training_seconds(limit=7200):
     limit = time_limit(limit)
-    return limit - min(300.0, limit * 0.05)
+    return limit - min(60.0, limit * 0.05)
 
 
 TOTAL_SECONDS = training_seconds(os.environ.get("TYRELL_TIME_LIMIT", 7200))
@@ -53,14 +53,13 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def run_python(code, task_dir, timeout, *, result_line=False):
+def run_pipeline_worker(operation, payload, task_dir, timeout, *, result_line=False):
     # Окружение наследуем, иначе часть библиотек не находит свои пакеты и HOME,
     # но ключи LLM в код агента не передаем
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("OPENAI_", "PG"))
            and k != "TYRELL_RUNTIME_STATS"}
     env |= {
         "PYTHONIOENCODING": "utf-8",
-        "PYTHONPATH": str(Path(__file__).resolve().parent),
         "OMP_NUM_THREADS": "8",
         "OPENBLAS_NUM_THREADS": "8",
     }
@@ -69,11 +68,16 @@ def run_python(code, task_dir, timeout, *, result_line=False):
     if HARD_DEADLINE[0] is not None:
         deadline = min(deadline, HARD_DEADLINE[0])
     try:
-        result = run_until(
-            [sys.executable, "-u", "-c", code], deadline,
-            cwd=task_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", env=env,
-        )
+        # The interpreter locates sibling modules from the script path; data stays in the task directory.
+        script = Path(__file__).resolve().with_name("pipeline.py")
+        with tempfile.TemporaryFile() as request:
+            request.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            request.seek(0)
+            result = run_until(
+                [sys.executable, "-B", "-u", str(script), operation], deadline,
+                cwd=task_dir, stdin=request, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace", env=env,
+            )
         return {
             "stdout": (result.stdout.rstrip().rsplit("\n", 1)[-1] if result_line else result.stdout[-12000:]),
             "stderr": result.stderr[-12000:],
@@ -104,19 +108,8 @@ def checkpoint_history(task_dir):
 
 def experiment(task_dir, spec, budget, recipe="single", config=None, feature_code=None, *, deadline=None):
     """Эксперимент в отдельном процессе: падение или утечка памяти не задевают агента."""
-    payload = json.dumps({"task_spec": spec, "config": config or {}, "time_budget": budget,
-                          "recipe": recipe, "feature_code": feature_code}, ensure_ascii=False)
-    code = (
-        "import json; from pipeline import run_experiment; "
-        f"args = json.loads({payload!r}); "
-        "r = run_experiment('.', **args); "
-        "r['membership_signature'] = (r.get('cv_audit') or {}).get('membership_signature'); "
-        "print(json.dumps({k: r.get(k) for k in ('score', 'score_std', 'members', 'saved', 'complete', "
-        "'fold_scores', 'fold_signature', 'split', 'greater_is_better', 'fit_time', 'config', "
-        "'feature_candidates', 'membership_signature', 'te_keys', 'vs_saved', 'best_saved_score', "
-        "'n_folds_done', 'recipe', 'metric')}, "
-        "ensure_ascii=False, default=str))"
-    )
+    payload = {"task_spec": spec, "config": config or {}, "time_budget": budget,
+               "recipe": recipe, "feature_code": feature_code}
     timeout = budget * 1.2 + min(90, TOTAL_SECONDS * 0.04)
     if HARD_DEADLINE[0] is not None:
         # Не дольше общего дедлайна: сабмит пишется атомарно, недоделанный шаг его не испортит
@@ -125,7 +118,7 @@ def experiment(task_dir, spec, budget, recipe="single", config=None, feature_cod
         timeout = min(timeout, deadline - time.monotonic())
     if budget < 1 or timeout < 1:
         return None, {"error": "Общее время работы истекло."}
-    result = run_python(code, task_dir, timeout=timeout, result_line=True)
+    result = run_pipeline_worker("experiment", payload, task_dir, timeout, result_line=True)
     checkpoint_history(task_dir)
     if result.get("exit_code") == 0:
         try:
@@ -135,19 +128,16 @@ def experiment(task_dir, spec, budget, recipe="single", config=None, feature_cod
     return None, result
 
 
-def ensemble(task_dir, spec):
+def ensemble(task_dir, spec, *, deadline=None):
     """Смесь лучших экспериментов в отдельном процессе; сабмит меняется только при приросте больше шума."""
-    payload = json.dumps(spec, ensure_ascii=False)
-    code = ("import json; from pipeline import run_ensemble; "
-            f"r = run_ensemble('.', json.loads({payload!r})); "
-            "print(json.dumps({k: r[k] for k in ('score', 'saved', 'vs_saved', 'members')}, "
-            "ensure_ascii=False, default=str))")
     timeout = ENSEMBLE_RESERVE
     if HARD_DEADLINE[0] is not None:
         timeout = min(timeout, HARD_DEADLINE[0] - time.monotonic())
-    if timeout < 30:
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+    if timeout < (2 if deadline is not None else 30):
         return
-    result = run_python(code, task_dir, timeout=timeout)
+    result = run_pipeline_worker("ensemble", {"task_spec": spec}, task_dir, timeout)
     checkpoint_history(task_dir)
     output = result.get("stdout", "").strip().splitlines()
     log(f"Ансамбль экспериментов: {output[-1] if result.get('exit_code') == 0 and output else str(result)[-1000:]}")
@@ -340,7 +330,7 @@ def resolve_spec(client, task, summary, guess, deadline, state=None, notify=lamb
 
 
 def choose_variant(task_dir, spec, baseline, deadline):
-    """Compare each feature change with the same complete single-model control."""
+    """Compare feature trials on fixed folds, then challenge the winning single model."""
     from training import compare_results
 
     if not baseline or not baseline.get("complete"):
@@ -352,12 +342,15 @@ def choose_variant(task_dir, spec, baseline, deadline):
     calendar = {"auto_features": True}
     variants = (feature_trials + [calendar] if spec["task_type"] == "binary"
                 else [calendar] + feature_trials)
-    variants.append({"params": {"num_leaves": 31, "min_child_samples": 10}}
-                    if temporal else {"target_encoding": True})
-    fit_seconds = max(1., float(baseline["fit_time"]))
-    desired = max(8., 2.5 * fit_seconds + 5.)
+    temporal_mae = temporal and spec["task_type"] == "regression" and spec.get("metric") == "mae"
+    temporal_ap = temporal and spec["task_type"] == "binary" and spec.get("metric") == "pr_auc"
+    if not temporal_mae:
+        variants.append({"params": {"num_leaves": 31, "min_child_samples": 10}}
+                        if temporal else {"target_encoding": True})
 
-    def check(config):
+    def check(config, control):
+        fit_seconds = max(1., float(control["fit_time"]))
+        desired = max(8., 2.5 * fit_seconds + 5.)
         left = deadline - time.monotonic()
         if left < max(3., 1.15 * fit_seconds):
             return None
@@ -365,22 +358,31 @@ def choose_variant(task_dir, spec, baseline, deadline):
         if report is None:
             log(f"Проверка {config} не завершилась: {str(raw)[-500:]}")
             return None
-        signature = baseline.get("membership_signature")
-        if (not report["complete"] or report["fold_signature"] != baseline["fold_signature"]
+        signature = control.get("membership_signature")
+        if (not report["complete"] or report["fold_signature"] != control["fold_signature"]
                 or (signature and signature != report.get("membership_signature"))):
             log(f"Проверка {config}: нет сопоставимой полной валидации")
             return None
-        result = compare_results(baseline, report)
-        log(f"Проверка {config}: {report['score']} против {baseline['score']}, принят: {result['accept']}")
-        return result if result["accept"] else None
+        comparison = compare_results(control, report)
+        log(f"Проверка {config}: {report['score']} против {control['score']}, принят: {comparison['accept']}")
+        return report if comparison["accept"] else None
 
-    accepted = [(config, result) for config in variants if (result := check(config))]
-    accepted.sort(key=lambda item: item[1]["diff_mean"], reverse=True)
+    accepted = [(config, report) for config in variants if (report := check(config, baseline))]
+    accepted.sort(key=lambda item: item[1]["score"], reverse=baseline["greater_is_better"])
+    winner, incumbent = accepted[0] if accepted else ({}, baseline)
     if len(accepted) >= 2:
-        both = accepted[0][0] | accepted[1][0]
-        if result := check(both):
-            accepted.append((both, result))
-    return max(accepted, key=lambda item: item[1]["diff_mean"])[0] if accepted else None
+        combined = winner | accepted[1][0]
+        if report := check(combined, incumbent):
+            winner, incumbent = combined, report
+
+    # Change one aspect of the best feature recipe and compare against that very model.
+    if temporal_mae or temporal_ap:
+        overrides = ({"min_child_samples": 100, "lambda_l2": 3.0} if temporal_mae
+                     else {"metric": "average_precision"})
+        candidate = winner | {"params": (winner.get("params") or {}) | overrides}
+        if check(candidate, incumbent):
+            return candidate
+    return winner or None
 
 
 def run_agent(task_path, *, deadline=None):
@@ -613,6 +615,67 @@ def research(task_dir, spec, task, summary, client, deadline, *, tool_state=None
         log(f"Финальный auto_train: {report['score'] if report else str(raw)[-500:]}")
         if report:
             ensemble(task_dir, spec)
+
+    # Preserve the agreed search budgets in paired AutoML/Qwen comparisons.
+    if not paired:
+        search_remaining_budget(task_dir, spec, deadline)
+
+
+def search_remaining_budget(task_dir, spec, deadline):
+    """Spend the remaining wall time on independent batches on the original folds."""
+    history = checkpoint_history(task_dir)
+    controls = [h for h in history if h["complete"] and h["recipe"] in ("single", "auto")
+                and not h.get("diagnostic_group") and not h.get("problems")]
+    accepted = [h for h in controls if h["saved"]]
+    if not accepted:
+        return
+    anchor = accepted[-1]
+    # Reuse the accepted features. Each backend owns its parameter distribution.
+    features = {k: anchor["config"][k] for k in ("cat_encoding", "categorical_ids", "entity_history")
+                if k in anchor["config"]}
+    features.update(auto_features=bool(anchor.get("auto_features")),
+                    target_encoding=anchor.get("target_encoding") or False, refit_full=True)
+
+    families = ["lightgbm", "xgboost", "catboost"]
+    # Keep the number of outer-fold comparisons small even on a fast, small dataset.
+    batch_window = max(12., (deadline - time.monotonic()) / 16)
+    measured = {h["config"].get("model", "lightgbm"): h["fit_time"] for h in controls if h["recipe"] == "single"}
+    typical = measured.get("lightgbm", 3.)
+    overhead, blend_seconds = 3., 8.
+    batches, pending = 0, 0
+    while families:
+        remaining = deadline - time.monotonic() - blend_seconds
+        if remaining < max(8., 2 * overhead + 3.):
+            break
+        model = families.pop(0)
+        started = time.monotonic()
+        window = max(batch_window, 2.5 * measured.get(model, typical) + overhead)
+        budget = min(window, remaining - overhead)
+        cfg = features | {"model": model, "seed": 10007 + batches * 100003}
+        report, error = experiment(task_dir, spec, budget=budget, config=cfg, recipe="bag",
+                                   feature_code=anchor.get("feature_code"), deadline=deadline - blend_seconds)
+        batches += 1
+        if not report or not report["complete"]:
+            reason = (error or {}).get("error") or (error or {}).get("stderr", "")[-300:]
+            log(f"Дополнительный поиск: {model}, нет полного результата. {reason}")
+            continue
+        overhead = max(3., time.monotonic() - started - report["fit_time"] + 2.)
+        families.append(model)
+        pending += 1
+        count = (report.get("members") or {}).get("count", 0)
+        log(f"Дополнительный поиск: {model}, полных моделей {count}, "
+            f"{spec['metric']}={report['score']:.6g}, сохранён={report.get('saved', False)}")
+        if pending >= 3:
+            started = time.monotonic()
+            ensemble(task_dir, spec, deadline=min(deadline, started + 2 * blend_seconds))
+            blend_seconds = min(ENSEMBLE_RESERVE, max(4., 1.5 * (time.monotonic() - started) + 2.))
+            pending = 0
+
+    if pending:
+        ensemble(task_dir, spec, deadline=deadline)
+    if batches:
+        log(f"Дополнительный поиск завершён: серий {batches}, до рабочего дедлайна "
+            f"{max(0., deadline - time.monotonic()):.1f} с.")
 
 
 def run_llm_loop(client, task, summary, spec, task_dir, deadline, *, tool_state=None, notify=lambda: None):

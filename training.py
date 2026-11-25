@@ -17,7 +17,6 @@ from typing import Any, Callable
 
 from data_tools import label_available_at as _label_available_at
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
@@ -525,7 +524,12 @@ def _lgb_params(task_type, metric, n_classes, cfg):
 
 
 def _fit_lightgbm(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg, deadline):
+    import lightgbm as lgb
+
     params = _lgb_params(task_type, metric, n_classes, cfg)
+    # A single-class monitor cannot rank positives against negatives.
+    if task_type == "binary" and params.get("metric") == "average_precision" and np.unique(yva).size < 2:
+        params["metric"] = "binary_logloss"
     dtrain = lgb.Dataset(Xtr, ytr, weight=wtr)
     dvalid = lgb.Dataset(Xva, yva, reference=dtrain)
     state = {"time_stopped": False, "best_iter": 0, "best": None}
@@ -1392,6 +1396,103 @@ def blend_results(results: list[dict], y: pd.Series, metric: str,
     return res
 
 
+# Each family keeps its own CPU hyperparameters. Draws are independent of CV scores.
+_BAG_PARAMS = {
+    "lightgbm": {"num_leaves": (15, 31, 63), "min_child_samples": (20, 50, 100),
+                 "lambda_l2": (1., 3., 8.), "feature_fraction": (.7, .85, 1.)},
+    "xgboost": {"max_depth": (3, 5, 7), "min_child_weight": (1., 4., 12.),
+                "lambda": (1., 3., 8.), "colsample_bytree": (.7, .85, 1.)},
+    "catboost": {"depth": (4, 6, 7), "l2_leaf_reg": (3., 6., 10.),
+                 "learning_rate": (.04, .06, .08)},
+}
+
+
+def train_budget_bag(X, y, X_test, task_type, metric, config, time_budget):
+    """Average every complete, compatible fit from one learner within a shared budget."""
+    start = time.monotonic()
+    if not np.isfinite(time_budget) or time_budget <= 0:
+        raise ValueError("Bagging time budget must be positive and finite")
+    deadline = start + time_budget
+    base = dict(config or {})
+    model = base.get("model", "lightgbm")
+    if model not in _BAG_PARAMS or _check_backend(model) != model:
+        raise ValueError(f"Requested bagging backend is unavailable: {model}")
+    batch_seed = int(base.get("seed", DEFAULT_CONFIG["seed"]))
+    if base.get("fold_seed") is None:
+        base["fold_seed"] = DEFAULT_CONFIG["seed"]
+    rng = np.random.default_rng(batch_seed)
+    # An affine permutation gives each member a distinct signed-32-bit-compatible seed.
+    modulus = 2**31 - 1
+    first_seed, stride = int(rng.integers(modulus)), int(rng.integers(1, modulus))
+    count = 0
+    first = None
+    longest = fit_total = 0.
+    reserve = min(5., .05 * time_budget)
+    while (budget := deadline - time.monotonic() - reserve) > 1.2 * longest:
+        member_seed = (first_seed + count * stride) % modulus
+        params = {name: rng.choice(values).item() for name, values in _BAG_PARAMS[model].items()}
+        params.update(base.get("params") or {})
+        member_config = base | {"model": model, "seed": member_seed, "params": params}
+        before = time.monotonic()
+        try:
+            result = train_and_predict(X, y, X_test, task_type, metric, member_config, time_budget=budget)
+        except (RuntimeError, TimeoutError, ValueError) as exc:
+            if first is None:
+                raise
+            logger.warning("Bagging stopped after %d complete members: %s", count, type(exc).__name__)
+            break
+        cfg = result["config"]
+        if cfg["n_folds_done"] != cfg["n_folds"] or not np.isfinite(result["score"]):
+            break
+        ids = np.asarray(result["fold_ids"])
+        order = result["class_order"]
+        test_key = "predictions" if cfg["task_type"] == "regression" else "probabilities"
+        dimensions = () if test_key == "predictions" else (len(order),)
+        oof = np.asarray(result["oof"], dtype=float)
+        test = np.asarray(result[test_key], dtype=float)
+        available = result.get("meta_known_from")
+        if (ids.shape != (len(y),) or cfg["n_folds"] < 1 or np.unique(ids[ids >= 0]).size != cfg["n_folds"]
+                or (available is not None and np.shape(available) != ids.shape)
+                or oof.shape != (len(y),) + dimensions or test.shape != (len(X_test),) + dimensions
+                or not np.isfinite(oof[ids >= 0]).all() or not np.isfinite(test).all()):
+            raise ValueError("Invalid predictions or validation rows in a bag member")
+        if first is None:
+            first = result
+            mean_oof, mean_test = oof.copy(), test.copy()
+        else:
+            same_windows = ("task_type", "metric", "n_folds", "fold_seed", "split", "fold_windows", "early_stopping_windows",
+                            "label_delay_unit", "prediction_cutoff", "observed_before_prediction")
+            if (not np.array_equal(order, first["class_order"]) or not np.array_equal(ids, first["fold_ids"])
+                    or not np.array_equal(result.get("meta_known_from"), first.get("meta_known_from"))
+                    or any(cfg.get(key) != first["config"].get(key) for key in same_windows)):
+                raise ValueError("Incompatible folds, class order or label availability in bag members")
+            mean_oof += (oof - mean_oof) / (count + 1)
+            mean_test += (test - mean_test) / (count + 1)
+        count += 1
+        last_seed = member_seed
+        member_time = time.monotonic() - before
+        fit_total += result["fit_time"]
+        longest = max(longest, member_time)
+        reserve = max(reserve, 2. * result.get("postprocess_time", 0.))
+
+    if first is None:
+        raise TimeoutError("No complete model fit within the bagging budget")
+    if count == 1:
+        bag = dict(first)
+    else:
+        averaged = first | {"oof": mean_oof, test_key: mean_test}
+        data = _prepare_blend([averaged], y, metric)
+        bag = _finish_blend(data, data.oofs[0], data.tests[0],
+                            {"model": model, "blend_type": "equal_bag"}, start, fit_total)
+        bag["config"]["seed"] = batch_seed
+        bag["feature_candidates"] = first.get("feature_candidates")
+        bag["model_inputs"] = first.get("model_inputs")
+    bag["members"] = {"model": model, "count": count, "batch_seed": batch_seed,
+                      "first_seed": first_seed, "last_seed": last_seed}
+    bag["fit_time"] = time.monotonic() - start
+    return bag
+
+
 def _blend_objective(data: _BlendData) -> Metric:
     # Метрика по меткам кусочно-постоянна, для весов бленда берем гладкий logloss
     if data.task_type in CLASSIFICATION and not data.metric.needs_proba:
@@ -1776,9 +1877,11 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
             logger.info("auto_train: CatBoost пропущен, осталось %.0f%% бюджета",
                         100 * max(remaining(), 0) / time_budget)
 
-    if best is None:
-        greater = next(iter(members.values()))["greater_is_better"]
-        best = dict(max(members.values(), key=lambda r: r["score"] if greater else -r["score"]))
+    # A blend may predate a stronger completed member if the final mix timed out or failed.
+    greater = next(iter(members.values()))["greater_is_better"]
+    best_single = max(members.values(), key=lambda r: r["score"] if greater else -r["score"])
+    if best is None or _is_better(best_single["score"], best["score"], greater):
+        best = dict(best_single)
     best["members"] = {k: {"score": r["score"], "score_std": r["score_std"], "fit_time": r["fit_time"],
                            "model": r["config"]["model"], "params": r["config"].get("params"),
                            "seed": r["config"].get("seed"),

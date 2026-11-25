@@ -1,5 +1,8 @@
 """Wall-clock supervision shared by the official CLI and the local diagnostics."""
+from contextlib import ExitStack
 import math
+import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -56,9 +59,49 @@ def run_until(command, deadline, **popen_options):
         return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
+def _bundled_openmp():
+    """Locate a working wheel runtime if the Linux loader lacks the system name."""
+    import ctypes
+    try:
+        ctypes.CDLL("libgomp.so.1")
+        return None
+    except OSError:
+        pass
+
+    from importlib import metadata
+    for package in ("scikit-learn", "xgboost"):
+        try:
+            dist = metadata.distribution(package)
+        except metadata.PackageNotFoundError:
+            continue
+        for entry in dist.files or ():
+            if not entry.match(package.replace("-", "_") + ".libs/libgomp-*.so.1*"):
+                continue
+            runtime = Path(dist.locate_file(entry)).resolve()
+            try:
+                ctypes.CDLL(str(runtime))
+            except OSError:
+                continue
+            return runtime
+    return None
+
+
 def supervised_exit(command, deadline, **popen_options):
     try:
-        return run_until(command, deadline, **popen_options).returncode
+        with ExitStack() as resources:
+            if sys.platform == "linux" and (runtime := _bundled_openmp()):
+                from tempfile import TemporaryDirectory
+
+                # The dynamic loader reads LD_LIBRARY_PATH at process startup. Keep
+                # the alias alive for this worker and all of its model subprocesses.
+                directory = resources.enter_context(TemporaryDirectory(prefix="tyrell-openmp-"))
+                (Path(directory) / "libgomp.so.1").symlink_to(runtime)
+                env = popen_options.get("env")
+                child_env = dict(os.environ if env is None else env)
+                previous = child_env.get("LD_LIBRARY_PATH")
+                child_env["LD_LIBRARY_PATH"] = directory + (os.pathsep + previous if previous else "")
+                popen_options["env"] = child_env
+            return run_until(command, deadline, **popen_options).returncode
     except subprocess.TimeoutExpired:
         print("Wall-clock deadline reached; stopped the worker and its descendants.",
               file=sys.stderr, flush=True)
