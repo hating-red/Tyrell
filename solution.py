@@ -421,6 +421,7 @@ def _run_agent(task_path, deadline, stats=None):
     from postgres_loader import PG_ENV, PG_CONNECTION_ENV, prepare_postgres
 
     # Keep the runner's task directory when task.md is a symlink.
+    # A runner can link task.md into its working directory alongside the template.
     task_path = Path(task_path).absolute()
     task = task_path.read_text(encoding="utf-8-sig")
     HARD_DEADLINE[0] = deadline
