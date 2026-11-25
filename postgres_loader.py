@@ -609,7 +609,9 @@ def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core
                 on_stats(phase="joins", joins=joins)
             try:
                 if deadline is None or deadline > join_start:
-                    enrich_postgres(conn, tables, train, test, id_col, target, text, output_dir, deadline, join_log,
+                    # Optional references must leave most of the remaining time for training.
+                    join_deadline = None if deadline is None else join_start + (deadline - join_start) * 0.25
+                    enrich_postgres(conn, tables, train, test, id_col, target, text, output_dir, join_deadline, join_log,
                                     on_audit=audit_join if on_stats else None)
                 else:
                     join_log("Достигнут лимит времени JOIN")

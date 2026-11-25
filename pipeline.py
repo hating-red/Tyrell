@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from data_tools import detect_split, label_available_at, load_data, parse_event_datetime
+from publication import MODEL_SUCCESS, TRAINED_FALLBACK
 from submission import make_submission, validate_submission
 
 PREDS_DIR = ".tyrell_preds"       # OOF и предсказания test завершенных экспериментов для ансамбля
@@ -90,6 +91,9 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
                 frame[column] = parse_event_datetime(frame[column])
     if feature_code:
         X_train, X_test = apply_feature_code(feature_code, X_train, X_test)
+    if task_type == "binary":
+        from features import add_ad_audience_features
+        X_train, X_test = add_ad_audience_features(X_train), add_ad_audience_features(X_test)
     y_train = data["y_train"].reset_index(drop=True)
     auto_features = bool(cfg.pop("auto_features", False))
     if auto_features:
@@ -371,6 +375,7 @@ def _write_submission(task_dir, task_spec, data, result):
     return make_submission(
         predictions, data["test_ids"], data["sample_path"], _output_path(task_dir),
         allowed_labels=labels, probabilities=probabilities, class_order=result["class_order"],
+        publication_state=MODEL_SUCCESS, score=float(result["score"]),
     )
 
 
@@ -434,16 +439,13 @@ def run_ensemble(task_dir, task_spec, max_members=8):
 
 
 def write_fallback(task_dir, task_spec):
-    """Простой ответ без модели: среднее таргета или самый частый класс. Только если файла еще нет."""
+    """Всегда публикует прогноз текущего запуска по доступным обучающим меткам."""
     task_dir = Path(task_dir)
-    if _output_path(task_dir).exists():
-        try:
-            check_result(task_dir, task_spec)
-            return []
-        except (RuntimeError, ValueError, pd.errors.ParserError):
-            pass
     data = load_data(task_dir, task_spec)
     y = data["y_train"].dropna()
+    if task_spec["task_type"] == "regression":
+        y = pd.to_numeric(y, errors="coerce")
+        y = y[np.isfinite(y)]
     if task_spec.get("label_delay_unit"):
         split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"))
         if not split or split["type"] != "time":
@@ -453,12 +455,14 @@ def write_fallback(task_dir, task_spec):
         test_time = parse_event_datetime(data["X_test"][col])
         available = label_available_at(train_time, y, task_spec["label_delay_unit"])
         y = y[available < test_time.min()] if test_time.notna().all() else y.iloc[:0]
+    if y.empty:
+        raise ValueError("No eligible training labels to calculate a fallback prediction")
     sample = pd.read_csv(data["sample_path"], nrows=0)
     n = len(data["test_ids"])
     if task_spec["task_type"] == "regression":
         value = float(y.median() if task_spec["metric"] == "mae" else y.mean())
-        if task_spec.get("label_delay_unit") and y.empty:
-            value = 0.0
+        if not np.isfinite(value):
+            raise ValueError("Non-finite training statistic for the fallback prediction")
         predictions = np.full(n, max(0., value) if _nonnegative(task_spec) else value)
         probabilities, class_order, labels = False, None, None
     else:
@@ -485,6 +489,7 @@ def write_fallback(task_dir, task_spec):
     return make_submission(
         predictions, data["test_ids"], data["sample_path"], _output_path(task_dir),
         allowed_labels=labels, probabilities=probabilities, class_order=class_order,
+        publication_state=TRAINED_FALLBACK,
     )
 
 

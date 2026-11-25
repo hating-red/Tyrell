@@ -431,6 +431,7 @@ def guess_task_spec(task_dir, task_text=""):
 # relationship through foreign keys. Hourly sources additionally need an interval clock.
 _DIMENSION_KEYS = {"ads": "ad_id", "campaigns": "campaign_id",
                    "users": "user_id", "districts": "district_id"}
+_AD_TARGETING_FIELDS = {"target_gender", "target_age_group", "target_interests"}
 _HOURLY_TABLES = {"weather", "traffic", "air_quality", "power_grid", "public_transport"}
 _START_NAMES = {"hour_start", "hour_start_time", "hour_start_ts", "hour_start_at", "interval_start",
                 "interval_start_time", "period_start", "bucket_start"}
@@ -439,6 +440,7 @@ _END_NAMES = {"hour_end", "hour_end_time", "hour_end_ts", "hour_end_at", "interv
 _EVENT_CHUNK_ROWS = 20_000
 _AUX_ROW_LIMIT = 1_000_000
 _AUX_MEMORY_LIMIT = 192 * 1024**2
+_HOURLY_MEMORY_LIMIT = 512 * 1024**2
 
 
 _GENERIC_HOUR_COLUMNS = {"timestamp", "datetime", "hour", "hour_ts", "hour_timestamp", "ts", "hourly_timestamp"}
@@ -516,8 +518,17 @@ def _dictionary_clocks(conn, tables, train, test, deadline, log):
     return descriptions
 
 
+def _public_ad_task(task_text):
+    return re.search(r"\bhack_final_task1\b", task_text, re.I) is not None
+
+
 def _hour_clock(table, task_text, descriptions=None):
-    """Resolve timestamp semantics only from field names or scoped descriptions."""
+    """Resolve how each source timestamps its hourly measurements."""
+    # The organizers confirmed the clock convention for the five public sources.
+    if table.name.lower() in _HOURLY_TABLES and re.search(r"\bhack_final_task2\b", task_text, re.I):
+        timestamp = next((c for c in table.columns if c.lower() == "timestamp"), None)
+        if timestamp is not None:
+            return timestamp, "start"
     clocks = {}
     for column in table.columns:
         name = column.lower()
@@ -739,11 +750,13 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
     blocked = {x.lower() for x in train_only} | {identifier.lower(), "label", "target", "outcome",
                                                  "prediction", "predicted", "submission"}
     unsupported_types = {"bytea", "json", "jsonb", "array", "user-defined"}
+    ad_targeting = _AD_TARGETING_FIELDS if name == "ads" and _public_ad_task(task_text) else ()
     values = []
     for c in table.columns:
         low = c.lower()
         if (c == right or c == hour_col or c == publication or low in _START_NAMES | _END_NAMES or
-                any(re.search(rf"(?:^|_){re.escape(term)}(?:_|$)", low) for term in blocked)
+                low in blocked or (low not in ad_targeting and
+                 any(re.search(rf"(?:^|_){re.escape(term)}(?:_|$)", low) for term in blocked))
                 or table.column_types.get(c, "").lower() in unsupported_types):
             continue
         values.append(c)
@@ -788,7 +801,7 @@ def _asof_clock(series):
     return times, bool(zoned.all())
 
 
-def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication=None):
+def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication=None, *, coalesce=False):
     """Validate keys after normalisation, before any train/test rows are touched."""
     keys = ["__entity", "__available"] if hour_col else ["__entity"]
     lookup = auxiliary[values].add_prefix(prefix).copy()
@@ -802,6 +815,13 @@ def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publicatio
         if stamps.isna().any() or (stamps != stamps.dt.floor("h")).any():
             raise ValueError("не определена часовая граница интервала")
         lookup["__available"] = stamps + (pd.Timedelta(hours=1) if mode == "start" else pd.Timedelta(0))
+        if coalesce and not publication:
+            lookup = lookup.drop_duplicates()
+            repeated = lookup.duplicated(keys, keep=False)
+            if repeated.any():
+                # Conflicting copies do not establish any measurement for that hour.
+                lookup.loc[repeated, [prefix + c for c in values]] = None
+                lookup = lookup.drop_duplicates(keys)
     if lookup.duplicated(keys).any():
         raise ValueError("неуникальный ключ справочника")
     if hour_col:
@@ -866,13 +886,14 @@ def _join_chunk(events, lookup, left, event_col, audit=None):
     return pd.concat([events, aligned], axis=1)
 
 
-def _read_lookup(conn, table, cols, deadline):
+def _read_lookup(conn, table, cols, deadline, *, hourly=False):
     import time
     from postgres_loader import _fetch_size, _identifier, _relation, _remaining, _set_timeout
 
     # A server-side cursor prevents a large dimension from being buffered by libpq.
     fields = ", ".join(map(_identifier, cols))
     query = f"SELECT {fields} FROM {_relation(table)} LIMIT {_AUX_ROW_LIMIT + 1}"
+    memory_limit = _HOURLY_MEMORY_LIMIT if hourly else _AUX_MEMORY_LIMIT
     _set_timeout(conn, deadline)
     chunks, n_rows, n_bytes = [], 0, 0
     with conn.cursor(name="tyrell_auxiliary") as cursor:
@@ -892,7 +913,7 @@ def _read_lookup(conn, table, cols, deadline):
             chunk = pd.DataFrame(rows, columns=cols, dtype=object)
             n_rows += len(chunk)
             n_bytes += int(chunk.memory_usage(deep=True).sum())
-            if n_rows > _AUX_ROW_LIMIT or n_bytes > _AUX_MEMORY_LIMIT:
+            if n_rows > _AUX_ROW_LIMIT or n_bytes > memory_limit:
                 raise ValueError("превышен бюджет памяти справочника")
             batch = min(_fetch_size(n_rows, n_bytes), _AUX_ROW_LIMIT + 1 - n_rows)
             chunks.append(chunk)
@@ -960,21 +981,32 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                     raise ValueError("не подтверждена доступность статических признаков до события")
             cols = [right] + ([hour_col] if hour_col else []) + ([publication] if publication else []) + values
             with conn.transaction():
-                auxiliary = _read_lookup(conn, table, cols, deadline)
+                auxiliary = _read_lookup(conn, table, cols, deadline, hourly=bool(hour_col))
             if on_audit is not None:
                 detail["lookup_rows"] = len(auxiliary)
                 detail["distinct_lookup_keys"] = int(auxiliary[right].astype("string").nunique())
             if not hour_col and auxiliary[right].astype("string").duplicated().any():
-                evidence = _pre_event_fields(table, values, task_text)
-                detail["static_evidence"] = evidence
-                # Audit conflicts without using unaudited payloads as features.
-                eligible = list(evidence)
-                auxiliary, detail["duplicate_resolution"] = _collapse_static_rows(auxiliary, right, eligible or values)
-                if not eligible or auxiliary.empty:
-                    raise ValueError("неуникальный ключ справочника без безопасных статических значений")
-                values = eligible
+                if table.name.lower() == "users" and _public_ad_task(task_text):
+                    # The task allows profile joins when the user has one unambiguous profile.
+                    keys = auxiliary[right].astype("string")
+                    usable = keys.notna() & keys.str.strip().ne("") & ~keys.duplicated(keep=False)
+                    auxiliary = auxiliary.loc[usable]
+                    detail["duplicate_resolution"] = {"excluded_rows": int((~usable).sum()),
+                                                      "retained_keys": int(usable.sum())}
+                    if auxiliary.empty:
+                        raise ValueError("У справочника нет однозначных ключей")
+                else:
+                    evidence = _pre_event_fields(table, values, task_text)
+                    detail["static_evidence"] = evidence
+                    # Audit conflicts without using unaudited payloads as features.
+                    eligible = list(evidence)
+                    auxiliary, detail["duplicate_resolution"] = _collapse_static_rows(
+                        auxiliary, right, eligible or values)
+                    if not eligible or auxiliary.empty:
+                        raise ValueError("неуникальный ключ справочника без безопасных статических значений")
+                    values = eligible
             payload = [prefix + c for c in values]
-            lookup = _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication)
+            lookup = _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication, coalesce=True)
             del auxiliary
             splits = {}
             with tempfile.TemporaryDirectory(dir=output_dir) as staging:

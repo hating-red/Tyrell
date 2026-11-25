@@ -128,6 +128,26 @@ def add_auto_features(X_train, X_test, numeric_priority=None, *, row_local=False
     return result.iloc[:n].reset_index(drop=True), result.iloc[n:].reset_index(drop=True)
 
 
+def add_ad_audience_features(frame):
+    """Compare declared ad targeting with the event user's unambiguous profile."""
+    features = {}
+    for name, wanted, actual in (("ads__matches_gender", "ads__target_gender", "users__user_gender"),
+                                 ("ads__matches_age", "ads__target_age_group", "users__age_group")):
+        if wanted in frame and actual in frame:
+            target, observed = frame[wanted], frame[actual]
+            match = target.eq(observed) | target.eq("All")
+            features[name] = match.where(target.notna() & observed.notna()).astype(float)
+    interest_columns = ["ads__target_interests", "users__interests"]
+    if all(column in frame for column in interest_columns):
+        interests = frame[interest_columns].astype("string")
+        pairs = interests.dropna().drop_duplicates().itertuples(index=False, name=None)
+        overlaps = {(wanted, actual): len(set(wanted.split(", ")) & set(actual.split(", ")))
+                    for wanted, actual in pairs}
+        features["ads__interest_overlap"] = [overlaps.get(pair) for pair in interests.itertuples(index=False, name=None)]
+    added = {name: value for name, value in features.items() if name not in frame}
+    return frame.assign(**added) if added else frame
+
+
 def temporal_entity_candidates(frame, clock):
     """Select repeated identifiers in the initial model-fit prefix only."""
     history, numeric_ids = [], []
