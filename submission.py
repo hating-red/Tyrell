@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from publication import prepare_publication
+
 PROBA_TOLERANCE = 1e-6  # выход за [0, 1] меньше этого — ошибка округления, обрезаем молча
 ROW_SUM_TOLERANCE = 0.01  # сумма вероятностей в строке может отличаться от 1 не больше чем на столько
 
@@ -84,7 +86,7 @@ def _match_dtype(answers: pd.Series, sample_column: pd.Series) -> tuple[pd.Serie
 
 # ---------- Сборка и запись ----------
 
-def _write_atomic(table: pd.DataFrame, output_path: Path) -> None:
+def _write_atomic(table: pd.DataFrame, output_path: Path, state, score) -> None:
     """Пишет CSV во временный файл рядом и подменяет им старый одним действием (os.replace)."""
     with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=".submission-",
                                      suffix=".tmp", delete=False) as tmp:
@@ -95,6 +97,7 @@ def _write_atomic(table: pd.DataFrame, output_path: Path) -> None:
             # The grader can collect the finished CSV under a separate user.
             # A separate grader account may need to read the published predictions.
             tmp_path.chmod(0o644)
+        prepare_publication(tmp_path, state, score)
         os.replace(tmp_path, output_path)
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -110,7 +113,7 @@ def _find_id_column(columns: list[str], test_ids: pd.Series) -> str:
 
 def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, output_path: str | Path,
                     allowed_labels: set | None = None, probabilities: bool = False,
-                    class_order: list | None = None) -> list[str]:
+                    class_order: list | None = None, *, publication_state=None, score=None) -> list[str]:
     """Собирает submission.csv из предсказаний, проверяет и сохраняет.
 
     predictions:    ответы по строкам test.csv в том же порядке. Варианты:
@@ -191,6 +194,6 @@ def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, o
         print(f"[submission] НЕ записан: {'; '.join(problems)}", flush=True)
         return problems
 
-    _write_atomic(submission, Path(output_path))
+    _write_atomic(submission, Path(output_path), publication_state, score)
     print(f"[submission] записан {output_path}: {len(submission)} строк, столбцы {columns}", flush=True)
     return []

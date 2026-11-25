@@ -765,7 +765,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         raise ValueError("Validation split requires an existing input column and type time or group")
     times = _time_values(X[split["column"]]) if temporal else None
     if temporal:
-        labeled &= times.notna().to_numpy()
+        labeled = labeled & times.notna().to_numpy()
     if not labeled.all():
         logger.warning("Пропуски в таргете: %d строк исключены из обучения", int((~labeled).sum()))
     if labeled.sum() < 10:

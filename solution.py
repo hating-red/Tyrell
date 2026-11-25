@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+from publication import TEMPLATE_ONLY, publication_run, published_result
 from time_budget import pop_worker_deadline, run_until, shutdown_reserve, supervised_exit, time_limit, worker_command
 
 
@@ -18,7 +19,12 @@ if __name__ == "__main__":
         limit = time_limit(os.environ.get("TYRELL_TIME_LIMIT", 7200))
         # Leave a small allowance to reap a blocked worker and exit before the platform cap.
         CLI_DEADLINE = PROCESS_STARTED + limit - shutdown_reserve(limit)
-        raise SystemExit(supervised_exit(worker_command(__file__, CLI_DEADLINE, sys.argv[1:]), CLI_DEADLINE))
+        output = Path(sys.argv[1] if len(sys.argv) > 1 else "task.md").absolute().parent / "submission.csv"
+        with publication_run():
+            code = supervised_exit(worker_command(__file__, CLI_DEADLINE, sys.argv[1:]), CLI_DEADLINE)
+            receipt = published_result(output)
+            print(f"SUBMISSION_STATE={receipt['state'] if receipt else TEMPLATE_ONLY}", flush=True)
+            raise SystemExit(code if receipt or code else 1)
 
 from contextlib import ExitStack, contextmanager
 import logging
@@ -386,6 +392,13 @@ def choose_variant(task_dir, spec, baseline, deadline):
 
 
 def run_agent(task_path, *, deadline=None):
+    if CLI_DEADLINE is not None:
+        return _run_with_stats(task_path, deadline)
+    with publication_run():
+        return _run_with_stats(task_path, deadline)
+
+
+def _run_with_stats(task_path, deadline):
     limit = time_limit(os.environ.get("TYRELL_TIME_LIMIT", 7200))
     hard_deadline = deadline if deadline is not None else time.monotonic() + limit
     # Absolute across imports, PostgreSQL, every experiment and final CSV verification.
@@ -412,7 +425,9 @@ def run_agent(task_path, *, deadline=None):
     try:
         _run_agent(task_path, deadline, stats)
     except Exception as exc:
-        stats(phase="failed", failed_phase=state["phase"], error_type=type(exc).__name__)
+        receipt = published_result(Path(task_path).absolute().parent / "submission.csv")
+        stats(phase="failed", failed_phase=state["phase"], error_type=type(exc).__name__,
+              submission_state=receipt["state"] if receipt else TEMPLATE_ONLY)
         raise
     stats(phase="complete")
 
@@ -534,10 +549,15 @@ def _run_agent(task_path, deadline, stats=None):
             if stats:
                 stats(phase="validate_csv", research_seconds=round(time.monotonic() - research_start, 3))
         check_result(task_dir, spec)
-        history = checkpoint_history(task_dir)
-        saved = [h for h in history if h["saved"]]
-        result = f"{spec['metric']}={saved[-1]['score']:.6g}" if saved else "страховочный прогноз"
-        print(f"Готово: submission.csv проверен, {result}.", flush=True)
+        receipt = published_result(task_path.parent / "submission.csv")
+        if receipt is None:
+            raise RuntimeError(f"{TEMPLATE_ONLY}: this run has no verified train-derived submission")
+        checkpoint_history(task_dir)
+        if stats:
+            stats(submission_state=receipt["state"])
+        score = receipt["score"]
+        result = f"{spec['metric']}={score:.6g}" if score is not None else "страховочный прогноз"
+        print(f"Готово: submission.csv проверен, {result}. {receipt['state']}", flush=True)
 
 
 def research(task_dir, spec, task, summary, client, deadline, *, tool_state=None, notify=lambda: None):
@@ -552,10 +572,30 @@ def research(task_dir, spec, task, summary, client, deadline, *, tool_state=None
     final_reserve = min(30., 0.06 * scale) if compact else FINAL_SHARE * scale
     common_deadline = deadline - final_reserve - search_seconds
     initial_share = 0.12 if compact else SAFETY_SHARE
-    safety, raw = experiment(task_dir, spec, budget=min(initial_share * scale, common_deadline - time.monotonic()),
-                             deadline=common_deadline)
-    if safety is None:
-        log(f"Быстрая модель не завершилась: {str(raw)[-2000:]}")
+    safety = None
+    backends = ("lightgbm", "xgboost", "catboost")
+    for index, backend in enumerate(backends):
+        now = time.monotonic()
+        # A stalled native library must leave time for a different backend in a fresh process.
+        remaining = deadline - final_reserve - now
+        attempt_deadline = now + remaining / (len(backends) - index)
+        if index == 0:
+            attempt_deadline = min(attempt_deadline, common_deadline)
+        budget = min(initial_share * scale, attempt_deadline - now)
+        if budget < 1:
+            continue
+        config = None if index == 0 else {"model": backend}
+        try:
+            report, raw = experiment(task_dir, spec, budget=budget, config=config, deadline=attempt_deadline)
+        except (OSError, ValueError, RuntimeError) as error:
+            report, raw = None, str(error)
+        if report and report.get("saved"):
+            if index == 0:
+                safety = report  # choose_variant compares LightGBM feature variants with this control.
+            else:
+                log(f"Резервная модель {backend} сохранила прогноз.")
+            break
+        log(f"Модель {backend} не сохранила прогноз: {str(raw)[-2000:]}")
 
     if not compact:
         budget = min(AUTO_SHARE * scale, common_deadline - time.monotonic())
