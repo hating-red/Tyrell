@@ -8,6 +8,7 @@
 !/features.py
 !/paired_research.py
 !/pipeline.py
+!/publication.py
 !/postgres_loader.py
 !/publication.py
 !/submission.py
