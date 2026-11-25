@@ -111,7 +111,7 @@ def _word(text, name):
 def _local_sample(task_path, task_text, *, reject_ambiguous=False):
     folder = task_path.parent.resolve()
     adjacent = folder / "sample_submission.csv"
-    if adjacent.resolve().is_relative_to(folder) and adjacent.is_file():
+    if adjacent.is_file():
         return adjacent
     candidates = set()
     for match in re.finditer(r"[\w./\\-]*sample_submission\.csv\b", task_text, re.I):

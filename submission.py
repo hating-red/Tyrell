@@ -91,6 +91,9 @@ def _write_atomic(table: pd.DataFrame, output_path: Path) -> None:
         tmp_path = Path(tmp.name)
     try:
         table.to_csv(tmp_path, index=False, encoding="utf-8")
+        if os.name == "posix":
+            # A separate grader account may need to read the published predictions.
+            tmp_path.chmod(0o644)
         os.replace(tmp_path, output_path)
     finally:
         tmp_path.unlink(missing_ok=True)

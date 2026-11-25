@@ -420,7 +420,8 @@ def run_agent(task_path, *, deadline=None):
 def _run_agent(task_path, deadline, stats=None):
     from postgres_loader import PG_ENV, PG_CONNECTION_ENV, prepare_postgres
 
-    task_path = Path(task_path).resolve()
+    # A runner can link task.md into its working directory alongside the template.
+    task_path = Path(task_path).absolute()
     task = task_path.read_text(encoding="utf-8-sig")
     HARD_DEADLINE[0] = deadline
     LLM_USAGE.update(calls=0, prompt=0, completion=0)
