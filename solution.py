@@ -1,475 +1,622 @@
+"""Competition entry point: python3 solution.py task.md."""
+import time
+PROCESS_STARTED = time.monotonic()
+
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
-import time
+import tempfile
+import threading
+import traceback
+from collections import deque
+from itertools import product
 
-from openai import OpenAI
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
-from data_tools import guess_task_spec, inspect_data
-from pipeline import check_result
-
-# Лимит платформы с запасом на завершение; TYRELL_TIME_LIMIT - только для локальных прогонов
-# Запас 10 минут: платформа считает длительность вместе с запуском контейнера и данными
-TOTAL_SECONDS = float(os.environ.get("TYRELL_TIME_LIMIT", 3 * 60 * 60)) - 600
-HARD_DEADLINE = [None]                # общий дедлайн: ни один эксперимент его не переживет
-SAFETY_SHARE = 0.06                   # быстрый страховочный ответ
-AUTO_SHARE = 0.25                     # базовый auto_train до LLM
-FINAL_SHARE = 0.2                     # остаток на финальный auto_train с лучшими признаками
-LLM_ATTEMPTS = 4                      # попыток на один запрос к LLM
-# Лимит запросов к LLM за прогон; TYRELL_MAX_LLM_CALLS - чтобы локальные тесты не съели дневной бюджет
-MAX_LLM_CALLS = int(os.environ.get("TYRELL_MAX_LLM_CALLS", 150))
-LLM_USAGE = {"calls": 0, "prompt": 0, "completion": 0}
-KEEP_TOOL_MESSAGES = 3                # столько последних ответов инструментов отдаем LLM целиком
-TOOL_MESSAGE_LIMIT = 600              # до скольких символов обрезаем старые ответы
-TOOL_RESULT_LIMIT = 4000              # потолок одного ответа инструмента: история растет на каждом шаге
-MAX_NUDGES = 3                        # сколько раз просим LLM продолжать, если время осталось
-FINAL_MAX_SEEDS = 8                   # сидов на тип модели в финальном auto_train
-ENSEMBLE_RESERVE = 300                # секунд на смесь экспериментов в конце
-
-INSTRUCTION = """Ты — агент для решения задач машинного обучения на табличных данных.
-Тебе даны условие, сводка CSV и уже определённый task_spec (target, id, тип задачи, метрика).
-task_spec менять нельзя, он передаётся в эксперименты автоматически.
-
-Базовое решение уже обучено и сохранено: auto_train (LightGBM и XGBoost с несколькими
-сидами и взвешенным блендом, для метрик по меткам ещё подбор весов классов). Одной моделью
-уже проверены автопризнаки (config auto_features: частоты категорий, число пропусков,
-части дат, средние и отклонения важных числовых признаков по категориям) и кодирование
-по таргету (config target_encoding: среднее таргета по сущности, которая повторяется в
-train и test, например зданию или клиенту; считается внутри фолдов без утечки); выигравший вариант обучен
-полным рецептом. Смотри в «Уже сделано», какой вариант сохранён, и строй гипотезы поверх него.
-Твоя задача — улучшить результат валидации гипотезами. Самые полезные гипотезы:
-1. Новые признаки через feature_code: строка Python с функцией make_features(df) -> df.
-   df — признаки train и test одной таблицей, без target и id; верни df с теми же строками
-   (можно добавлять и удалять колонки). Доступны pd и np. Ищи то, чего нет в автопризнаках:
-   отношения и разности числовых признаков, взаимодействия категорий, признаки по смыслу
-   полей из условия. Автопризнаки добавляются поверх feature_code, если auto_features true.
-2. Параметры модели через config: model (lightgbm, xgboost, catboost), params,
-   num_boost_round, early_stopping_rounds, class_weight, log_target, cat_encoding
-   (native или frequency), features (список колонок), auto_features (true или false),
-   target_encoding (true — ключи найти автоматически, или список исходных колонок; элемент
-   списка может быть списком колонок — тогда кодируется их сочетание).
-3. recipe: "single" — одна модель (быстро, для проверки гипотезы), "auto" — полный рецепт
-   с блендом (медленнее, сильнее). Удачные признаки проверяй потом с recipe "auto".
-
-Валидация — 5 фолдов, одинаковых во всех экспериментах; если test похож на новый период,
-фолды строятся группами по этой колонке. Результат сохраняется в submission.csv, только
-если он лучше сохранённого на большинстве фолдов и прирост больше шума (поле vs_saved).
-Инструмент возвращает score, fold_scores, saved, vs_saved и best_saved_score.
-Сравнивай гипотезы по score с одинаковым recipe; разница меньше разброса fold_scores — шум.
-В конце решение само запустит расширенный auto_train на лучших найденных признаках.
-
-run_python запускает отдельный процесс для анализа данных; файлы сохраняются, переменные нет.
-Относительные пути — от папки задачи. Не устанавливай пакеты, не ходи в интернет,
-не читай ключи и .env. Доступно 8 CPU и 32 ГБ памяти.
-Работай, пока есть время: после каждого результата предлагай следующую гипотезу.
-"""
-
-TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "run_python",
-        "description": "Выполнить Python-код и вернуть вывод, ошибки и код завершения.",
-        "parameters": {
-            "type": "object",
-            "properties": {"code": {"type": "string"}},
-            "required": ["code"],
-            "additionalProperties": False,
-        },
-    },
-}, {
-    "type": "function",
-    "function": {
-        "name": "run_experiment",
-        "description": "Обучить модель на текущем task_spec, оценить на фолдах и сохранить submission при улучшении.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "config": {"type": "object"},
-                "recipe": {"type": "string", "enum": ["single", "auto"]},
-                "feature_code": {"type": "string"},
-                "time_budget": {"type": "number", "minimum": 30, "maximum": 2400},
-            },
-            "required": ["config", "recipe", "time_budget"],
-            "additionalProperties": False,
-        },
-    },
-}]
+from publication import publication_run, published_result, receipt_directory
+from time_budget import pop_worker_deadline, run_until, shutdown_reserve, supervised_exit, time_limit, worker_command
 
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def run_python(code, task_dir, timeout):
-    # Окружение наследуем, иначе часть библиотек не находит свои пакеты и HOME,
-    # но ключи LLM в код агента не передаем
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("OPENAI_")}
-    env |= {
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONPATH": str(Path(__file__).resolve().parent),
-        "OMP_NUM_THREADS": "8",
-        "OPENBLAS_NUM_THREADS": "8",
-    }
-    env.setdefault("HOME", str(task_dir))
+def log_phase(name, started, *, budget=None, reason, **details):
+    payload = {"phase": name, "seconds": round(time.monotonic() - started, 3), "budget_seconds": budget,
+               "reason": reason, **details}
+    log("PHASE " + json.dumps(payload, ensure_ascii=False))
+
+
+def trial_fits(estimate, deadline):
+    remaining = deadline - time.monotonic()
+    overhead = min(30., max(2., remaining * .05))
+    return 1.3 * estimate + overhead <= remaining
+
+
+def run_trial(directory, spec, deadline, budget, config=None, recipe="single", *, estimate=None):
+    """Train in an isolated process. Keep the last complete CSV if a later trial fails."""
+    started = time.monotonic()
+    remaining = deadline - started
+    overhead = min(30., max(2., remaining * .05))
+    if not trial_fits(budget if estimate is None else estimate, deadline):
+        return None
+    budget = min(budget, (remaining - overhead) / 1.3)
+    if budget < 1:
+        return None
+    request = {"task_spec": spec, "config": config or {}, "recipe": recipe, "time_budget": budget}
+    from pipeline import output_directory
+    request.update(output_dir=output_directory.get(), receipt_dir=receipt_directory.get())
+    environment = {k: v for k, v in os.environ.items() if not k.upper().startswith("OPENAI_")}
+    script = Path(__file__).resolve().with_name("pipeline.py")
     try:
-        result = subprocess.run(
-            [sys.executable, "-u", "-c", code],
-            cwd=task_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, env=env,
-        )
-        return {
-            "stdout": result.stdout[-12000:],
-            "stderr": result.stderr[-12000:],
-            "exit_code": result.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {"error": "Превышено время выполнения кода."}
-
-
-def experiment(task_dir, spec, budget, recipe="single", config=None, feature_code=None):
-    """Эксперимент в отдельном процессе: падение или утечка памяти не задевают агента."""
-    payload = json.dumps({"task_spec": spec, "config": config or {}, "time_budget": budget,
-                          "recipe": recipe, "feature_code": feature_code}, ensure_ascii=False)
-    code = (
-        "import json; from pipeline import run_experiment; "
-        f"args = json.loads({payload!r}); "
-        "print(json.dumps(run_experiment('.', **args), ensure_ascii=False, default=str))"
-    )
-    timeout = budget * 1.2 + 180
-    if HARD_DEADLINE[0] is not None:
-        # Не дольше общего дедлайна: сабмит пишется атомарно, недоделанный шаг его не испортит
-        timeout = min(timeout, HARD_DEADLINE[0] - time.monotonic())
-    if timeout < 30:
-        return None, {"error": "Общее время работы истекло."}
-    result = run_python(code, task_dir, timeout=timeout)
-    if result.get("exit_code") == 0:
-        try:
-            return json.loads(result["stdout"].strip().splitlines()[-1]), result
-        except (ValueError, IndexError):
-            pass
-    return None, result
-
-
-def ensemble(task_dir, spec):
-    """Смесь лучших экспериментов в отдельном процессе; сабмит меняется только при приросте больше шума."""
-    payload = json.dumps(spec, ensure_ascii=False)
-    code = ("import json; from pipeline import run_ensemble; "
-            f"r = run_ensemble('.', json.loads({payload!r})); "
-            "print(json.dumps({k: r[k] for k in ('score', 'saved', 'vs_saved', 'members')}, "
-            "ensure_ascii=False, default=str))")
-    timeout = ENSEMBLE_RESERVE
-    if HARD_DEADLINE[0] is not None:
-        timeout = min(timeout, HARD_DEADLINE[0] - time.monotonic())
-    if timeout < 30:
-        return
-    result = run_python(code, task_dir, timeout=timeout)
-    output = result.get("stdout", "").strip().splitlines()
-    log(f"Ансамбль экспериментов: {output[-1] if result.get('exit_code') == 0 and output else str(result)[-1000:]}")
-
-
-def fallback(task_dir, spec):
-    """Константный ответ, если не обучилась даже быстрая модель."""
-    payload = json.dumps(spec, ensure_ascii=False)
-    code = ("import json; from pipeline import write_fallback; "
-            f"print(write_fallback('.', json.loads({payload!r})))")
-    log(f"Константный ответ: {run_python(code, task_dir, timeout=600)}")
-    if not (task_dir / "submission.csv").exists():
-        # Последний рубеж: дочерний процесс не смог даже это, пишем из основного
-        from pipeline import write_fallback
-        try:
-            log(f"Константный ответ из основного процесса: {write_fallback(task_dir, spec)}")
-        except Exception as error:
-            log(f"Не удалось записать даже константный ответ: {error}")
-
-
-def track_usage(response):
-    """Считаем токены: лимит LLM дневной, и по логу видно, сколько стоит прогон."""
-    # Поля читаем осторожно: сервер может вернуть usage в другом виде, запрос это не должно ломать
-    usage = getattr(response, "usage", None)
-    LLM_USAGE["calls"] += 1
-    LLM_USAGE["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
-    LLM_USAGE["completion"] += getattr(usage, "completion_tokens", 0) or 0
-    log(f"LLM: запросов {LLM_USAGE['calls']}, токенов на входе {LLM_USAGE['prompt']}, "
-        f"на выходе {LLM_USAGE['completion']}")
-
-
-def ask_llm(client, messages, deadline):
-    """Запрос с повторами. None, если LLM недоступна: агент продолжит без нее."""
-    for attempt in range(LLM_ATTEMPTS):
-        remaining = deadline - time.monotonic()
-        if remaining < 60 or LLM_USAGE["calls"] >= MAX_LLM_CALLS:
-            return None
-        try:
-            response = client.chat.completions.create(
-                model=os.environ["OPENAI_MODEL"], messages=trim_history(messages),
-                tools=TOOLS, parallel_tool_calls=False, timeout=min(180, remaining - 30),
-            )
-            track_usage(response)
-            return response
-        except Exception as error:  # сеть, лимиты, ошибки сервера: пробуем еще раз
-            log(f"LLM недоступна (попытка {attempt + 1}): {type(error).__name__}: {error}")
-            time.sleep(min(10 * 2 ** attempt, 90, max(0.0, (deadline - time.monotonic()) / 4)))
+        with tempfile.TemporaryFile() as stream:
+            stream.write(json.dumps(request, ensure_ascii=False).encode("utf-8"))
+            stream.seek(0)
+            proc = run_until([sys.executable, "-B", "-u", str(script)], min(deadline, started + budget + overhead),
+                             cwd=directory, env=environment, stdin=stream, stdout=subprocess.PIPE)
+        if proc.returncode == 0:
+            report = json.loads(proc.stdout.decode("utf-8").splitlines()[-1])
+            if "skipped" in report:
+                log(f"{recipe} {config or {}} skipped: {report['skipped']}")
+                return None
+            report["elapsed_seconds"] = time.monotonic() - started
+            log(f"{recipe} {config or {}}: {report['metric']}={report['score']:.6f}, "
+                f"folds={report['n_folds_done']}, saved={report['saved']}")
+            if report["metric"] == "pr_auc":
+                log(f"AP_TRIAL_FOLDS recipe={recipe} config={config or {}} "
+                    f"scores={report['fold_scores']} saved={report['saved']}")
+            return report
+    except Exception:
+        log_error()
     return None
 
 
-def clip_text(text, limit=TOOL_RESULT_LIMIT):
-    """Начало и конец длинного ответа: в выводе Python самое важное в конце, ошибки и результат."""
-    if len(text) <= limit:
-        return text
-    head = limit // 4
-    return text[:head] + " ...(обрезано)... " + text[-(limit - head):]
+_CV_TOOL = "run_cv_experiment"
+_CV_FLAGS = {"auto_features", "target_encoding", "entity_history", "ad_history", "log_target"}
 
 
-def trim_history(messages):
-    """Старые ответы инструментов и ассистента обрезаем, чтобы история не тратила лимит.
-
-    Целиком остается все, что после KEEP_TOOL_MESSAGES-го с конца ответа инструмента.
-    """
-    tool_positions = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    cutoff = tool_positions[-KEEP_TOOL_MESSAGES] if len(tool_positions) >= KEEP_TOOL_MESSAGES else 0
-    trimmed = []
-    for i, message in enumerate(messages):
-        content = message.get("content")
-        old = i < cutoff and message.get("role") in ("tool", "assistant")
-        if old and isinstance(content, str) and len(content) > TOOL_MESSAGE_LIMIT:
-            message = message | {"content": content[:TOOL_MESSAGE_LIMIT] + " ...(обрезано)"}
-        trimmed.append(message)
-    return trimmed
-
-
-def compact_summary(summary):
-    """Сводка для LLM без описаний колонок: они уже есть в task.md, а токены тратят дневной лимит."""
-    out = {k: v for k, v in summary.items() if k not in ("train", "test")}
-    out["columns_format"] = "name, dtype, missing, unique"
-    for part in ("train", "test"):
-        info = summary.get(part, {})
-        out[part] = {"rows": info.get("rows"), "columns": [
-            [c["name"], c["dtype"], c["missing"], c["unique"]] for c in info.get("columns", [])]}
-    return json.dumps(out, ensure_ascii=False)
+def parse_model_object(content):
+    """Read a JSON object following a thinking block or inside a fenced answer."""
+    content = re.split(r"</think\s*>", content, flags=re.IGNORECASE)[-1]
+    blocks = re.findall(r"\x60{3}(?:json)?\s*(.*?)\x60{3}", content, re.IGNORECASE | re.DOTALL)
+    decoder = json.JSONDecoder()
+    for text in [*blocks, content]:
+        for match in re.finditer(r"\{", text):
+            try:
+                result, _ = decoder.raw_decode(text[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(result, dict):
+                return result
+    raise ValueError("The model did not return a JSON object")
 
 
-def resolve_spec(client, task, summary, guess, deadline):
-    """Уверенной эвристике верим; иначе просим LLM уточнить task_spec и проверяем ответ."""
-    spec, confident = guess
-    if confident or client is None:
-        return spec
-    messages = [
-        {"role": "system", "content": "Определи task_spec задачи. Ответь только JSON с ключами "
-                                      "target_column, id_columns (список из одной колонки), task_type "
-                                      "(regression, binary, multiclass), metric, probabilities."},
-        {"role": "user", "content": task + "\n\nСводка данных:\n" + compact_summary(summary)
-                                    + "\n\nПредположение по данным:\n" + json.dumps(spec, ensure_ascii=False)},
-    ]
-    for attempt in range(LLM_ATTEMPTS):
-        if deadline - time.monotonic() < 120:
-            break
+class ResearchModel:
+    """Only structured task descriptions and validated model configurations cross this boundary."""
+    def __init__(self, mailbox=None):
+        self.remaining = {"spec": 2, "hypothesis": 8}
+        self.mailbox = mailbox
+        self.enabled = mailbox is not None or all(os.environ.get(k) for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"))
+        self.extra_supported = True
+        self.tools_supported = True
+        self.last_tool = None
+        self.last_reason = None
+
+    def ask(self, kind, prompt, payload, deadline):
+        self.last_tool = None
+        self.last_reason = None
+        if not self.enabled:
+            return None
+        if self.mailbox is not None:
+            if self.remaining[kind] <= 0:
+                return None
+            self.remaining[kind] -= 1
+            name = f"{kind}-{self.remaining[kind]}"
+            request = self.mailbox / (name + ".request")
+            reply = request.with_suffix(".reply")
+            staged = request.with_suffix(".tmp")
+            staged.write_text(json.dumps([kind, prompt, payload, deadline], default=str), encoding="utf-8")
+            staged.replace(request)
+            while time.monotonic() < deadline:
+                if reply.exists():
+                    result, self.enabled, self.last_tool, self.last_reason = json.loads(reply.read_text(encoding="utf-8"))
+                    return result
+                time.sleep(.1)
+            return None
         try:
-            response = client.chat.completions.create(
-                model=os.environ["OPENAI_MODEL"], messages=messages, timeout=120,
-            )
-            track_usage(response)
-            text = response.choices[0].message.content or ""
-            answer = json.loads(text[text.index("{"):text.rindex("}") + 1])
-            candidate = spec | {k: answer[k] for k in spec if k in answer}
-            if candidate["target_column"] in summary.get("possible_targets", []) + [spec["target_column"]] \
-                    and candidate["task_type"] in ("regression", "binary", "multiclass"):
-                return candidate
-        except Exception as error:
-            log(f"Не удалось уточнить task_spec (попытка {attempt + 1}): {error}")
-            time.sleep(5)
+            from openai import BadRequestError, OpenAI
+        except ImportError:
+            log_error()
+            self.enabled = False
+            return None
+        while self.remaining[kind] and deadline - time.monotonic() > 5:
+            self.remaining[kind] -= 1
+            extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}} if self.extra_supported else {}
+            using_tool = kind == "hypothesis" and self.tools_supported
+            if using_tool:
+                properties = {name: {"type": "boolean"} for name in sorted(_CV_FLAGS)}
+                properties["model"] = {"type": "string", "enum": ["lightgbm", "xgboost", "catboost"]}
+                extra.update(tools=[{"type": "function", "function": {
+                    "name": _CV_TOOL, "description": "Run one model configuration on the existing CV folds.",
+                    "parameters": {"type": "object", "properties": properties, "required": ["model"],
+                                   "additionalProperties": False},
+                }}], tool_choice={"type": "function", "function": {"name": _CV_TOOL}})
+            raw = ""
+            try:
+                with OpenAI(base_url=os.environ["OPENAI_BASE_URL"], api_key=os.environ["OPENAI_API_KEY"],
+                            timeout=min(90, deadline-time.monotonic()), max_retries=0) as client:
+                    log(f"LLM_REQUEST kind={kind} thinking_flag={self.extra_supported} tool_requested={using_tool}")
+                    response = client.chat.completions.create(
+                        model=os.environ["OPENAI_MODEL"], max_tokens=4096, **extra,
+                        messages=[{"role":"system","content":prompt+" Return only a JSON object."},
+                                  {"role":"user","content":json.dumps(payload,ensure_ascii=False,default=str)}])
+                choice = response.choices[0]
+                message = choice.message
+                finish = getattr(choice, "finish_reason", None)
+                calls = getattr(message, "tool_calls", None) or []
+                log(f"LLM_RESPONSE kind={kind} tool_calls={len(calls)} finish_reason={finish}")
+                raw = message.content or ""
+                self.last_reason = "invalid_tool_arguments" if calls else (
+                    "text_only" if raw else f"empty_content_{finish}")
+                if using_tool and len(calls) == 1 and calls[0].function.name == _CV_TOOL:
+                    raw = calls[0].function.arguments
+                    result = parse_model_object(raw)
+                    self.last_tool = _CV_TOOL
+                    return result
+                if calls:
+                    raise ValueError("Unexpected tool call")
+                return parse_model_object(raw)
+            except BadRequestError:
+                log(f"LLM_ERROR kind={kind} retry_without_thinking={self.extra_supported}")
+                log_error()
+                if self.extra_supported:
+                    self.extra_supported = False
+                    continue
+                if using_tool:
+                    self.tools_supported = False
+                    continue
+                self.enabled = False
+                self.last_reason = "request_rejected"
+                return None
+            except (ValueError, IndexError):
+                log(f"LLM_ERROR kind={kind} invalid_response=True")
+                log("LLM_RAW " + json.dumps(redact(str(raw))[:500], ensure_ascii=False))
+                log_error()
+                return None
+            except Exception:
+                log(f"LLM_ERROR kind={kind} unavailable=True")
+                log_error()
+                self.enabled = False
+                self.last_reason = "sdk_error"
+                return None
+        return None
+
+
+def serve_research_model(directory, stop):
+    model = ResearchModel()
+    while not stop.wait(.1):
+        for request in directory.glob("*.request"):
+            try:
+                args = json.loads(request.read_text(encoding="utf-8"))
+                result = model.ask(*args)
+                reply = request.with_suffix(".writing")
+                reply.write_text(json.dumps([result, model.enabled, model.last_tool, model.last_reason]), encoding="utf-8")
+                reply.replace(request.with_suffix(".reply"))
+                request.unlink()
+            except Exception:
+                log_error()
+                return
+
+
+def redact(detail):
+    for key in ("OPENAI_API_KEY", "PGPASSWORD"):
+        if os.environ.get(key):
+            detail = detail.replace(os.environ[key], "[redacted]")
+    return detail
+
+
+def log_error():
+    log(redact(traceback.format_exc()))
+
+
+def resolve_task(directory, text, model, deadline, early=None):
+    from data_tools import guess_task_spec, inspect_data, load_data, target_constraints, PROBA_METRICS
+    from training import METRICS
+    guess = None
+    try:
+        guess, certain = guess_task_spec(directory, text)
+        if early:
+            early(guess)
+        if certain or not model.enabled:
+            return guess
+    except ValueError:
+        log_error()
+    summary = inspect_data(directory)
+    evidence = {k: summary[k] for k in ("possible_targets", "possible_id_columns", "sample_columns")}
+    while model.enabled and model.remaining["spec"] and deadline - time.monotonic() > 5:
+        candidate = model.ask("spec", "Identify target_column, id_column, metric, task_type and probabilities "
+                              "from these materials. Use one of the listed metrics.",
+                              {"task":text[:9000],"schema":evidence,"metrics":list(METRICS)}, deadline)
+        if not candidate:
+            continue
+        target, key, metric = (candidate.get(k) for k in ("target_column","id_column","metric"))
+        kind = candidate.get("task_type")
+        if not all(isinstance(c,str) for c in (target,key,metric,kind)):
+            continue
+        if (target not in evidence["possible_targets"] or key not in evidence["possible_id_columns"]
+                or metric not in METRICS or kind not in METRICS[metric].task_types):
+            continue
+        spec = {"target_column":target,"id_columns":[key],"metric":metric,"task_type":kind,
+                "probabilities":metric in PROBA_METRICS or len(evidence["sample_columns"])>2}
+        data = load_data(directory, spec)
+        if kind == "regression" and spec["probabilities"]:
+            continue
+        if kind in ("binary", "multiclass") and (data["y_train"].nunique() > 2) != (kind == "multiclass"):
+            continue
+        return spec | target_constraints(text,target,data["y_train"],kind)
+    if guess:
+        return guess
+    raise ValueError("Could not identify a supported task from the schema and template")
+
+
+def hypothesis(model, task, spec, columns, trials, deadline):
+    config = model.ask("hypothesis", "Propose ONE new CV experiment. Output a compact object such as "
+                       '{"model":"xgboost","auto_features":true}. '
+                       "Choose model from lightgbm, catboost, xgboost. Optional boolean flags: auto_features, "
+                       "entity_history, ad_history, log_target. Use ad_history only if a completed trial used it. "
+                       "Use target_encoding only if a completed trial used it. "
+                       "Use an available backend. For MAE explore log_target with auto_features "
+                       "on a working backend if this combination has not completed. "
+                       "Use prior results and avoid any configuration already tried.",
+                       {"task":task[:6000],"spec":spec,"features":columns[:150],"trials":trials}, deadline)
+    flags = _CV_FLAGS
+    if (config and set(config) <= flags | {"model"} and config.get("model") in ("lightgbm","xgboost","catboost")
+            and all(type(config[k]) is bool for k in flags & config.keys())):
+        if not config.get("ad_history") or any(t.get("scores") and t["config"].get("ad_history") for t in trials):
+            return config
+    return None
+
+
+def run_agent(task_path, directory, deadline):
+    from pipeline import output_directory, schema_fallback, check_result
+    from postgres_loader import _local_sample
+    try:
+        output_directory.set(str(task_path.parent))
+        task = task_path.read_text(encoding="utf-8-sig")
+        template = _local_sample(task_path, task)
+        if template:
+            schema_fallback(template, task, task_path.parent / "submission.csv")
+        spec = research(task_path, directory, deadline)
+        check_result(directory, spec)
+    except Exception:
+        log_error()
+        if not published_result(task_path.parent / "submission.csv"):
+            raise
+
+
+def choose_variant(spec, baseline):
+    variants = []
+    if baseline and (baseline.get("split") or {}).get("type") == "time":
+        available = baseline.get("feature_candidates", {})
+        if available.get("entity_history"):
+            variants.append({"auto_features": True, "entity_history": True})
+        if spec["metric"] == "mae":
+            variants.append({"auto_features": True, "log_target": True})
+        if available.get("ad_history"):
+            variants.extend([
+                {"auto_features": True, "ad_history": True},
+                {"auto_features": True, "ad_history": True, "entity_history": True},
+            ])
+    variants.extend([{"auto_features": True}, {"target_encoding": True}])
+    backend = (baseline or {}).get("config", {}).get("model")
+    if spec["metric"] == "pr_auc" and backend and backend != "lightgbm":
+        return [{"model": backend} | variant for variant in variants]
+    return variants
+
+
+def search_remaining_budget(directory, spec, deadline, baseline, winner, tested):
+    """Search additional windows and model settings with time left for the final blend."""
+    fit_deadline = deadline - 180.
+    estimate = max(20., baseline.get("elapsed_seconds", baseline["fit_time"]))
+    accepted = {key: winner[key] for key in ("entity_history", "target_encoding") if winner.get(key)}
+    windows, smoothings = (8, 20, 60), (8., 24., 64.)
+    models, seeds = ("lightgbm", "catboost", "xgboost"), (42, 101, 263)
+    families = deque((model, iter(product(seeds, windows, smoothings))) for model in models)
+    estimates = dict.fromkeys(models, estimate)
+    failures = dict.fromkeys(models, 0)
+    retired = {}
+    attempts = completed = 0
+    while families:
+        model, options = families.popleft()
+        choice = next(options, None)
+        if choice is None:
+            retired[model] = "queue_exhausted"
+            continue
+        if not trial_fits(estimates[model], fit_deadline):
+            retired[model] = "next_trial_does_not_fit"
+            continue
+        seed, window, smoothing = choice
+        config = accepted | {"model": model, "seed": seed, "auto_features": True, "ad_history": True,
+                             "ad_history_window": window, "ad_history_smoothing": smoothing}
+        key = json.dumps(config, sort_keys=True)
+        if key in tested:
+            families.append((model, options))
+            continue
+        tested.add(key)
+        attempts += 1
+        budget = min(420., max(110., 1.8 * estimates[model]))
+        report = run_trial(directory, spec, fit_deadline, budget, config, estimate=estimates[model])
+        if report and report["complete"]:
+            estimates[model] = max(20., report.get("elapsed_seconds", report["fit_time"]))
+            failures[model] = 0
+            completed += 1
+        else:
+            failures[model] += 1
+            if failures[model] >= 3:
+                retired[model] = "retry_limit_reached"
+                continue
+            log(f"SEARCH_RETRY model={model} remaining={3-failures[model]}")
+        families.append((model, options))
+    reason = ("next_trial_does_not_fit" if "next_trial_does_not_fit" in retired.values() else
+              "families_exhausted_after_retries" if "retry_limit_reached" in retired.values() else "queue_exhausted")
+    return {"reason": reason, "families": retired, "attempts": attempts, "completed": completed}
+
+
+def research(task_path, directory, deadline):
+    from pipeline import experiment_history, write_fallback
+    from postgres_loader import prepare_postgres
+
+    task = task_path.read_text(encoding="utf-8-sig")
+    mailbox = directory / "research"
+    model = ResearchModel(mailbox if mailbox.is_dir() else None)
+    spec = None
+    using_postgres = bool(os.environ.get("PGDATABASE"))
+    pg_started = time.monotonic()
+    join_started = None
+
+    def core_ready():
+        nonlocal spec, join_started
+        if using_postgres:
+            log_phase("pg_load", pg_started, reason="core_tables_loaded")
+        safety_started = time.monotonic()
+        def publish(guess):
+            nonlocal spec
+            problems = write_fallback(directory, guess)
+            if problems:
+                raise ValueError(problems)
+            spec = guess
+        resolved = resolve_task(directory, task, model, deadline, early=publish)
+        if resolved != spec:
+            publish(resolved)
+        log_phase("safety_prior", safety_started, reason="prior_published")
+        log(f"Task: {spec}")
+        join_started = time.monotonic()
+
+    if using_postgres:
+        try:
+            prepare_postgres(task_path, directory, deadline=deadline, on_core_ready=core_ready, log=log)
+        finally:
+            if join_started is not None:
+                log_phase("join", join_started, budget=round(max(0., deadline - join_started)*.4, 3),
+                          reason="join_plan_finished")
+    else:
+        # Local qualifier datasets also use this entry point.
+        from data_tools import _read_files
+        folder = _read_files(task_path.parent)[0]
+        for name in ("train.csv", "test.csv", "sample_submission.csv", "data_dictionary.csv"):
+            if (folder / name).is_file():
+                shutil.copyfile(folder / name, directory / name)
+        core_ready()
+
+    import csv
+    with (directory / "test.csv").open(encoding="utf-8-sig", newline="") as stream:
+        columns = next(csv.reader(stream))
+    available = deadline - time.monotonic()
+    quick = min(420, max(15, available * 0.12))
+    safety_started = time.monotonic()
+    baseline = run_trial(directory, spec, deadline, quick)
+    baseline_trial = {}
+    failed_trial = None
+    if not baseline:
+        failed_trial = {"config": {"model": "lightgbm"}, "status": "baseline failed"}
+        baseline_trial = {"model": "catboost"}
+        baseline = run_trial(directory, spec, deadline, quick, baseline_trial)
+    log_phase("safety_model", safety_started, budget=quick * (2 if failed_trial else 1),
+              reason="model_completed" if baseline else "no_completed_model")
+    variant_started = time.monotonic()
+    variants = choose_variant(spec, baseline)
+    winner = {}
+    trials = [failed_trial] if failed_trial else []
+    tested = set()
+    unusable = 0
+    if baseline:
+        trials.append({"config": baseline_trial, "scores":baseline["fold_scores"]})
+    search_deadline = time.monotonic() + .55 * max(0, deadline-time.monotonic())
+    llm_started = None
+    llm_reason = "search_deadline"
+    variant_trials = llm_trials = 0
+    while time.monotonic() < search_deadline:
+        from_llm = False
+        if variants:
+            config = variants.pop(0)
+        else:
+            if llm_started is None:
+                log_phase("choose_variant", variant_started, budget=round(search_deadline-variant_started, 3),
+                          reason="queue_exhausted", trials=variant_trials)
+                llm_started = time.monotonic()
+            if not model.enabled:
+                llm_reason = "llm_unavailable"
+                break
+            if not model.remaining["hypothesis"]:
+                llm_reason = "request_budget_exhausted"
+                break
+            if not trial_fits(90., search_deadline):
+                llm_reason = "next_request_does_not_fit"
+                break
+            config = hypothesis(model, task, spec, columns, trials, search_deadline)
+            from_llm = True
+            if not config:
+                log("LLM_HYPOTHESIS status=no_valid_config")
+                unusable += 1
+                if unusable >= 2:
+                    llm_reason = model.last_reason or "no_valid_tool_configuration"
+                    break
+                continue
+        key = json.dumps(config, sort_keys=True)
+        if key in tested:
+            if from_llm:
+                log("LLM_HYPOTHESIS status=duplicate")
+            continue
+        tested.add(key)
+        estimate = max(2., baseline.get("elapsed_seconds", baseline["fit_time"]) if baseline else quick)
+        if not trial_fits(estimate, search_deadline):
+            if from_llm:
+                log("LLM_HYPOTHESIS status=insufficient_time")
+                llm_reason = "next_trial_does_not_fit"
+            break
+        report = run_trial(directory, spec, search_deadline, quick, config, estimate=estimate)
+        if from_llm:
+            llm_trials += 1
+            status = ("completed" if report and report["complete"] else "incomplete")
+            log(f"LLM_HYPOTHESIS status={status} config={config}")
+            if model.last_tool and report:
+                log(f"LLM_TOOL_EXECUTED name={model.last_tool} status={status}")
+            unusable = 0 if status == "completed" else unusable + 1
+        else:
+            variant_trials += 1
+        if report:
+            trials.append({"config":config,"scores":report["fold_scores"]})
+            if report["saved"]:
+                winner = config
+        else:
+            trials.append({"config":config, "status":"skipped or failed"})
+        if unusable >= 2:
+            llm_reason = "consecutive_incomplete_trials"
+            break
+    if llm_started is None:
+        log_phase("choose_variant", variant_started, budget=round(search_deadline-variant_started, 3),
+                  reason="search_deadline", trials=variant_trials)
+        llm_started = time.monotonic()
+    log_phase("llm_cycle", llm_started, budget=round(max(0., search_deadline-llm_started), 3),
+              reason=llm_reason, trials=llm_trials)
+
+    # Bound expensive searches so that completed candidates are published during the run.
+    candidates = [{k:v for k,v in winner.items() if k not in ("model",)}, {"auto_features":True}]
+    for index, candidate in enumerate(candidates):
+        phase = "baseline_auto_train" if index == 0 else "final_auto_train"
+        started = time.monotonic()
+        if candidate in candidates[:index]:
+            log_phase(phase, started, budget=0., reason="duplicate_configuration")
+            continue
+        remaining = deadline-time.monotonic()
+        if remaining < max(15.,1.3*(baseline["fit_time"] if baseline else 5.)):
+            log_phase(phase, started, budget=0., reason="next_trial_does_not_fit")
+            continue
+        auto_budget = min(900, max(0., (remaining - 32.) / 1.3))
+        report = run_trial(directory, spec, deadline, auto_budget,
+                           candidate | {"max_seeds":3}, "auto")
+        log_phase(phase, started, budget=round(auto_budget, 3),
+                  reason=(report.get("auto_stop") or {}).get("reason", "no_completed_model") if report else "no_completed_model",
+                  queue=(report or {}).get("auto_stop"))
+        if report and report["saved"]:
+            winner = candidate
+    ad_search = (baseline and baseline.get("feature_candidates", {}).get("ad_history")
+                 and available > 1800.)
+    blend_estimate = min(90., quick)
+    if ad_search:
+        # Publish the best known blend before using the remaining budget.
+        history = experiment_history(directory)
+        if sum(bool(h.get("preds_file")) for h in history) >= 2:
+            started = time.monotonic()
+            blend = run_trial(directory, spec, deadline, 180., recipe="ensemble", estimate=blend_estimate)
+            if blend:
+                blend_estimate = max(5., blend["elapsed_seconds"])
+            log_phase("ensemble", started, budget=180., reason="blend_evaluated" if blend else "no_result",
+                      checkpoint=True)
+        started = time.monotonic()
+        search = search_remaining_budget(directory, spec, deadline, baseline, winner, tested)
+        log_phase("search_remaining_budget", started, budget=round(max(0., deadline-started-180), 3),
+                  **search)
+    else:
+        log_phase("search_remaining_budget", time.monotonic(), budget=0., reason="not_enabled_for_task_or_budget")
+    history = experiment_history(directory)
+    started = time.monotonic()
+    blend_budget = max(0., deadline-started)
+    blend = None
+    if sum(bool(h.get("preds_file")) for h in history) < 2:
+        blend_reason = "insufficient_completed_members"
+    elif not trial_fits(blend_estimate, deadline):
+        blend_reason = "next_trial_does_not_fit"
+    else:
+        blend = run_trial(directory, spec, deadline, blend_budget, recipe="ensemble", estimate=blend_estimate)
+        blend_reason = "blend_evaluated" if blend else "no_result"
+    log_phase("ensemble", started, budget=round(blend_budget, 3),
+              reason=blend_reason, checkpoint=False)
     return spec
 
 
-def choose_variant(task_dir, spec, baseline, deadline):
-    """Какие улучшения признаков брать в полный рецепт: проверка одной моделью против baseline.
-
-    baseline - страховочная модель (та же одна модель на тех же фолдах). Вариант принимается
-    по тому же правилу, что и сабмит: лучше на большинстве фолдов и прирост больше шума.
-    Если выиграли оба, проверяем их вместе. Возвращает config победителя или None.
-    """
-    from training import compare_results
-
-    if not baseline or not baseline.get("complete"):
-        return None
-    # На одну проверку - с запасом время страховочной модели, но не больше ее доли
-    budget = min(SAFETY_SHARE * TOTAL_SECONDS, max(120.0, 3 * baseline["fit_time"]))
-
-    def check(config):
-        if deadline - time.monotonic() < FINAL_SHARE * TOTAL_SECONDS + budget * 1.2:
-            return None
-        report, raw = experiment(task_dir, spec, budget=budget, config=config)
-        if report is None:
-            log(f"Проверка {config} не удалась: {str(raw)[-500:]}")
-            return None
-        if not report["complete"]:
-            log(f"Проверка {config}: не все фолды успели, сравнить нельзя")
-            return None
-        result = compare_results(baseline, report)
-        log(f"Проверка {config}: {report['score']} против {baseline['score']}, "
-            f"принят: {result['accept']}, ключи: {report.get('te_keys')}")
-        return result if result["accept"] else None
-
-    variants = [{"auto_features": True}, {"target_encoding": True}]
-    accepted = [(config, result) for config in variants if (result := check(config))]
-    if len(accepted) == 2:
-        both = {"auto_features": True, "target_encoding": True}
-        if result := check(both):
-            accepted.append((both, result))
-    if not accepted:
-        return None
-    return max(accepted, key=lambda item: item[1]["diff_mean"])[0]
-
-
-def run_agent(task_path):
-    start = time.monotonic()
-    deadline = start + TOTAL_SECONDS
-    HARD_DEADLINE[0] = deadline
-    remaining = lambda: deadline - time.monotonic()
-    task_path = task_path.resolve()
-    task_dir = task_path.parent
-    task = task_path.read_text(encoding="utf-8")
-    summary = inspect_data(task_dir)
-    (task_dir / ".tyrell_experiments.json").write_text("[]", encoding="utf-8")
-
-    keys_ok = all(os.environ.get(n, "").strip() for n in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"))
-    client = OpenAI(max_retries=1) if keys_ok else None
-    if not keys_ok:
-        log("Ключи LLM не заданы, работаю без LLM.")
-
-    # Шаг 0: task_spec и страховочный ответ до любых долгих запросов к LLM
-    try:
-        guess = guess_task_spec(task_dir, task)
-    except ValueError as error:
-        log(f"Эвристика не определила task_spec: {error}")
-        guess = ({"target_column": None, "id_columns": [], "task_type": None, "metric": None,
-                  "probabilities": False}, False)
-    spec = resolve_spec(client, task, summary, guess, deadline)
-    log(f"task_spec: {spec}")
-    report, raw = experiment(task_dir, spec, budget=SAFETY_SHARE * TOTAL_SECONDS)
-    safety = report
-    log(f"Страховочный ответ: {report and report['score']}")
-    if report is None or not report.get("saved"):
-        log(f"Быстрая модель не сохранилась: {str(raw)[-2000:]}")
-        fallback(task_dir, spec)
-
-    # Шаг 1: базовый auto_train
-    budget = min(AUTO_SHARE * TOTAL_SECONDS, remaining() - FINAL_SHARE * TOTAL_SECONDS)
-    if budget > 120:
-        report, raw = experiment(task_dir, spec, budget=budget, recipe="auto")
-        log(f"auto_train: {report and {k: report[k] for k in ('score', 'saved', 'members')}}")
-        if report is None:
-            log(f"auto_train упал: {str(raw)[-2000:]}")
-
-    # Шаг 1б: автопризнаки и кодирование по таргету сначала проверяем одной моделью на тех же
-    # фолдах - это минуты. Полный рецепт (десятки минут) запускаем только для победителя
-    winner = choose_variant(task_dir, spec, safety, deadline)
-    budget = min(AUTO_SHARE * TOTAL_SECONDS, remaining() - FINAL_SHARE * TOTAL_SECONDS)
-    if winner and budget > 120:
-        report, raw = experiment(task_dir, spec, budget=budget, recipe="auto", config=winner)
-        log(f"auto_train с {winner}: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
-        if report is None:
-            log(f"auto_train с {winner} упал: {str(raw)[-2000:]}")
-
-    # Шаг 2: цикл гипотез с LLM
-    if client is not None:
-        run_llm_loop(client, task, summary, spec, task_dir, deadline)
-    # Смесь уже сделанных экспериментов: если финальный шаг не успеет, она останется
-    ensemble(task_dir, spec)
-
-    # Шаг 3: все оставшееся время - расширенный auto_train (больше сидов и медленные модели)
-    # на лучших признаках. Сабмит заменится, только если результат лучше с учетом шума
-    history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
-    saved = [h for h in history if h["saved"] and h["recipe"] != "ensemble"]
-    best = saved[-1] if saved else None
-    # Поправка на перерасход auto_train до 5%, загрузку данных и итоговый ансамбль
-    budget = (remaining() - 180 - ENSEMBLE_RESERVE) / 1.1
-    if budget > 300:
-        config = {"max_seeds": FINAL_MAX_SEEDS}
-        if best:
-            config |= {k: v for k, v in best["config"].items() if k == "cat_encoding"}
-            config["auto_features"] = bool(best.get("auto_features"))
-            config["target_encoding"] = best.get("target_encoding") or False
-        report, _ = experiment(task_dir, spec, budget=budget, recipe="auto", config=config,
-                               feature_code=best and best.get("feature_code"))
-        log(f"Финальный auto_train: {report and {k: report[k] for k in ('score', 'saved', 'vs_saved')}}")
-        ensemble(task_dir, spec)
-
-    try:
-        check_result(task_dir)
-        history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
-        saved = [h for h in history if h["saved"]]
-        print(f"Готово: submission.csv сохранён, лучший результат валидации "
-              f"{saved and saved[-1]['score']}.")
-    except Exception as error:
-        print(f"Проверка submission.csv: {error}")
-
-
-def run_llm_loop(client, task, summary, spec, task_dir, deadline):
-    llm_deadline = deadline - FINAL_SHARE * TOTAL_SECONDS
-    history = json.loads((task_dir / ".tyrell_experiments.json").read_text(encoding="utf-8"))
-    context = {"task_spec": spec, "experiments": [
-        {k: h.get(k) for k in ("recipe", "auto_features", "target_encoding", "te_keys", "score",
-                               "fold_scores", "saved", "members")} for h in history]}
-    messages = [
-        {"role": "system", "content": INSTRUCTION},
-        {"role": "user", "content": task + "\n\nСводка данных:\n" + compact_summary(summary)
-                                    + "\n\nУже сделано:\n" + json.dumps(context, ensure_ascii=False, default=str)},
-    ]
-    nudges = 0
-    for step in range(200):
-        if llm_deadline - time.monotonic() < 120:
-            break
-        log(f"Шаг {step + 1}. До финала {int(llm_deadline - time.monotonic())} секунд.")
-        response = ask_llm(client, messages, llm_deadline)
-        if response is None:
-            log("LLM не отвечает, перехожу к финалу.")
-            return
-        message = response.choices[0].message
-        reply = message.model_dump(exclude_none=True)
-        # Рассуждения модели в историю не кладем: иначе каждый следующий запрос оплачивает их снова
-        for key in ("reasoning_content", "reasoning"):
-            reply.pop(key, None)
-        messages.append(reply)
-
-        if not message.tool_calls:
-            left = llm_deadline - time.monotonic()
-            if nudges >= MAX_NUDGES or left < 600:
-                return
-            nudges += 1
-            messages.append({"role": "user", "content": f"Осталось около {int(left // 60)} минут. "
-                             "Предложи и проверь следующую гипотезу: новые признаки или параметры."})
-            continue
-
-        for call in message.tool_calls:
-            try:
-                arguments = json.loads(call.function.arguments)
-                left = llm_deadline - time.monotonic()
-                if call.function.name == "run_experiment":
-                    budget = min(float(arguments.get("time_budget", 300)), 2400, left - 60)
-                    if budget < 30:
-                        raise ValueError("Время на новые эксперименты закончилось.")
-                    report, raw = experiment(
-                        task_dir, spec, budget=budget, recipe=arguments.get("recipe", "single"),
-                        config=arguments.get("config") or {}, feature_code=arguments.get("feature_code"),
-                    )
-                    result = report if report is not None else raw
-                elif call.function.name == "run_python":
-                    code = arguments["code"]
-                    if not isinstance(code, str):
-                        raise ValueError("Аргумент code должен быть строкой.")
-                    result = run_python(code, task_dir, min(1800, max(30, left)))
-                else:
-                    raise ValueError("Неизвестный инструмент.")
-            except (ValueError, KeyError, TypeError, OSError) as error:
-                result = {"error": str(error)}
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": clip_text(json.dumps(result, ensure_ascii=False, default=str)),
-            })
+def main():
+    deadline = pop_worker_deadline()
+    task = Path(sys.argv[1] if len(sys.argv) > 1 else "task.md").absolute()
+    if deadline is not None:
+        receipt_directory.set(sys.argv[3])
+        run_agent(task, Path(sys.argv[2]), deadline)
+        return 0
+    limit = time_limit(os.environ.get("TYRELL_TIME_LIMIT", 7200))
+    shutdown = shutdown_reserve(limit)
+    work_seconds = min(6500. - shutdown, limit - min(420., limit * 420 / 7200))
+    deadline = PROCESS_STARTED + work_seconds
+    with publication_run() as proofs, tempfile.TemporaryDirectory(prefix="tyrell-data-") as directory:
+        cmd = worker_command(Path(__file__).resolve(), deadline, [str(task), directory, proofs])
+        stop = threading.Event()
+        if ResearchModel().enabled:
+            mailbox = Path(directory) / "research"
+            mailbox.mkdir()
+            threading.Thread(target=serve_research_model, args=(mailbox, stop), daemon=True).start()
+        env = {k:v for k,v in os.environ.items() if not k.upper().startswith("OPENAI_")}
+        try:
+            code = supervised_exit(cmd, deadline + shutdown, env=env)
+        finally:
+            stop.set()
+        output = task.parent / "submission.csv"
+        receipt = published_result(output)
+        from pipeline import experiment_history, output_directory, schema_fallback, verify_template_output
+        from postgres_loader import _local_sample
+        task_text = task.read_text(encoding="utf-8-sig")
+        sample = _local_sample(task, task_text) or Path(directory) / "sample_submission.csv"
+        if sample.is_file():
+            if not receipt:
+                schema_fallback(sample, task_text, output)
+                receipt = published_result(output)
+            verify_template_output(sample, task_text, output)
+        if not receipt:
+            log("No validated predictions published by this run")
+            return code or 1
+        if receipt["state"] == "MODEL_SUCCESS":
+            output_directory.set(str(task.parent))
+            saved = [item for item in experiment_history(directory) if item["saved"]]
+            if saved:
+                winner = saved[-1]
+                if winner["metric"] == "pr_auc":
+                    log(f"AP_WINNER recipe={winner['recipe']} config={winner['config']}")
+                for score, baseline in zip(winner["fold_scores"], winner.get("fold_baselines", [])):
+                    better = score > baseline["score"] if winner["greater_is_better"] else score < baseline["score"]
+                    log(f"CV_AUDIT metric={winner['metric']} fold={baseline['fold']} model={score:.6f} "
+                        f"baseline={baseline['score']:.6f} constant={baseline['constant']:.6f} "
+                        f"train_rows={baseline['train_rows']} validation_rows={baseline['validation_rows']} "
+                        f"model_beats_baseline={better}")
+        print(f"SUBMISSION_STATE={receipt['state']} score={receipt.get('score')}", flush=True)
+        log_phase("total", PROCESS_STARTED, budget=round(work_seconds+shutdown, 3),
+                  reason=receipt["state"], platform_limit=limit)
+        return 0
 
 
 if __name__ == "__main__":
-    run_agent(Path(sys.argv[1] if len(sys.argv) > 1 else "task.md"))
+    sys.exit(main())

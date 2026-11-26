@@ -13,6 +13,8 @@
 """
 
 import os
+import tempfile
+from publication import prepare_publication
 from pathlib import Path
 
 import numpy as np
@@ -129,11 +131,21 @@ def _repair_class_probabilities(table: pd.DataFrame) -> tuple[pd.DataFrame, list
 
 # ---------- Сборка и запись ----------
 
-def _write_atomic(table: pd.DataFrame, output_path: Path) -> None:
+def _write_atomic(table: pd.DataFrame, output_path: Path, state, score) -> None:
     """Пишет CSV во временный файл рядом и подменяет им старый одним действием (os.replace)."""
-    tmp_path = output_path.with_suffix(".tmp")
-    table.to_csv(tmp_path, index=False, encoding="utf-8")
-    os.replace(tmp_path, output_path)
+    with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=".submission-",
+                                     suffix=".tmp", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        table.to_csv(tmp_path, index=False, encoding="utf-8")
+        if os.name == "posix":
+            # The grader can collect the finished CSV under a separate user.
+            # A separate grader account may need to read the published predictions.
+            tmp_path.chmod(0o644)
+        prepare_publication(tmp_path, state, score)
+        os.replace(tmp_path, output_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _find_id_column(columns: list[str], test_ids: pd.Series) -> str:
@@ -146,7 +158,7 @@ def _find_id_column(columns: list[str], test_ids: pd.Series) -> str:
 
 def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, output_path: str | Path,
                     allowed_labels: set | None = None, probabilities: bool = False,
-                    class_order: list | None = None) -> list[str]:
+                    class_order: list | None = None, *, publication_state=None, score=None) -> list[str]:
     """Собирает submission.csv из предсказаний, проверяет и сохраняет.
 
     predictions:    ответы по строкам test.csv в том же порядке. Варианты:
@@ -164,9 +176,17 @@ def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, o
     Возвращает список проблем. Пустой список = файл записан и корректен.
     Если проблемы есть, файл НЕ записывается: старый хороший ответ остаётся на месте.
     """
-    sample = pd.read_csv(sample_path)
-    columns = list(sample.columns)
+    columns = pd.read_csv(sample_path, nrows=0).columns.tolist()
     id_col = _find_id_column(columns, test_ids)
+    sample = pd.read_csv(sample_path, dtype={id_col: str}, keep_default_na=False)
+    expected_ids = sample[id_col]
+    keys = test_ids.astype("string")
+    for ids in (keys, expected_ids):
+        if ids.isna().any() or ids.str.strip().eq("").any() or ids.duplicated().any():
+            return ["Пустые или повторяющиеся ID в test или шаблоне"]
+    positions = pd.Index(keys).get_indexer(expected_ids)
+    if len(keys) != len(expected_ids) or (positions < 0).any():
+        return ["Состав ID в test и шаблоне различается"]
     answer_cols = [c for c in columns if c != id_col]
     if len(test_ids) == 0:
         return ["test пустой: нечего записывать"]
@@ -179,8 +199,9 @@ def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, o
         if values.ndim != 1:
             return [f"шаблон ждёт один столбец ответа, а пришло предсказаний формы {values.shape}"]
         answers, fixes = _repair_single(pd.Series(values), allowed_labels, probabilities)
-        answers, dtype_fixes = _match_dtype(answers, sample[answer_cols[0]])
-        fixes += dtype_fixes
+        if allowed_labels is not None:
+            answers, dtype_fixes = _match_dtype(answers, sample[answer_cols[0]])
+            fixes += dtype_fixes
         answer_table = pd.DataFrame({answer_cols[0]: answers.to_numpy()})
     else:
         # Вероятности по классам: выстраиваем столбцы в порядке шаблона
@@ -205,14 +226,14 @@ def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, o
     for fix in fixes:
         print(f"[submission] исправлено: {fix}", flush=True)
 
-    answer_table.insert(0, id_col, test_ids.to_numpy())
+    answer_table = answer_table.iloc[positions].reset_index(drop=True)
+    answer_table.insert(0, id_col, expected_ids)
     submission = answer_table[columns]  # порядок столбцов как в шаблоне
-    expected_ids = test_ids.reset_index(drop=True).rename(id_col)
     problems = validate_submission(submission, expected_ids, columns, allowed_labels, probabilities)
     if problems:
         print(f"[submission] НЕ записан: {'; '.join(problems)}", flush=True)
         return problems
 
-    _write_atomic(submission, Path(output_path))
+    _write_atomic(submission, Path(output_path), publication_state, score)
     print(f"[submission] записан {output_path}: {len(submission)} строк, столбцы {columns}", flush=True)
     return []
