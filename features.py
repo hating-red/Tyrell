@@ -210,6 +210,246 @@ def ad_history_keys(columns):
     return groups
 
 
+def event_entities(fit, clock, *, maximum=4):
+    """Identify repeated entity keys from the first historical fit prefix."""
+    candidates = []
+    for name in fit:
+        if name == clock or not name.lower().endswith(("_id", "_key", "_code")):
+            continue
+        values = fit[name].dropna()
+        unique = values.nunique()
+        if 2 <= unique <= len(values) // 2:
+            candidates.append((name, unique))
+    # Preserve a mix of granular and coarse keys while cutting duplicate FK aliases.
+    chosen = []
+    for name, _ in sorted(candidates, key=lambda x: (-x[1], x[0])):
+        if not any(fit[name].equals(fit[other]) for other in chosen):
+            chosen.append(name)
+        if len(chosen) >= maximum:
+            break
+    return chosen
+
+
+def _codes(source, query, keys):
+    if not keys:
+        return np.zeros(len(source), dtype="int64"), np.zeros(len(query), dtype="int64")
+    columns = pd.concat([source[list(keys)], query[list(keys)]], ignore_index=True)
+    codes, _ = pd.factorize(pd.MultiIndex.from_frame(columns), sort=False)
+    codes = np.asarray(codes, dtype="int64")
+    codes[~columns.notna().all(axis=1).to_numpy()] = -1
+    return codes[:len(source)], codes[len(source):]
+
+
+def event_activity(source, query, clock, entities):
+    """Use only earlier registrations, which can include unlabelled test events."""
+    found = {}
+    ts, qt = source[clock].to_numpy(), query[clock].to_numpy()
+    for cols in [(), *((col,) for col in entities)]:
+        past, now = _codes(source, query, cols)
+        history = pd.DataFrame({"key": past, "stamp": ts})
+        by_key = history.loc[history["stamp"].notna() & history.key.ge(0)].groupby("key").indices
+        present = history.loc[history["stamp"].notna() & history.key.ge(0), "stamp"].to_numpy()
+        title = "__activity_" + ("all" if not cols else cols[0])
+        values = np.full((len(query), 6), np.nan)
+        for key, ids in pd.Series(np.arange(len(query))).groupby(now, sort=False):
+            pos = ids.to_numpy()
+            pos = pos[pd.notna(qt[pos]) & (key >= 0)]
+            if not len(pos):
+                continue
+            stamp = qt[pos]
+            ordered = np.sort(present[by_key[key]]) if key in by_key else np.empty(0, dtype=ts.dtype)
+            prev = np.searchsorted(ordered, stamp, side="left")
+            for j, hours in enumerate((1, 3, 24, 168)):
+                values[pos, j] = prev - np.searchsorted(ordered, stamp - np.timedelta64(hours, "h"))
+            hit = prev > 0
+            values[pos[hit], 4] = (stamp[hit] - ordered[prev[hit] - 1]) / np.timedelta64(1, "s")
+            values[pos, 5] = 1 + prev - np.searchsorted(ordered, stamp.astype("datetime64[D]"))
+        for j, name in enumerate(("1h", "3h", "24h", "7d", "seconds_since_previous", "day_rank")):
+            found[f"{title}_{name}"] = values[:, j]
+    return pd.DataFrame(found, index=query.index, dtype="float32")
+
+
+def activity_reference(source, query, clock, entities):
+    """Get each sampled row's window counts from cumulative earlier registrations."""
+    fields = ("1h", "3h", "24h", "7d", "seconds_since_previous", "day_rank")
+    outputs = {}
+    for keys in [(), *((column,) for column in entities)]:
+        past, now = _codes(source, query, keys)
+        history = pd.DataFrame({"key": past, "stamp": source[clock].array})
+        history = history.loc[history["stamp"].notna() & history["key"].ge(0)].sort_values("stamp")
+        history["n"] = history.groupby("key", sort=False).cumcount() + 1
+        ask = pd.DataFrame({"row": np.arange(len(query)), "key": now, "stamp": query[clock].array})
+        ask = ask.loc[ask["stamp"].notna() & ask["key"].ge(0)].sort_values("stamp")
+
+        def prefix(cutoff):
+            markers = ask[["row", "key"]].assign(cutoff=cutoff)
+            return pd.merge_asof(markers, history, by="key", left_on="cutoff", right_on="stamp",
+                                 allow_exact_matches=False, direction="backward").set_index("row")
+
+        previous = prefix(ask["stamp"])
+        count = previous["n"].fillna(0)
+        values = [count - prefix(ask["stamp"] - pd.Timedelta(hours=hours))["n"].fillna(0)
+                  for hours in (1, 3, 24, 168)]
+        values.extend([(previous["cutoff"] - previous["stamp"]).dt.total_seconds(),
+                       1 + count - prefix(ask["stamp"].dt.floor("D"))["n"].fillna(0)])
+        name = "__activity_" + (keys[0] if keys else "all")
+        outputs.update({f"{name}_{field}": column.reindex(range(len(query))).to_numpy()
+                        for field, column in zip(fields, values)})
+    return pd.DataFrame(outputs, index=query.index, dtype="float32")
+
+
+def causal_target_history(source, query, clock, available, labels, entities, *, window, smoothing, median=False):
+    """Apply strictly earlier, observable labels from a fold's own model-fit prefix."""
+    from itertools import combinations
+
+    query_clock = query[clock].to_numpy()
+    numeric = np.asarray(labels, dtype=float)
+    avail = np.asarray(available)
+    observed = pd.notna(avail) & np.isfinite(numeric)
+    numeric, avail = numeric[observed], avail[observed]
+    source = source.iloc[np.flatnonzero(observed)]
+    order = np.argsort(avail, kind="stable")
+    prefix = np.r_[0., np.cumsum(numeric[order])]
+    prior_n = np.searchsorted(avail[order], query_clock, side="left")
+    prior = np.divide(prefix[prior_n], prior_n, out=np.full(len(query), np.nan), where=prior_n > 0)
+    outputs = {}
+    ordered = pd.DataFrame({"event": query_clock, "row": np.arange(len(query))})
+    ordered = ordered.dropna(subset=["event"]).sort_values("event", kind="stable")
+    prior[pd.isna(query_clock)] = np.nan
+    groups = [(c,) for c in entities] + list(combinations(entities[:3], 2))
+    for cols in groups:
+        source_key, query_key = _codes(source, query, cols)
+        hist = pd.DataFrame({"key": source_key, "available": avail, "y": numeric})
+        hist = hist.loc[hist.key.ge(0)].sort_values("available", kind="stable")
+        g = hist.groupby("key", sort=False)
+        running = g["y"].cumsum()
+        hist["sum"] = running - running.groupby(hist["key"], sort=False).shift(window, fill_value=0.)
+        hist["count"] = g.cumcount() + 1
+        if median:
+            hist["median"] = g["y"].rolling(window, min_periods=1).median().droplevel(0).reindex(hist.index)
+        hist["last_positive"] = hist["available"].where(hist["y"].gt(0)).groupby(hist["key"], sort=False).ffill()
+        ask = ordered.assign(key=query_key[ordered["row"].to_numpy()])
+        hits = pd.merge_asof(ask, hist, by="key", left_on="event", right_on="available",
+                             direction="backward", allow_exact_matches=False)
+        if (hits["available"] >= hits["event"]).any():
+            from leak_audit import LeakAuditError
+            raise LeakAuditError("label was not available before the query event")
+        hits = hits.set_index("row").reindex(range(len(query)))
+        n = hits["count"].fillna(0).to_numpy()
+        tag = "__history_" + "_by_".join(cols)
+        outputs[tag + "_count"] = n
+        outputs[tag + "_mean"] = (hits["sum"].fillna(0).to_numpy() + smoothing * prior) / (np.minimum(n, window) + smoothing)
+        if median:
+            outputs[tag + "_median"] = hits["median"].to_numpy()
+        outputs[tag + "_since_positive"] = (hits["event"] - hits["last_positive"]).dt.total_seconds().to_numpy()
+    return pd.DataFrame(outputs, index=query.index, dtype="float32")
+
+
+def history_reference(source, query, clock, availability, labels, entities, *, window, smoothing, median,
+                      corrupt_future=False):
+    """Independently slice each entity's available prefix for every sampled query."""
+    from itertools import combinations
+    from leak_audit import replay_payload
+
+    stamps = np.asarray(availability)
+    labels = np.asarray(labels, dtype=float)
+    observed = pd.notna(stamps) & np.isfinite(labels)
+    order = np.flatnonzero(observed)
+    order = order[np.argsort(stamps[order], kind="stable")]
+    ask = query[clock].to_numpy()
+    valid = pd.notna(ask)
+    end = np.searchsorted(stamps[order], ask, side="left")
+    # For each cutoff the perturbed array shares this prefix and has a constant
+    # suffix. Its observable prefix sums are therefore shared across replays.
+    totals = np.r_[0., np.cumsum(labels[order])]
+    prior = np.divide(totals[end], end, out=np.full(len(query), np.nan), where=valid & (end > 0))
+    outputs = {}
+    for keys in [(c,) for c in entities] + list(combinations(entities[:3], 2)):
+        src_keys, query_keys = _codes(source, query, keys)
+        groups = pd.Series(order).groupby(src_keys[order], sort=False)
+        past = {key: rows.to_numpy() for key, rows in groups if key >= 0}
+        values = np.full((len(query), 4), np.nan)
+        values[:, 0] = 0
+        values[:, 1] = prior
+        for key, positions in pd.Series(np.flatnonzero(valid)).groupby(query_keys[valid], sort=False):
+            if key not in past:
+                continue
+            rows, ids = past[key], positions.to_numpy()
+            times, ys = stamps[rows], labels[rows]
+            cut = np.searchsorted(times, ask[ids], side="left")
+            values[ids, 0] = cut
+            positive = times[ys > 0]
+            last = np.searchsorted(positive, ask[ids], side="left")
+            hit = last > 0
+            values[ids[hit], 3] = (ask[ids[hit]] - positive[last[hit]-1]) / np.timedelta64(1, "s")
+            for idx, stop in zip(ids, cut):
+                if stop:
+                    start = max(0, stop-window)
+                    recent = ys[start:stop]
+                    if corrupt_future:
+                        # Include the first noisy value, even for coincident labels.
+                        # The rest of the identical suffix is outside this prefix.
+                        tail = slice(start, min(len(ys), stop + 1))
+                        changed = replay_payload(ys[tail], times[tail], ask[idx], corrupt_future=True)
+                        recent = changed[np.isfinite(changed)]
+                    values[idx, 1] = (recent.sum() + smoothing * prior[idx]) / (len(recent) + smoothing)
+                    if median:
+                        values[idx, 2] = np.median(recent)
+        tag = "__history_" + "_by_".join(keys)
+        columns = (("count", 0), ("mean", 1), ("median", 2), ("since_positive", 3))
+        outputs.update({tag + "_" + col: values[:, i] for col, i in columns if median or col != "median"})
+    return pd.DataFrame(outputs, index=query.index, dtype="float32")
+
+
+def audit_event_kernel(builder, source, availability, queries, clock, group, *, labels=None, budget=None,
+                       reference=None, corrupted_reference=None):
+    """Replay sampled queries after dropping future inputs and perturbing future labels."""
+    from leak_audit import AuditBudget, audit_log, check_equal, exact_cutoffs
+
+    budget = budget or AuditBudget()
+    with budget.check(group) as check_time:
+        expected = builder(source, queries, availability, labels)
+        if reference is not None:
+            check_equal(expected, reference(source, queries, availability, labels))
+        if corrupted_reference is not None:
+            check_time()
+            check_equal(expected, corrupted_reference(source, queries, availability, labels))
+        cutoffs = exact_cutoffs(queries[clock])
+        if reference is not None:
+            # A full input replay exercises the production entry point in addition
+            # to the indexed replay, which covers every sampled cutoff.
+            cutoffs = (next(cutoffs, None),)
+        for item in cutoffs:
+            if item is None:
+                continue
+            check_time()
+            idx, cutoff = item
+            original = queries.iloc[idx]
+            retained = np.asarray(availability < cutoff)
+            masked = builder(source.iloc[retained], original, np.asarray(availability)[retained],
+                             None if labels is None else np.asarray(labels)[retained])
+            check_equal(expected.iloc[idx], masked)
+            check_time()
+            changed = source.copy()
+            noisy = None
+            if labels is not None:
+                noisy = np.asarray(labels, dtype=float).copy()
+                noisy[~retained] = -123456.789
+            else:
+                for column in changed.columns.difference([clock]):
+                    changed[column] = changed[column].astype(object)
+                    changed.loc[~retained, column] = "audit changed future entity"
+            check_equal(expected.iloc[idx], builder(changed, original, availability, noisy))
+    checks = ["truncated_source", "corrupted_source"]
+    if reference is not None:
+        checks.append("per_row_cutoff")
+    if corrupted_reference is not None or reference is None:
+        checks.append("per_cutoff_corrupted_source")
+    audit_log("pass", group, features=list(expected), rows=len(queries), cutoffs=int(queries[clock].nunique()),
+              rule="strictly earlier registration" if labels is None else "fold labels available strictly before event",
+              checks=checks)
+
+
 def add_ad_history(fit, queries, labels, clock, groups, *, window, smoothing):
     """Compute engagement history using only strictly earlier rows of this fit prefix."""
     n_fit = len(fit)

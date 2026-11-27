@@ -488,7 +488,7 @@ def pg_error_reason(error):
     return f"{reason} (SQLSTATE {state or 'unavailable'})"
 
 
-def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core_ready=None, on_stats=None):
+def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core_ready=None, on_stats=None, replay=None):
     """Export once per run into a new scratch folder. Preserve source files and credentials."""
     import psycopg
 
@@ -609,8 +609,10 @@ def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core
                 if deadline is None or deadline > join_start:
                     # References are optional. Leave most of the remaining wall time for training.
                     join_deadline = None if deadline is None else join_start + (deadline - join_start) * 0.4
+                    replay_options = {"replay": replay,
+                                      "event_counts": {kind: exports[kind]["rows"] for kind in ("train", "test")}} if replay else {}
                     enrich_postgres(conn, tables, train, test, id_col, target, text, output_dir, join_deadline, join_log,
-                                    on_audit=audit_join if on_stats else None)
+                                    on_audit=audit_join if on_stats else None, **replay_options)
                 else:
                     join_log("Достигнут лимит времени JOIN")
             finally:

@@ -135,7 +135,7 @@ def load_data(task_dir, task_spec) -> dict:
         str(row["feature"]) for row in dictionary.to_dict("records")
         if str(row["role"]).strip().lower() in ("id", "identifier")
     }
-    excluded = {target, identifier, *targets, *declared_ids}
+    excluded = {target, identifier, *targets, *declared_ids, *task_spec.get("excluded_features", ())}
     features = task_spec.get("feature_columns")
     if features is None:
         features = [name for name in train if name in test and name not in excluded]
@@ -420,20 +420,26 @@ def guess_task_spec(task_dir, task_text=""):
 def target_constraints(text, target, y, task_type):
     if task_type != "regression":
         return {}
-    numeric = pd.to_numeric(y, errors="coerce").dropna()
+    observed = y.dropna()
+    numeric = pd.to_numeric(observed, errors="coerce").dropna()
     spec = {"nonnegative": bool(re.search(r"non[- ]?negative|неотрицательн", text, re.I)
                                 or (len(numeric) and numeric.min() >= 0))}
     unit = re.search(r"label delay unit\s*:\s*`?(minutes?|hours?)", text, re.I)
     duration = re.search(r"(?:минут\w*|час(?:а|ов)?|minutes?|hours?)\s+(?:от|до|между|until|from|between|to)\b"
                          r"|(?:time|duration|delay)\s+(?:elapsed|until|between|from|to)\b", text, re.I)
-    if unit:
-        spec["label_delay_unit"] = "hours" if unit[1].lower().startswith("hour") else "minutes"
+    delay_unit = None
+    if len(numeric) != len(observed) or not len(numeric) or not np.isfinite(numeric).all() or numeric.min() < 0:
+        return spec
+    if unit and (duration or re.search(r"label.*(?:available|observed).*after|метк.*(?:доступн|известн).*после", text, re.I)):
+        delay_unit = "hours" if unit[1].lower().startswith("hour") else "minutes"
     elif duration:
         part = text[max(0, duration.start()-40):duration.end()+100] + " " + target
         if re.search(r"минут|minute", part, re.I):
-            spec["label_delay_unit"] = "minutes"
+            delay_unit = "minutes"
         elif re.search(r"час|hour", part, re.I):
-            spec["label_delay_unit"] = "hours"
+            delay_unit = "hours"
+    if delay_unit and 0 < numeric.median() <= (30 * 24 * (60 if delay_unit == "minutes" else 1)):
+        spec["label_delay_unit"] = delay_unit
     return spec
 
 
@@ -529,6 +535,7 @@ def _dictionary_clocks(conn, tables, train, test, deadline, log):
 def _hour_clock(table, task_text, descriptions=None):
     """Resolve timestamp semantics only from field names or scoped descriptions."""
     clocks = {}
+    ambiguous_clocks = set()
     for column in table.columns:
         name = column.lower()
         if name not in _START_NAMES | _END_NAMES | _GENERIC_HOUR_COLUMNS:
@@ -549,6 +556,7 @@ def _hour_clock(table, task_text, descriptions=None):
                                line.replace(chr(96), ""), re.I)]
         dictionary = descriptions or {}
         if column in dictionary and dictionary[column] is None:
+            ambiguous_clocks.add(column)
             continue
         evidence = set()
         phrases = {"start": r"start of (?:the |an? )?hour|hour start|начал[оуа] (?:каждого )?часа",
@@ -566,6 +574,8 @@ def _hour_clock(table, task_text, descriptions=None):
                 evidence.add(mentioned[0])
         if len(evidence) == 1 and "uncertain" not in evidence:
             clocks[column] = evidence.pop()
+        elif evidence or column in dictionary or table.comments.get(column) or scoped:
+            ambiguous_clocks.add(column)
     # Prefer the published interval end when both bounds are present.
     for mode in ("end", "start"):
         matches = [col for col, value in clocks.items() if value == mode]
@@ -574,10 +584,11 @@ def _hour_clock(table, task_text, descriptions=None):
         if matches:
             break
     generic = [c for c in table.columns if c.lower() in _GENERIC_HOUR_COLUMNS]
-    if len(generic) == 1:
+    if len(generic) == 1 and generic[0] not in ambiguous_clocks and (
+            table.name.lower() in _HOURLY_TABLES or "hour" in generic[0].lower()):
         return generic[0], "start"
     composite_time = [c for c in table.primary_key if "timestamp" in table.column_types.get(c, "")]
-    if len(table.primary_key) == 2 and len(composite_time) == 1:
+    if len(table.primary_key) == 2 and len(composite_time) == 1 and composite_time[0] not in ambiguous_clocks:
         return composite_time[0], "start"
     return None, None
 
@@ -646,6 +657,7 @@ def _temporal_field(table, col):
 
 
 def _plan_relation(table, train, test, identifier, train_only, task_text, descriptions=None, bridges=None):
+    from leak_audit import restricted_inputs
     common = set(train.columns).intersection(test.columns)
     name = table.name.lower()
     if (table in (train, test) or "submission" in name or
@@ -653,6 +665,10 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
         return None
     if name == "data_dictionary":
         raise ValueError("словарь метаданных")
+    restrictions = restricted_inputs(task_text, [table.name, f"{table.schema}.{table.name}",
+                                                 *[f"{table.name}.{c}" for c in table.columns]])
+    if table.name in restrictions or f"{table.schema}.{table.name}" in restrictions:
+        raise ValueError("task.md does not establish safe availability for the source")
     hour_col, mode = _hour_clock(table, task_text, descriptions)
     names = {c.lower() for c in table.columns}
     hourly = bool(hour_col or name in _HOURLY_TABLES or "hourly" in name or
@@ -706,10 +722,18 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
     for c in table.columns:
         low = c.lower()
         if (c == right or c == hour_col or c == publication or low in _START_NAMES | _END_NAMES or
-                _temporal_field(table, c) or
+                _temporal_field(table, c) or f"{table.name}.{c}" in restrictions or
                 any(re.search(rf"(?:^|_){re.escape(term)}(?:_|$)", low) for term in blocked)
                 or table.column_types.get(c, "").lower() in unsupported_types):
             continue
+        if not hourly:
+            if re.search(r"(?:^|_)(?:count|sum|last|score)(?:_|$)", low):
+                continue
+            if mode == "profile" and hour_col.lower() in {"created_at", "creation_time"}:
+                immutable = re.search(r"\b(?:immutable|fixed at creation)\b|неизменяем", table.comments.get(c, ""), re.I)
+                stable = re.search(r"(?:^|_)(?:gender|sex|birth_year|category|type)(?:_|$)", low)
+                if not (immutable or stable):
+                    continue
         values.append(c)
     if not values:
         raise ValueError("нет доступных признаков")
@@ -742,12 +766,19 @@ parse_event_datetime = to_utc_naive
 
 def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication=None, *, coalesce=False):
     """Validate keys after normalisation, before any train/test rows are touched."""
+    auxiliary = auxiliary.reset_index(drop=True)
     lookup = auxiliary[values].add_prefix(prefix).copy()
     payload = list(lookup)
     lookup["__entity"] = auxiliary[right].astype("string")
     lookup = lookup.loc[lookup["__entity"].notna() & lookup["__entity"].str.strip().ne("")].copy()
     if not hour_col:
-        lookup[prefix + "profile_count"] = lookup.groupby("__entity", sort=False)["__entity"].transform("size")
+        repeated = lookup["__entity"].duplicated(keep=False)
+        if repeated.any():
+            # A current snapshot cannot tell which conflicting version was visible.
+            dup = lookup.loc[repeated]
+            for column in payload:
+                unique = dup.groupby("__entity", sort=False)[column].transform("nunique", dropna=False)
+                lookup.loc[unique.index[unique.gt(1)], column] = None
         return lookup.drop_duplicates("__entity", keep="last").set_index("__entity")
     stamps = to_utc_naive(auxiliary.loc[lookup.index, hour_col])
     if mode == "profile":
@@ -768,10 +799,12 @@ def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publicatio
         lookup = lookup.drop_duplicates()
         repeated = lookup.duplicated(keys, keep=False)
         if repeated.any():
+            if publication:
+                raise ValueError("conflicting revisions with publication clocks require version history")
             lookup.loc[repeated, payload] = None
             lookup = lookup.sort_values("__available").drop_duplicates(keys, keep="last")
     if lookup.duplicated(keys).any():
-        raise ValueError("Duplicated hourly key")
+        raise ValueError("неуникальный почасовой ключ")
     numeric = {}
     for c in payload:
         values = pd.to_numeric(lookup[c], errors="coerce")
@@ -793,22 +826,54 @@ def _hour_features(grid, entities, events):
     total = count = None
     floor = events.dt.floor("h")
     latest_end = floor.where(floor.ne(events), floor - pd.Timedelta(hours=1))
-    for offset in range(6):
+    delayed = (grid["__available"].to_numpy() != grid.index.get_level_values(1).to_numpy()).any()
+    for offset in range(168 if delayed else 6):
         end = latest_end - pd.Timedelta(hours=offset)
         block = grid.reindex(pd.MultiIndex.from_arrays([entities, end])).reset_index(drop=True)
         available = block.pop("__available").lt(events.reset_index(drop=True))
-        values = block.where(available, axis=0).to_numpy(dtype="float32")
+        values = block.where(available, axis=0).to_numpy(dtype="float64")
         if total is None:
             total = np.zeros_like(values)
-            count = np.zeros(values.shape, dtype=np.uint8)
-        total += np.nan_to_num(values)
-        count += np.isfinite(values)
+            count = np.zeros(values.shape, dtype=np.uint16)
+        finite = np.isfinite(values)
+        total += np.where(finite, values, 0)
+        count += finite
         if offset < 3:
             outputs.update({f"{col}__lag{offset+1}h": values[:, j] for j, col in enumerate(block)})
-        if offset in (2, 5):
+        if offset in (2, 5, 23, 167):
             means = np.divide(total, count, out=np.full_like(total, np.nan), where=count > 0)
             outputs.update({f"{col}__mean{offset+1}h": means[:, j] for j, col in enumerate(block)})
+    if not delayed:
+        outputs.update(_hour_rollups(grid, entities, latest_end))
+    for col in grid.columns.drop("__available"):
+        outputs[f"{col}__delta1_3h"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__lag3h"]
+        outputs[f"{col}__dev7d"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__mean168h"]
     return pd.DataFrame(outputs)
+
+
+def _hour_rollups(grid, entities, latest_end):
+    cols = grid.columns.drop("__available")
+    windows = {24: np.full((len(entities), len(cols)), np.nan), 168: np.full((len(entities), len(cols)), np.nan)}
+    for key, positions in pd.Series(np.arange(len(entities))).groupby(entities.reset_index(drop=True)):
+        try:
+            rows = grid.xs(key).sort_index()
+        except KeyError:
+            continue
+        rows = rows.loc[rows.index == rows.index.floor("h"), cols]
+        stamps = rows.index.to_numpy()
+        values = rows.to_numpy(dtype="float64")
+        finite = np.isfinite(values)
+        sums = np.vstack([np.zeros(len(cols)), np.where(finite, values, 0).cumsum(axis=0)])
+        counts = np.vstack([np.zeros(len(cols)), finite.cumsum(axis=0)])
+        idx = positions.to_numpy()
+        end = latest_end.iloc[idx].to_numpy()
+        right = np.searchsorted(stamps, end, side="right")
+        for width, target in windows.items():
+            left = np.searchsorted(stamps, end - np.timedelta64(width - 1, "h"))
+            n = counts[right] - counts[left]
+            target[idx] = np.divide(sums[right] - sums[left], n, out=np.full(n.shape, np.nan),
+                                    where=(n > 0) & pd.notna(end)[:, None])
+    return {f"{col}__mean{width}h": table[:, i] for width, table in windows.items() for i, col in enumerate(cols)}
 
 
 def _join_chunk(events, lookup, left, event_col, audit=None):
@@ -854,6 +919,88 @@ def _join_chunk(events, lookup, left, event_col, audit=None):
     return pd.concat([events, aligned], axis=1)
 
 
+def _audit_lookup(samples, lookup, left, event_col, budget, source_name):
+    from leak_audit import audit_log, check_equal, replay_payload
+
+    events, expected = (pd.concat(part, ignore_index=True) for part in zip(*samples))
+    if not event_col:
+        audit_log("pass", source_name, features=list(expected), rule="static payload; ambiguous versions masked")
+        return
+    with budget.check(source_name) as check_time:
+        times = to_utc_naive(events[event_col])
+        keys = events[left].astype("string")
+        raw = pd.DataFrame(lookup)
+        grid = lookup.attrs.get("grid")
+        payload = [col for col in raw if not col.startswith("__")]
+        # Independent per-event truncation via strict lower bounds on each entity's releases.
+        positions = np.full(len(events), -1, dtype=int)
+        future = np.full(len(events), -1, dtype=int)
+        by_key = raw.groupby("__entity", sort=False).indices
+        for key, idx in pd.Series(np.arange(len(events))).groupby(keys, sort=False):
+            src = by_key.get(key)
+            if src is None:
+                continue
+            ids = idx.to_numpy()
+            stamp = times.iloc[ids].to_numpy()
+            at = np.searchsorted(raw.iloc[src]["__available"].to_numpy(), stamp, side="left")
+            before = (at > 0) & pd.notna(stamp)
+            after = (at < len(src)) & pd.notna(stamp)
+            positions[ids[before]] = src[at[before] - 1]
+            future[ids[after]] = src[at[after]]
+        raw = raw.reset_index(drop=True)
+        visible_rows = raw.reindex(positions).reset_index(drop=True)
+        check_equal(expected[payload], visible_rows[payload])
+        # Give every query its own key and noisy suffix. A backward lookup only
+        # needs the records immediately to either side of the release boundary.
+        withheld = raw.reindex(future).reset_index(drop=True)
+        for column in payload:
+            values = pd.to_numeric(withheld[column], errors="coerce")
+            with_numeric = pd.api.types.is_numeric_dtype(visible_rows[column])
+            withheld[column] = (values.fillna(0.) + 987654.321 if with_numeric else "audit future payload")
+        synthetic = pd.Series(np.arange(len(events)), dtype="string")
+        visible_rows["__entity"] = synthetic
+        withheld["__entity"] = synthetic
+        changed = pd.concat([visible_rows, withheld], ignore_index=True).dropna(subset=["__available"])
+        changed = changed.sort_values("__available", kind="stable")
+        query = pd.DataFrame({left: synthetic, event_col: times})
+        replay = _join_chunk(query, changed, left, event_col)
+        check_equal(expected[payload], replay[payload])
+        if grid is not None:
+            columns = grid.columns.drop("__available")
+            latest = (times - pd.Timedelta(nanoseconds=1)).dt.floor("h").to_numpy()
+            values = np.full((168, len(times), len(columns)), np.nan)
+            corrupted = np.full_like(values, np.nan)
+            for offset in range(-2, 168):
+                if offset % 24 == 0:
+                    check_time()
+                index = pd.MultiIndex.from_arrays([keys, latest - np.timedelta64(offset, "h")])
+                rows = grid.reindex(index)
+                args = (rows[columns].to_numpy(dtype=float), rows["__available"].to_numpy(), times.to_numpy())
+                dirty = replay_payload(*args, corrupt_future=True)
+                if offset >= 0:
+                    values[offset] = replay_payload(*args, corrupt_future=False)
+                    corrupted[offset] = dirty
+                elif np.isfinite(dirty).any():
+                    from leak_audit import LeakAuditError
+                    raise LeakAuditError("unfinished grid hour was visible")
+            for replay in (values, corrupted):
+                for i, column in enumerate(columns):
+                    history = replay[:, :, i]
+                    check_columns = {f"{column}__lag{lag}h": history[lag-1] for lag in (1, 2, 3)}
+                    for width in (3, 6, 24, 168):
+                        finite = np.isfinite(history[:width])
+                        count = finite.sum(axis=0)
+                        total = np.where(finite, history[:width], 0).sum(axis=0)
+                        check_columns[f"{column}__mean{width}h"] = np.divide(
+                            total, count, out=np.full(len(times), np.nan), where=count > 0)
+                    check_columns[f"{column}__delta1_3h"] = history[0] - history[2]
+                    check_columns[f"{column}__dev7d"] = history[0] - check_columns[f"{column}__mean168h"]
+                    check_equal(expected[list(check_columns)], pd.DataFrame(check_columns))
+    audit_log("pass", source_name, features=list(expected), rows=len(events),
+              rule="release < event", cutoffs=int(times.nunique()),
+              checks=["per_row_asof", "truncated_source", "per_cutoff_corrupted_source"])
+
+
 def _read_lookup(conn, table, cols, deadline, *, hourly=False):
     import time
     from postgres_loader import _fetch_size, _identifier, _relation, _remaining, _set_timeout
@@ -862,8 +1009,8 @@ def _read_lookup(conn, table, cols, deadline, *, hourly=False):
     fields = ", ".join(map(_identifier, cols))
     order = ""
     if not hourly:
-        # PostgreSQL has no implicit row order. Ties without version times use a reproducible last profile.
-        order = " ORDER BY " + ", ".join(map(_identifier, table.primary_key or cols))
+        fields_in_order = list(dict.fromkeys([*cols, *table.primary_key]))
+        order = " ORDER BY " + ", ".join(map(_identifier, fields_in_order))
     query = f"SELECT {fields} FROM {_relation(table)}{order} LIMIT {_AUX_ROW_LIMIT + 1}"
     # Hourly district series contain over 500k rows per source. Load one at a time.
     memory_limit = 1024**3 if hourly else _AUX_MEMORY_LIMIT
@@ -894,12 +1041,13 @@ def _read_lookup(conn, table, cols, deadline, *, hourly=False):
 
 
 def enrich_postgres(conn, tables, train, test, id_column, target_column, task_text,
-                    output_dir, deadline=None, log=print, on_audit=None):
+                    output_dir, deadline=None, log=print, on_audit=None, replay=None, event_counts=None):
     """Add checked dimensions to the one-time CSV snapshot shared by all experiments."""
     import os
     import shutil
     import tempfile
     import time
+    from leak_audit import sample_positions
 
     output_dir = Path(output_dir)
     train_only = (set(train.columns) - set(test.columns)) | {target_column}
@@ -945,7 +1093,7 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                 detail["bridge_column"] = via
             cols = [right] + ([hour_col] if hour_col else []) + ([publication] if publication else []) + values
             with conn.transaction():
-                auxiliary = _read_lookup(conn, table, cols, deadline, hourly=bool(hour_col))
+                auxiliary = _read_lookup(conn, table, cols, deadline, hourly=mode in ("start", "end"))
             if (mode == "start" and hour_col.lower() in _GENERIC_HOUR_COLUMNS and
                     hour_col not in table.primary_key and table.name.lower() not in _HOURLY_TABLES and
                     not descriptions.get(hour_col) and not table.comments.get(hour_col) and not publication and
@@ -961,6 +1109,7 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
             payload = [c for c in lookup if not c.startswith("__")]
             del auxiliary
             splits = {}
+            samples = []
             with tempfile.TemporaryDirectory(dir=output_dir) as staging:
                 for name in ("train.csv", "test.csv"):
                     stats = {"rows": 0, "matched_rows": 0, "missing_key_rows": 0}
@@ -968,6 +1117,7 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                         stats["feature_nonmissing"] = dict.fromkeys(payload, 0)
                     splits[Path(name).stem] = stats
                     dest = Path(staging) / name
+                    chosen = sample_positions(event_counts[Path(name).stem]) if replay and event_counts else None
                     with pd.read_csv(output_dir / name, dtype=str, keep_default_na=False,
                                      encoding="utf-8-sig", chunksize=_EVENT_CHUNK_ROWS) as chunks:
                         for i, events in enumerate(chunks):
@@ -977,7 +1127,13 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                             if (not joined.index.equals(events.index) or
                                     (id_column in events and not joined[id_column].equals(events[id_column]))):
                                 raise ValueError("изменились строки событий")
+                            if chosen is not None and len(events):
+                                ids = chosen[(chosen >= events.index[0]) & (chosen <= events.index[-1])]
+                                if len(ids):
+                                    samples.append((events.loc[ids], joined.loc[ids, joined.columns.difference(events.columns, sort=False)]))
                             joined.to_csv(dest, index=False, mode="a", header=(i == 0), encoding="utf-8")
+                if replay and samples:
+                    _audit_lookup(samples, lookup, left, event_col, replay, detail["table"])
                 # Preserve the original inode until both compatible exports are installed.
                 train_path = output_dir / "train.csv"
                 original = Path(staging) / "original-train.csv"
@@ -998,7 +1154,8 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                     f", {mode} clock {hour_col} -> {event_col}" if hour_col else ", one profile per key")
             extra = f", additional profile rows={duplicate_rows}" if mode not in ("start", "end") else ""
             counts = ", ".join(f"{split}={stats['matched_rows']}/{stats['rows']}" for split, stats in splits.items())
-            selection = "latest version strictly before event" if mode == "profile" else "last profile in SQL order"
+            selection = ("latest version strictly before event" if mode == "profile"
+                         else "deterministic key/payload order; conflicting values masked")
             profile = f", selection={selection}" if mode not in ("start", "end") else ""
             log(f"JOIN {table.schema}.{table.name}: {left} -> {right}{rule}{extra}{profile}, {counts}, "
                 f"rows_and_ids_preserved=True, source_features={values!r}")

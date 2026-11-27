@@ -17,6 +17,45 @@ from solution import ResearchModel, parse_model_object, serve_research_model
 from training import _past_encoding, train_and_predict
 
 
+def test_audited_search_crosses_completed_feature_bundles_with_seeds_and_parameters():
+    history = [
+        {"complete": True, "recipe": "single", "score": 3., "greater_is_better": False,
+         "config": {"model": "catboost", "event_activity": True}},
+        {"complete": True, "recipe": "single", "score": 4., "greater_is_better": False,
+         "config": {"model": "catboost", "causal_history": True}},
+        {"complete": False, "recipe": "single", "score": 2., "greater_is_better": False,
+         "config": {"model": "catboost", "log_target": True}},
+    ]
+    options = list(solution.audited_search_options(history, "catboost", {"auto_features": True}, (42, 101, 263)))
+    assert len(options) == 15
+    assert [row["seed"] for row in options if row.get("event_activity") and "seed" in row] == [42, 101, 263]
+    assert all(not row.get("log_target") for row in options)
+    assert len([row for row in options if "params" in row]) == 6
+
+
+def test_audited_search_runs_interleaved_queues_through_tuning(monkeypatch, tmp_path):
+    spec = {"audit_required": True, "metric": "mae", "available_backends": ["catboost", "xgboost"]}
+    history = [{"complete": True, "recipe": "single", "score": 3., "greater_is_better": False,
+                "config": {"model": "catboost", "event_activity": True}}]
+    trials = []
+
+    def train(directory, task, deadline, budget, config, *, estimate):
+        trials.append(config)
+        return {"complete": True, "fit_time": 22.}
+
+    monkeypatch.setattr(pipeline, "experiment_history", lambda _: history)
+    monkeypatch.setattr(solution, "run_trial", train)
+    result = solution.search_remaining_budget(tmp_path, spec, monotonic() + 5000,
+                                              {"fit_time": 20.}, {"auto_features": True}, set())
+    assert result["reason"] == "queue_exhausted"
+    assert result["completed"] == len(trials)
+    assert trials[0]["model"] == "catboost" and trials[1]["model"] == "xgboost"
+    for model in spec["available_backends"]:
+        family = [entry for entry in trials if entry["model"] == model and entry.get("event_activity")]
+        assert {entry["seed"] for entry in family if "seed" in entry} == {42, 101, 263}
+        assert len([entry for entry in family if "params" in entry]) == 2
+
+
 def test_duplicate_threshold_includes_split_column():
     train = pd.DataFrame({"x": [0., 2.], "period": [3, 4]})
     test = pd.DataFrame({"x": [-0.] * 1000, "period": [3] * 50 + [9] * 950})

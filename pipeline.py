@@ -6,6 +6,7 @@ import os
 import sys
 import shutil
 import tempfile
+import time
 from contextvars import ContextVar
 from itertools import chain, combinations
 
@@ -23,7 +24,8 @@ output_directory = ContextVar("output_directory", default=None)
 
 # Ключи конфига, которые имеют смысл для всего рецепта auto, а не для одной модели
 AUTO_KEYS = ("features", "cat_encoding", "target_encoding", "refit_full", "entity_history", "log_target",
-             "ad_history", "ad_history_window", "ad_history_smoothing")
+             "ad_history", "ad_history_window", "ad_history_smoothing", "event_activity", "causal_history",
+             "history_window", "history_smoothing", "mae_shift", "recency_days", "mae_objective")
 
 
 def apply_feature_code(feature_code, X_train, X_test):
@@ -89,11 +91,30 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         X_train, X_test = apply_feature_code(feature_code, X_train, X_test)
     y_train = data["y_train"].reset_index(drop=True)
     cfg = dict(config or {})
+    audited = task_spec.get("audit_required", False)
+    if audited and temporal and any(cfg.get(key) for key in ("target_encoding", "entity_history", "ad_history")):
+        return {"skipped": "leak_audit_failed: temporal configuration uses an uncertified legacy feature group"}
+    hourly_extended = bool(cfg.pop("hourly_extended", False))
+    hourly_columns = [name for name in X_train if name.endswith(("__mean24h", "__mean168h", "__delta1_3h", "__dev7d"))]
+    if audited and not hourly_extended:
+        X_train, X_test = X_train.drop(columns=hourly_columns), X_test.drop(columns=hourly_columns)
     auto_features = bool(cfg.pop("auto_features", False))
     if auto_features:
         from features import add_auto_features, important_numeric
         priority = None if temporal else important_numeric(X_train, y_train, task_type)
-        X_train, X_test = add_auto_features(X_train, X_test, priority, row_local=temporal)
+        if audited and not temporal:
+            return {"skipped": "leak_audit_failed: automated transforms require a time split"}
+        transformed = add_auto_features(X_train, X_test, priority, row_local=temporal)
+        if audited:
+            from leak_audit import AuditBudget, audit_log, check_equal, sample_positions
+            a, b = sample_positions(len(X_train)), sample_positions(len(X_test))
+            with AuditBudget().check("calendar"):
+                replayed = add_auto_features(X_train.iloc[a], X_test.iloc[b], row_local=True)
+                check_equal(transformed[0].iloc[a], replayed[0])
+                check_equal(transformed[1].iloc[b], replayed[1])
+            audit_log("pass", "calendar", features=[c for c in transformed[0] if c not in X_train],
+                      rule="current event values only", rows=len(a)+len(b))
+        X_train, X_test = transformed
 
     # Фолды одинаковые во всех экспериментах, иначе скоры несравнимы: агент их не меняет.
     # Разбиение группами включается само, если test похож на новый период
@@ -129,7 +150,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     for key in ("num_threads", "nthread", "thread_count", "n_jobs"):
         if key in cfg["params"]:
             cfg["params"][key] = 8
-    fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": 8, "split": split}
+    fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": 8, "split": split, "audit_required": audited}
 
     if task_spec.get("label_delay_unit"):
         fixed["label_delay_unit"] = task_spec["label_delay_unit"]
@@ -148,9 +169,10 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         "task_spec": task_spec, "recipe": recipe, "feature_code": feature_code,
         "auto_features": auto_features, "target_encoding": target_encoding or False, "te_keys": te_specs,
         "split": split, "members": result.get("members"),
-        "config": {k: v for k, v in cfg.items() if k != "features"},
+        "config": {k: v for k, v in cfg.items() if k != "features"} | {
+            "auto_features": auto_features, "hourly_extended": hourly_extended},
     }
-    report["feature_candidates"] = result.get("feature_candidates", {})
+    report["feature_candidates"] = result.get("feature_candidates", {}) | {"hourly_extended": bool(hourly_columns)}
     if "auto_stop" in result:
         report["auto_stop"] = result["auto_stop"]
     return _record(task_dir, task_spec, data, history, result, report)
@@ -199,6 +221,12 @@ def _record(task_dir, task_spec, data, history, result, report):
                 better = candidate_wins and complete and (report.get("recipe") != "ensemble" or blend_improves)
         if report.get("config", {}).get("ad_history"):
             better = bool(better and same_folds and comparison["n_better"] > n_folds / 2)
+        if task_spec.get("audit_required") and report.get("recipe") == "ensemble" and task_spec["metric"] == "pr_auc":
+            better = bool(complete and comparison and comparison["n_better"] > n_folds / 2
+                          and comparison["diff_mean"] > 0 and _beats_fold_baselines(result["fold_scores"], baselines, greater))
+        if task_spec.get("audit_required") and any(report.get("config", {}).get(key)
+                                                  for key in ("event_activity", "causal_history", "auto_features", "hourly_extended")):
+            better = bool(better and comparison and comparison["n_better"] > n_folds / 2)
     # Предсказания завершенных экспериментов храним на диске: в конце их можно смешать
     preds_file = None
     if complete and "fold_ids" in result:
@@ -225,7 +253,7 @@ def _record(task_dir, task_spec, data, history, result, report):
         "greater_is_better": result["greater_is_better"], "complete": complete, "n_folds_done": n_folds_done,
         "saved": better and not problems, "problems": problems,
         "best_saved_score": result["score"] if better and not problems else (previous["score"] if previous else None),
-        "vs_saved": comparison and {k: comparison[k] for k in ("accept", "diff_mean", "diff_std", "n_better")},
+        "vs_saved": comparison and {k: comparison[k] for k in ("accept", "diff_mean", "diff_std", "n_better", "diffs")},
         "fold_signature": signature, "fold_windows": result["config"].get("fold_windows", []),
         "fit_time": result["fit_time"], "preds_file": preds_file, "class_order": result["class_order"],
     }
@@ -256,6 +284,15 @@ def _record(task_dir, task_spec, data, history, result, report):
     else:
         staged_history.replace(history_file)
     history.append(report)
+    if task_spec.get("audit_required") and report["saved"] and comparison:
+        rules = {"auto_features": "current event values only",
+                 "event_activity": "only registrations strictly before the event",
+                 "causal_history": "only fit-fold labels available strictly before the event",
+                 "hourly_extended": "interval end and recorded publication both strictly before the event"}
+        groups = {key: value for key, value in rules.items() if report.get("config", {}).get(key)}
+        if groups:
+            print("FEATURE_ACCEPTED " + json.dumps({"groups": groups, "per_fold_gain": comparison["diffs"]}),
+                  file=sys.stderr, flush=True)
     return report
 
 
@@ -313,7 +350,7 @@ def _write_submission(output_path, task_spec, data, result):
     )
 
 
-def run_ensemble(task_dir, task_spec, max_members=8):
+def run_ensemble(task_dir, task_spec, max_members=8, *, time_budget=None):
     """Смесь лучших завершенных экспериментов: разные наборы признаков ошибаются по-разному.
 
     Фолды у всех экспериментов одинаковые, поэтому OOF смешиваются честно; веса подбираются
@@ -328,7 +365,33 @@ def run_ensemble(task_dir, task_spec, max_members=8):
     if len(candidates) < 2:
         raise ValueError("Для ансамбля нужно хотя бы два завершенных эксперимента.")
     greater = candidates[0]["greater_is_better"]
-    candidates = sorted(candidates, key=lambda h: h["score"], reverse=greater)[:max_members]
+    ranked = sorted(candidates, key=lambda h: h["score"], reverse=greater)
+    candidates = ranked[:max_members]
+    audited = task_spec.get("audit_required")
+    original_count = len(candidates)
+    deadline = time.monotonic() + time_budget if time_budget is not None else float("inf")
+
+    def diversity(member):
+        config = member["config"]
+        return config.get("model"), tuple(key for key in ("auto_features", "event_activity", "causal_history", "hourly_extended")
+                                          if config.get(key))
+
+    diverse_pool = list(range(min(original_count, 6)))
+    if audited:
+        for model in task_spec.get("available_backends", ()):
+            signatures = set()
+            for member in ranked:
+                backend, features = diversity(member)
+                if backend != model or features in signatures:
+                    continue
+                signatures.add(features)
+                if member not in candidates:
+                    candidates.append(member)
+                position = candidates.index(member)
+                if position not in diverse_pool:
+                    diverse_pool.append(position)
+                if len(signatures) == 2:
+                    break
 
     data = load_data(task_dir, task_spec)
     is_regression = task_spec["task_type"] == "regression"
@@ -353,17 +416,39 @@ def run_ensemble(task_dir, task_spec, max_members=8):
         })
     y = data["y_train"].reset_index(drop=True)
     metric = task_spec["metric"]
-    result = optimize_blend_weights(results, y, metric)
+    started = time.monotonic()
+    result = optimize_blend_weights(results[:original_count], y, metric)
+    pair_estimate = max(.25, (time.monotonic() - started) / 8)
     incumbent = next((h for h in reversed(history) if h["saved"]), None)
-    if incumbent and incumbent.get("fold_baselines") and not _beats_fold_baselines(
-            incumbent["fold_scores"], incumbent["fold_baselines"], greater):
+    chosen = None
+    if incumbent and incumbent.get("fold_baselines") and (audited or not _beats_fold_baselines(
+            incumbent["fold_scores"], incumbent["fold_baselines"], greater)):
         # Equal-weight pairs offer complementary rankings with no fitted weights.
         # Compare them only on the same temporal folds and require majority improvement.
         incumbent_stats = {k: incumbent[k] for k in ("fold_scores", "greater_is_better")}
         strongest = None
-        fixed_pairs = ((pair, blend_results([results[i] for i in pair], y, metric))
-                       for pair in combinations(range(len(results)), 2))
-        for pair, candidate in chain([(None, result)], fixed_pairs):
+        def diversified(members):
+            signatures = [diversity(candidates[i]) for i in members]
+            backends, features = zip(*signatures)
+            return all(backends) and len(set(backends)) == len(members) and len(set(features)) > 1
+
+        if audited:
+            sets = chain.from_iterable(combinations(diverse_pool, width) for width in (2, 3))
+            sets = (members for members in sets if diversified(members))
+        else:
+            sets = combinations(range(len(results)), 2)
+        def fixed_candidates():
+            nonlocal pair_estimate
+            for members in sets:
+                if time.monotonic() + 1.3 * pair_estimate + 3. > deadline:
+                    break
+                began = time.monotonic()
+                candidate = blend_results([results[i] for i in members], y, metric)
+                pair_estimate = max(.05, time.monotonic() - began, .8 * pair_estimate)
+                yield members, candidate
+
+        fixed = fixed_candidates()
+        for pair, candidate in chain([(None, result)], fixed):
             if not _beats_fold_baselines(candidate["fold_scores"], incumbent["fold_baselines"], greater):
                 continue
             comparison = compare_results(incumbent_stats, {"fold_scores": candidate["fold_scores"]})
@@ -374,8 +459,9 @@ def run_ensemble(task_dir, task_spec, max_members=8):
         if strongest is not None:
             _, pair, result = strongest
             if pair is not None:
-                candidates = [candidates[i] for i in pair]
-                result["config"]["blend_type"] = "equal_pair_beats_all_baselines"
+                chosen = [candidates[i] for i in pair]
+                result["config"]["blend_type"] = "equal_pair_beats_all_baselines" if len(pair) == 2 else "equal_triple"
+    candidates = chosen if chosen is not None else candidates[:original_count]
     if result.get("predictions") is None and result.get("probabilities") is not None:
         # Лучшей оказалась одиночная модель из файла: метки восстанавливаем из вероятностей
         order = np.asarray(result["class_order"], dtype=object)
@@ -530,13 +616,18 @@ def check_result(task_dir, task_spec=None):
 
 
 if __name__ == "__main__":
+    from leak_audit import LeakAuditError
+
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
     args = json.load(sys.stdin.buffer)
     output_directory.set(args.pop("output_dir", None))
     receipt_directory.set(args.pop("receipt_dir", None))
-    if args["recipe"] == "ensemble":
-        report = run_ensemble(Path.cwd(), args["task_spec"])
-    else:
-        report = run_experiment(Path.cwd(), **args)
+    try:
+        if args["recipe"] == "ensemble":
+            report = run_ensemble(Path.cwd(), args["task_spec"], time_budget=args["time_budget"])
+        else:
+            report = run_experiment(Path.cwd(), **args)
+    except LeakAuditError as exc:
+        report = {"skipped": f"leak_audit_failed: {exc}"}
     print(json.dumps(report, ensure_ascii=False, default=str), flush=True)

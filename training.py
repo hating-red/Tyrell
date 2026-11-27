@@ -220,6 +220,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ad_history": False,
     "ad_history_window": 20,
     "ad_history_smoothing": 20.,
+    "audit_required": False,
+    "event_activity": False,
+    "causal_history": False,
+    "history_window": 64,
+    "history_smoothing": 24.,
+    "recency_days": None,
+    "mae_objective": "l1",
+    "mae_shift": False,
     "profile_categories": False,
     "label_delay_unit": None,     # duration target from event time until the label is known
     "refit_full": False,          # дообучить модель на всем train и усреднить с моделями фолдов
@@ -227,6 +235,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _ROUND_KEYS = ("n_estimators", "num_iterations", "num_boost_round", "iterations", "num_rounds")
 _MIN_ROUNDS = 20                  # меньше этого по бюджету времени не урезаем
+_AUDITED_CAT_ONE_HOT = 32
 _TE_SMOOTHING = 2.0               # сглаживание среднего по ключу к общему среднему, «виртуальных строк»
 _TE_INNER_FOLDS = 5               # внутренние фолды для кодирования строк обучающей части
 _REFIT_ROUNDS = 1.15              # на всем train раундов больше, чем в среднем на фолде: данных больше
@@ -273,6 +282,14 @@ def _check_backend(name: str) -> str:
             logger.warning("Библиотека %s недоступна, откат на LightGBM", backend)
             return "lightgbm"
     return backend
+
+
+def backend_available(name):
+    try:
+        importlib.import_module(name)
+    except (ImportError, OSError):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +583,11 @@ def _lgb_params(task_type, metric, n_classes, cfg):
     }
     if task_type == "regression":
         objective = {"mae": "l1", "mape": "mape"}.get(metric.name, "regression")
-        params.update(objective=objective, metric="l1" if objective == "l1" else "l2")
+        if metric.name == "mae":
+            objective = cfg.get("mae_objective", "l1")
+            if objective == "quantile":
+                params["alpha"] = .5
+        params.update(objective=objective, metric="l1" if metric.name == "mae" else "l2")
     elif task_type == "binary":
         params.update(objective="binary", metric="average_precision" if metric.name == "pr_auc" else "binary_logloss")
     else:
@@ -622,7 +643,11 @@ def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg
     }
     if task_type == "regression":
         if metric.name == "mae":
-            params.update(objective="reg:absoluteerror", eval_metric="mae")
+            objective = cfg.get("mae_objective", "l1")
+            params.update(objective={"l1": "reg:absoluteerror", "quantile": "reg:quantileerror",
+                                     "huber": "reg:pseudohubererror"}[objective], eval_metric="mae")
+            if objective == "quantile":
+                params["quantile_alpha"] = .5
         else:
             params.update(objective="reg:squarederror", eval_metric="rmse")
     elif task_type == "binary":
@@ -690,6 +715,10 @@ def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
     }
     if task_type == "regression":
         params["loss_function"] = "MAE" if metric.name == "mae" else "RMSE"
+        if metric.name == "mae":
+            params["loss_function"] = {"l1": "MAE", "quantile": "Quantile:alpha=0.5",
+                                       "huber": "Huber:delta=1.0"}[cfg.get("mae_objective", "l1")]
+            params["eval_metric"] = "MAE"
     elif task_type == "binary":
         params.update(loss_function="Logloss", class_names=[0, 1])
         if metric.name == "pr_auc" and np.unique(yva).size == 2:
@@ -697,6 +726,8 @@ def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
     else:
         params.update(loss_function="MultiClass", class_names=list(range(n_classes)))
     params.update(cfg["params"])
+    if cfg.get("audit_required") and (cfg.get("split") or {}).get("type") == "time":
+        params["one_hot_max_size"] = _AUDITED_CAT_ONE_HOT
 
     class TimeCallback:
         stopped = False
@@ -907,11 +938,18 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         Xp, Xtp = _to_catboost_frame(Xp, cat_cols), _to_catboost_frame(Xtp, cat_cols)
 
     def training_weights(indices):
-        if cfg["class_weight"] != "balanced" or task_type not in CLASSIFICATION:
-            return None
-        local = y_fit[indices]
-        counts = np.bincount(local, minlength=n_classes)
-        return len(local) / (n_classes * counts[local])
+        weights = None
+        if cfg["class_weight"] == "balanced" and task_type in CLASSIFICATION:
+            local = y_fit[indices]
+            counts = np.bincount(local, minlength=n_classes)
+            weights = len(local) / (n_classes * counts[local])
+        if cfg["recency_days"] and temporal and pd.api.types.is_datetime64_any_dtype(labeled_times):
+            when = labeled_times.iloc[indices]
+            age = (when.max() - when).dt.total_seconds().to_numpy()
+            decay = np.exp(np.maximum(-80., -age / (86400 * cfg["recency_days"])))
+            decay /= decay.mean()
+            weights = decay if weights is None else weights * decay
+        return weights
 
     if cfg["class_weight"] not in (None, "balanced"):
         logger.warning("class_weight=%r не поддерживается, игнорирую", cfg["class_weight"])
@@ -925,6 +963,9 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         if not temporal or task_type != "regression":
             raise ValueError("A duration label requires chronological regression")
         available_at = _label_available_at(labeled_times, y_fit, cfg["label_delay_unit"])
+    elif temporal and cfg["audit_required"]:
+        available_at = labeled_times
+    if available_at is not None:
         test_times = _time_values(X_test[split["column"]])
         if test_times.isna().any():
             raise ValueError("Missing test event time prevents a label-availability cutoff")
@@ -962,6 +1003,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     te_names = _te_columns(te_cols, te_Y.shape[1] + 1, te_periods is not None) if te_cols else []
 
     candidates = {"entity_history": [], "categorical_ids": []}
+    general_entities = []
+    datetime_clock = False
     ad_groups = {}
     probe_columns = []
     if temporal and clock in Xp:
@@ -969,6 +1012,10 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         first_fit, _, _ = _past_monitor(folds[0][0], labeled_times, y_fit, task_type, available_at)
         initial = Xp.iloc[first_fit]
         candidates = temporal_entity_candidates(initial, clock)
+        datetime_clock = pd.api.types.is_datetime64_any_dtype(initial[clock])
+        if datetime_clock:
+            from features import event_entities
+            general_entities = event_entities(initial, clock)
         if task_type == "binary" and metric_obj.name == "pr_auc" and pd.api.types.is_datetime64_any_dtype(initial[clock]):
             ad_groups = ad_history_keys(initial.columns)
         if cfg["profile_categories"] and metric_obj.name == "pr_auc" and task_type == "binary":
@@ -986,6 +1033,47 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         raise ValueError("categorical_ids requires native category encoding")
     if cfg["ad_history"] and not ad_groups:
         raise ValueError("Advertising histories require time-ordered PR-AUC data and user and ad keys")
+    if (cfg["event_activity"] or cfg["causal_history"]) and not datetime_clock:
+        raise ValueError("Point-in-time histories require a datetime event clock")
+    if cfg["causal_history"] and (not general_entities or task_type == "multiclass"):
+        raise ValueError("This task has no eligible keys or scalar target for supervised histories")
+    from leak_audit import AuditBudget, audit_log, sample_positions
+    from features import activity_reference, audit_event_kernel, causal_target_history, event_activity, history_reference
+
+    budget = AuditBudget()
+    if cfg["event_activity"] or cfg["causal_history"]:
+        query = pd.concat([Xp.iloc[sample_positions(len(Xp))], Xtp.iloc[sample_positions(len(Xtp))]], ignore_index=True)
+        key_columns = [clock, *general_entities]
+        query = query[key_columns]
+    if cfg["event_activity"]:
+        source = pd.concat([X[key_columns], X_test[key_columns]], ignore_index=True)
+        source[clock] = _time_values(source[clock])
+        if cfg["audit_required"]:
+            audit_event_kernel(lambda data, ask, _, __: event_activity(data, ask, clock, general_entities),
+                               source, source[clock], query, clock, "event_activity", budget=budget,
+                               reference=lambda data, ask, _, __: activity_reference(data, ask, clock, general_entities))
+        Xp = pd.concat([Xp, event_activity(source, Xp, clock, general_entities)], axis=1)
+        Xtp = pd.concat([Xtp, event_activity(source, Xtp, clock, general_entities)], axis=1)
+
+    def target_features(source, evaluation, observed, y):
+        return causal_target_history(source, evaluation, clock, observed, y, general_entities,
+                                     window=cfg["history_window"], smoothing=cfg["history_smoothing"],
+                                     median=metric_obj.name == "mae")
+
+    if cfg["causal_history"] and cfg["audit_required"]:
+        first_fit, _, _ = _past_monitor(folds[0][0], labeled_times, y_fit, task_type, available_at)
+        observed = (available_at if available_at is not None else labeled_times).iloc[first_fit]
+
+        def reference(source, evaluation, known, labels, *, corrupt_future=False):
+            return history_reference(source, evaluation, clock, known, labels, general_entities,
+                                     window=cfg["history_window"], smoothing=cfg["history_smoothing"],
+                                     median=metric_obj.name == "mae", corrupt_future=corrupt_future)
+
+        audit_event_kernel(target_features, Xp.iloc[first_fit][key_columns], observed, query, clock,
+                           "causal_history", labels=y_fit[first_fit], budget=budget, reference=reference,
+                           corrupted_reference=lambda *args: reference(*args, corrupt_future=True))
+    if cfg["audit_required"]:
+        audit_log("pass", "model_input", features=list(Xp.columns), rule="declared row values and audited transforms")
     category_probes = {c: [] for c in probe_columns}
     model_inputs = {}
     fold_diagnostics = []
@@ -1025,12 +1113,27 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                 from features import add_ad_history
                 Xtr, evaluation = add_ad_history(Xtr, evaluation, y_fit[tr_idx], clock, ad_groups,
                                                   window=cfg["ad_history_window"], smoothing=cfg["ad_history_smoothing"])
+            if cfg["causal_history"]:
+                observed = (available_at if available_at is not None else labeled_times).iloc[tr_idx]
+                target_frame = pd.concat([Xtr[[clock, *general_entities]], evaluation[[clock, *general_entities]]],
+                                         ignore_index=True)
+                derived = target_features(Xtr, target_frame, observed, y_fit[tr_idx])
+                Xtr = pd.concat([Xtr, derived.iloc[:len(Xtr)].set_axis(Xtr.index)], axis=1)
+                evaluation = pd.concat([evaluation, derived.iloc[len(Xtr):].set_axis(evaluation.index)], axis=1)
             if cfg["categorical_ids"]:
                 Xtr = Xtr.copy()
                 for col in candidates["categorical_ids"]:
                     Xtr[col] = Xtr[col].astype("category")
             Xtr, prepared, cats = _prepare_features(Xtr, evaluation, list(Xtr.columns), "native")
             if cfg["model"] == "catboost":
+                if cfg["audit_required"]:
+                    # Keep CatBoost from computing target statistics in a shuffled training order.
+                    # High-cardinality categories use only the fold's unlabeled vocabulary.
+                    ordinal = [col for col in cats if len(Xtr[col].cat.categories) >= _AUDITED_CAT_ONE_HOT]
+                    for col in ordinal:
+                        Xtr[col] = Xtr[col].cat.codes.astype("float32")
+                        prepared[col] = prepared[col].cat.codes.astype("float32")
+                    cats = [col for col in cats if col not in ordinal]
                 extra["cat_cols"] = cats
                 Xtr, prepared = _to_catboost_frame(Xtr, cats), _to_catboost_frame(prepared, cats)
             Xva, Xte = prepared.iloc[:len(va_idx)], prepared.iloc[len(va_idx):]
@@ -1223,6 +1326,12 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     # Финальные предсказания
     if task_type == "regression":
         predictions = _finalize_regression(test_pred, y_fit[refit_idx], clip)
+        if temporal and metric_obj.name == "mae" and cfg["mae_shift"] and len(done_folds) == len(folds):
+            adjusted, shifted_scores, shifts = causal_mae_shift(oof, y_fit, folds, labeled_times, available_at, test_cutoff)
+            if sum(a < b for a, b in zip(shifted_scores, fold_scores)) > len(fold_scores) / 2 and np.mean(shifted_scores) < np.mean(fold_scores):
+                oof, fold_scores = adjusted, shifted_scores
+                predictions = _finalize_regression(predictions + shifts[-1], y_fit[refit_idx], clip)
+                postprocess_info = {"type": "causal_mae_shift", "shifts": shifts}
         probabilities, class_order = None, None
     else:
         probabilities = test_pred
@@ -1249,12 +1358,14 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                             "train_max": str(latest), "validation_min": str(earliest)})
             if available_at is not None:
                 details = cutoff_details[i]
-                windows[-1].update(validation_cutoff=details["cutoff"].isoformat(), train_pending=details["train_pending"],
+                cutoff = details["cutoff"]
+                windows[-1].update(validation_cutoff=cutoff.isoformat() if isinstance(cutoff, pd.Timestamp) else str(cutoff),
+                                   train_pending=details["train_pending"],
                                    validation_pending_at_prediction=details["validation_pending_at_prediction"])
         if available_at is not None:
-            cfg["prediction_cutoff"] = test_cutoff.isoformat()
+            cfg["prediction_cutoff"] = test_cutoff.isoformat() if isinstance(test_cutoff, pd.Timestamp) else str(test_cutoff)
             cfg["observed_before_prediction"] = len(refit_idx)
-            cutoffs = pd.DatetimeIndex([d["cutoff"] for d in cutoff_details])
+            cutoffs = pd.Index([d["cutoff"] for d in cutoff_details])
             meta_known_from = np.full(len(labeled), len(cutoffs), dtype=np.int32)
             meta_known_from[labeled] = cutoffs.searchsorted(available_at, side="right")
         cfg["fold_windows"] = windows
@@ -1285,7 +1396,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "fold_scores_raw": [float(s) for s in fold_scores_raw],
         "fold_times": fold_times,
         "best_iterations": best_iters,
-        "feature_candidates": candidates | {"ad_history": bool(ad_groups)},
+        "feature_candidates": candidates | {"ad_history": bool(ad_groups), "event_activity": datetime_clock,
+                                            "causal_history": bool(general_entities) and task_type != "multiclass"},
         "model_inputs": model_inputs,
         "fold_diagnostics": fold_diagnostics,
         "category_probes": ({"smoothing_rows": 20, "source": "labels in model-fit prefix before monitor",
@@ -1295,6 +1407,26 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "postprocess": postprocess_info,
         "refit": refit_info,
     }
+
+
+def causal_mae_shift(oof, y, folds, times, available, test_cutoff):
+    """Fit each shift to residuals from previously observable validation labels."""
+    ready = available if available is not None else times
+    adjusted = oof.copy()
+    scores, shifts, seen = [], [], []
+    for _, val in folds:
+        eligible = np.asarray(seen, dtype=int)
+        eligible = eligible[ready.iloc[eligible].lt(times.iloc[val].min()).to_numpy()]
+        shift = float(np.median(y[eligible] - oof[eligible])) if len(eligible) else 0.
+        adjusted[val] += shift
+        shifts.append(shift)
+        scores.append(float(np.abs(y[val] - adjusted[val]).mean()))
+        seen.extend(val.tolist())
+    eligible = np.asarray(seen, dtype=int)
+    if test_cutoff is not None:
+        eligible = eligible[ready.iloc[eligible].lt(test_cutoff).to_numpy()]
+    shifts.append(float(np.median(y[eligible] - oof[eligible])) if len(eligible) else 0.)
+    return adjusted, scores, shifts
 
 
 def _fold_ids(folds: list, done_folds: list, labeled: np.ndarray) -> np.ndarray:
@@ -1791,16 +1923,21 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     # не видит: в OOF новых категорий не бывает. Поэтому при их заметной доле обходимся без него
     features = base.get("features") or list(X.columns)
     unseen = unseen_category_share(X[features], X_test[features])
-    use_xgb = max(unseen.values(), default=0.0) < _AUTO_UNSEEN_MAX
+    use_lgb = backend_available("lightgbm")
+    use_xgb = backend_available("xgboost") and max(unseen.values(), default=0.0) < _AUTO_UNSEEN_MAX
+    use_cat = backend_available("catboost")
     if not use_xgb:
         logger.warning("auto_train: в test новые категории %s, XGBoost не используем",
                        {k: round(v, 3) for k, v in unseen.items() if v >= _AUTO_UNSEEN_MAX})
 
     # Шаг 1: два бустинга с дефолтами, LightGBM первым как самый быстрый
-    run("lgb", {"model": "lightgbm"}, budget=0.4 * (remaining() - reserve()), force=True)
+    if use_lgb:
+        run("lgb", {"model": "lightgbm"}, budget=0.4 * (remaining() - reserve()), force=True)
+    elif use_cat:
+        run("catboost", {"model": "catboost"}, force=True)
     if use_xgb:
         run("xgb", {"model": "xgboost"})
-    if not members:
+    if not members and use_cat and use_lgb:
         run("catboost", {"model": "catboost"})
     if not members:
         raise RuntimeError("No boosting backend completed validation")
@@ -1809,9 +1946,9 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     # Шаг 2: сиды XGBoost и LightGBM, пока следующая модель укладывается в остаток
     task_final = next(iter(members.values()))["config"]["task_type"]
     queue = []
-    if task_final in CLASSIFICATION:
+    if use_lgb and task_final in CLASSIFICATION:
         queue.append(("lgb_balanced", {"model": "lightgbm", "class_weight": "balanced"}))
-    else:
+    elif use_lgb:
         y_num = pd.to_numeric(pd.Series(np.asarray(y)), errors="coerce").dropna()
         if len(y_num) and y_num.min() >= 0 and y_num.skew() > 1:
             # Тяжелый хвост: log1p-модель как кандидат в бленд, веса решат, нужна ли она
@@ -1821,7 +1958,8 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         for k in range(first, last):
             if use_xgb:
                 queue.append((f"xgb_seed{k + 1}", {"model": "xgboost", "seed": seed0 + k}))
-            queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
+            if use_lgb:
+                queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
 
     add_seeds(1, min(max_seeds, _AUTO_MAX_SEEDS))
     added = [run(name, extra) for name, extra in queue]
@@ -1839,14 +1977,15 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         slow = {"early_stopping_rounds": 300, "num_boost_round": 10000}
         if use_xgb:
             queue.append(("xgb_slow", {"model": "xgboost", "params": {"eta": 0.02}} | slow))
-        queue.append(("lgb_slow", {"model": "lightgbm", "params": {"learning_rate": 0.02}} | slow))
+        if use_lgb:
+            queue.append(("lgb_slow", {"model": "lightgbm", "params": {"learning_rate": 0.02}} | slow))
         add_seeds(_AUTO_MAX_SEEDS, max_seeds)
         added += [run(name, extra) for name, extra in queue]
     if any(added):
         best = blend(best)
 
     # Шаг 3: CatBoost только по флагу, в самом конце и только при большом запасе
-    if use_catboost:
+    if use_catboost and use_cat and "catboost" not in members:
         if remaining() > 0.5 * time_budget:
             if run("catboost", {"model": "catboost"}):
                 best = blend(best)

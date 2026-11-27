@@ -69,9 +69,9 @@ def run_trial(directory, spec, deadline, budget, config=None, recipe="single", *
             report["elapsed_seconds"] = time.monotonic() - started
             log(f"{recipe} {config or {}}: {report['metric']}={report['score']:.6f}, "
                 f"folds={report['n_folds_done']}, saved={report['saved']}")
-            if report["metric"] == "pr_auc":
-                log(f"AP_TRIAL_FOLDS recipe={recipe} config={config or {}} "
-                    f"scores={report['fold_scores']} saved={report['saved']}")
+            prefix = "AP_TRIAL_FOLDS" if report["metric"] == "pr_auc" else "TRIAL_FOLDS"
+            log(f"{prefix} recipe={recipe} config={config or {}} "
+                f"scores={report['fold_scores']} saved={report['saved']}")
             return report
     except Exception:
         log_error()
@@ -79,7 +79,8 @@ def run_trial(directory, spec, deadline, budget, config=None, recipe="single", *
 
 
 _CV_TOOL = "run_cv_experiment"
-_CV_FLAGS = {"auto_features", "target_encoding", "entity_history", "ad_history", "log_target"}
+_CV_FLAGS = {"auto_features", "event_activity", "causal_history", "hourly_extended", "log_target", "mae_shift"}
+_BACKENDS = ("lightgbm", "catboost", "xgboost")
 
 
 def parse_model_object(content):
@@ -142,7 +143,7 @@ class ResearchModel:
             using_tool = kind == "hypothesis" and self.tools_supported
             if using_tool:
                 properties = {name: {"type": "boolean"} for name in sorted(_CV_FLAGS)}
-                properties["model"] = {"type": "string", "enum": ["lightgbm", "xgboost", "catboost"]}
+                properties["model"] = {"type": "string", "enum": payload.get("spec", {}).get("available_backends", _BACKENDS)}
                 extra.update(tools=[{"type": "function", "function": {
                     "name": _CV_TOOL, "description": "Run one model configuration on the existing CV folds.",
                     "parameters": {"type": "object", "properties": properties, "required": ["model"],
@@ -269,17 +270,14 @@ def resolve_task(directory, text, model, deadline, early=None):
 def hypothesis(model, task, spec, columns, trials, deadline):
     config = model.ask("hypothesis", "Propose ONE new CV experiment. Output a compact object such as "
                        '{"model":"xgboost","auto_features":true}. '
-                       "Choose model from lightgbm, catboost, xgboost. Optional boolean flags: auto_features, "
-                       "entity_history, ad_history, log_target. Use ad_history only if a completed trial used it. "
-                       "Use target_encoding only if a completed trial used it. "
-                       "Use an available backend. For MAE explore log_target with auto_features "
-                       "on a working backend if this combination has not completed. "
+                       "Choose a model from available_backends. Optional boolean flags: auto_features, "
+                       "event_activity, causal_history, hourly_extended, log_target, mae_shift. The last two are for MAE only. "
                        "Use prior results and avoid any configuration already tried.",
                        {"task":task[:6000],"spec":spec,"features":columns[:150],"trials":trials}, deadline)
     flags = _CV_FLAGS
-    if (config and set(config) <= flags | {"model"} and config.get("model") in ("lightgbm","xgboost","catboost")
+    if (config and set(config) <= flags | {"model"} and config.get("model") in spec.get("available_backends", _BACKENDS)
             and all(type(config[k]) is bool for k in flags & config.keys())):
-        if not config.get("ad_history") or any(t.get("scores") and t["config"].get("ad_history") for t in trials):
+        if spec["metric"] == "mae" or not (config.get("log_target") or config.get("mae_shift")):
             return config
     return None
 
@@ -302,6 +300,26 @@ def run_agent(task_path, directory, deadline):
 
 
 def choose_variant(spec, baseline):
+    if spec.get("audit_required"):
+        models = spec["available_backends"]
+        if not baseline or not models:
+            return []
+        backend = baseline.get("backend", models[0])
+        candidates = baseline.get("feature_candidates", {})
+        variants = [{"auto_features": True}]
+        if candidates.get("hourly_extended"):
+            variants.extend([{"hourly_extended": True}, {"auto_features": True, "hourly_extended": True}])
+        if candidates.get("event_activity"):
+            variants.append({"auto_features": True, "event_activity": True})
+        if candidates.get("causal_history"):
+            variants.extend([
+                {"auto_features": True, "causal_history": True},
+                {"auto_features": True, "event_activity": True, "causal_history": True},
+            ])
+        if spec["metric"] == "mae":
+            variants.extend({"auto_features": True, "mae_objective": objective} for objective in ("quantile", "huber"))
+            variants.extend([{"auto_features": True, "log_target": True}, {"mae_shift": True}])
+        return [{"model": backend} | variant for variant in variants]
     variants = []
     if baseline and (baseline.get("split") or {}).get("type") == "time":
         available = baseline.get("feature_candidates", {})
@@ -321,14 +339,74 @@ def choose_variant(spec, baseline):
     return variants
 
 
-def search_remaining_budget(directory, spec, deadline, baseline, winner, tested):
+_SEARCH_FEATURES = ("auto_features", "causal_history", "event_activity", "hourly_extended",
+                    "log_target", "mae_shift", "history_window", "history_smoothing", "mae_objective")
+_SEARCH_PARAMS = {
+    "lightgbm": ({"max_depth": 5, "num_leaves": 24, "lambda_l2": 3.},
+                 {"max_depth": 7, "num_leaves": 48, "lambda_l2": 8.}),
+    "catboost": ({"depth": 4, "l2_leaf_reg": 8.}, {"depth": 7, "l2_leaf_reg": 8.}),
+    "xgboost": ({"max_depth": 4, "min_child_weight": 8., "lambda": 4.},
+                {"max_depth": 7, "min_child_weight": 12., "lambda": 8.}),
+}
+
+
+def audited_search_options(history, model, winner, seeds):
+    """Rank complete feature bundles on the joint CV score before trying seeds and parameters."""
+    members = [row for row in history if row.get("complete") and row.get("recipe") == "single"]
+    members.sort(key=lambda row: (row["config"].get("model") != model,
+                                  -row["score"] if row["greater_is_better"] else row["score"]))
+    bundles = []
+    for config in [winner, *(row["config"] for row in members)]:
+        features = {key: config[key] for key in _SEARCH_FEATURES if config.get(key)}
+        if features not in bundles:
+            bundles.append(features)
+        if len(bundles) == 3:
+            break
+    for seed, features in product(seeds, bundles):
+        yield features | {"seed": seed}
+    for params, features in product(_SEARCH_PARAMS[model], bundles):
+        yield features | {"params": params}
+
+
+def _trial_key(config):
+    cleaned = {key: value for key, value in config.items() if value is not None and value is not False and value != {}}
+    if cleaned.get("seed") == 42:
+        cleaned.pop("seed")
+    return json.dumps(cleaned, sort_keys=True)
+
+
+def search_remaining_budget(directory, spec, deadline, baseline, winner, tested, *, blend_estimate=90.):
     """Search additional windows and model settings with time left for the final blend."""
-    fit_deadline = deadline - 180.
+    audited = spec.get("audit_required")
+    fit_deadline = deadline - max(180., 1.3 * blend_estimate + 30.)
     estimate = max(20., baseline.get("elapsed_seconds", baseline["fit_time"]))
     accepted = {key: winner[key] for key in ("entity_history", "target_encoding") if winner.get(key)}
     windows, smoothings = (8, 20, 60), (8., 24., 64.)
     models, seeds = ("lightgbm", "catboost", "xgboost"), (42, 101, 263)
-    families = deque((model, iter(product(seeds, windows, smoothings))) for model in models)
+    if audited:
+        models = spec["available_backends"]
+        features = {key: True for key in ("auto_features", "causal_history", "event_activity", "hourly_extended",
+                                         "log_target", "mae_shift")
+                    if winner.get(key)}
+        feature_candidates = baseline.get("feature_candidates", {})
+        options = [features | {"recency_days": days} for days in (None, 7, 30, 90)]
+        if feature_candidates.get("causal_history"):
+            options += [features | {"causal_history": True, "history_window": window, "history_smoothing": smooth}
+                        for window, smooth in ((16, 24.), (64, 8.), (64, 64.), (256, 24.))]
+        if feature_candidates.get("event_activity"):
+            options.append(features | {"event_activity": True})
+        if spec["metric"] == "mae":
+            options.append(features | {"mae_shift": True})
+        from pipeline import experiment_history
+        initial_options = tuple(options)
+
+        def audited_queue(backend):
+            yield from initial_options
+            yield from audited_search_options(experiment_history(directory), backend, winner, seeds)
+
+        families = deque((model, audited_queue(model)) for model in models)
+    else:
+        families = deque((model, iter(product(seeds, windows, smoothings))) for model in models)
     estimates = dict.fromkeys(models, estimate)
     failures = dict.fromkeys(models, 0)
     retired = {}
@@ -342,19 +420,28 @@ def search_remaining_budget(directory, spec, deadline, baseline, winner, tested)
         if not trial_fits(estimates[model], fit_deadline):
             retired[model] = "next_trial_does_not_fit"
             continue
-        seed, window, smoothing = choice
-        config = accepted | {"model": model, "seed": seed, "auto_features": True, "ad_history": True,
-                             "ad_history_window": window, "ad_history_smoothing": smoothing}
-        key = json.dumps(config, sort_keys=True)
+        if audited:
+            config = {"model": model} | choice
+        else:
+            seed, window, smoothing = choice
+            config = accepted | {"model": model, "seed": seed, "auto_features": True, "ad_history": True,
+                                 "ad_history_window": window, "ad_history_smoothing": smoothing}
+        key = _trial_key(config) if audited else json.dumps(config, sort_keys=True)
         if key in tested:
             families.append((model, options))
             continue
+        tuning_cost = 1.35 if audited and config.get("params") else 1.
+        step_estimate = tuning_cost * estimates[model]
+        if not trial_fits(step_estimate, fit_deadline):
+            retired[model] = "next_trial_does_not_fit"
+            continue
         tested.add(key)
         attempts += 1
-        budget = min(420., max(110., 1.8 * estimates[model]))
-        report = run_trial(directory, spec, fit_deadline, budget, config, estimate=estimates[model])
+        budget = min(420., max(110., 1.8 * step_estimate))
+        report = run_trial(directory, spec, fit_deadline, budget, config, estimate=step_estimate)
         if report and report["complete"]:
-            estimates[model] = max(20., report.get("elapsed_seconds", report["fit_time"]))
+            actual = report.get("elapsed_seconds", report["fit_time"])
+            estimates[model] = max(20., actual, estimates[model] * .85) if audited else max(20., actual)
             failures[model] = 0
             completed += 1
         else:
@@ -372,12 +459,15 @@ def search_remaining_budget(directory, spec, deadline, baseline, winner, tested)
 def research(task_path, directory, deadline):
     from pipeline import experiment_history, write_fallback
     from postgres_loader import prepare_postgres
+    from leak_audit import AuditBudget, audit_log, restricted_inputs
+    from training import backend_available
 
     task = task_path.read_text(encoding="utf-8-sig")
     mailbox = directory / "research"
     model = ResearchModel(mailbox if mailbox.is_dir() else None)
     spec = None
     using_postgres = bool(os.environ.get("PGDATABASE"))
+    replay = AuditBudget()
     pg_started = time.monotonic()
     join_started = None
 
@@ -395,17 +485,25 @@ def research(task_path, directory, deadline):
         resolved = resolve_task(directory, task, model, deadline, early=publish)
         if resolved != spec:
             publish(resolved)
+        import csv
+        with (directory / "test.csv").open(encoding="utf-8-sig", newline="") as stream:
+            fields = next(csv.reader(stream))
+        blocked = restricted_inputs(task, fields)
+        backends = [backend for backend in _BACKENDS if backend_available(backend)]
+        spec = spec | {"audit_required": True, "excluded_features": list(blocked), "available_backends": backends}
+        for name, why in blocked.items():
+            audit_log("excluded", "task.md", feature=name, reason=why)
         log_phase("safety_prior", safety_started, reason="prior_published")
         log(f"Task: {spec}")
         join_started = time.monotonic()
 
     if using_postgres:
         try:
-            prepare_postgres(task_path, directory, deadline=deadline, on_core_ready=core_ready, log=log)
+            prepare_postgres(task_path, directory, deadline=deadline, on_core_ready=core_ready, log=log, replay=replay)
         finally:
             if join_started is not None:
                 log_phase("join", join_started, budget=round(max(0., deadline - join_started)*.4, 3),
-                          reason="join_plan_finished")
+                          reason="join_plan_finished", leak_audit_seconds=replay.elapsed)
     else:
         # Local qualifier datasets also use this entry point.
         from data_tools import _read_files
@@ -421,20 +519,23 @@ def research(task_path, directory, deadline):
     available = deadline - time.monotonic()
     quick = min(420, max(15, available * 0.12))
     safety_started = time.monotonic()
-    baseline = run_trial(directory, spec, deadline, quick)
+    baseline = None
     baseline_trial = {}
     failed_trial = None
-    if not baseline:
-        failed_trial = {"config": {"model": "lightgbm"}, "status": "baseline failed"}
-        baseline_trial = {"model": "catboost"}
+    for backend in spec["available_backends"]:
+        baseline_trial = {"model": backend}
         baseline = run_trial(directory, spec, deadline, quick, baseline_trial)
+        if baseline:
+            baseline["backend"] = backend
+            break
+        failed_trial = {"config": baseline_trial, "status": "baseline failed"}
     log_phase("safety_model", safety_started, budget=quick * (2 if failed_trial else 1),
               reason="model_completed" if baseline else "no_completed_model")
     variant_started = time.monotonic()
     variants = choose_variant(spec, baseline)
     winner = {}
     trials = [failed_trial] if failed_trial else []
-    tested = set()
+    tested = {_trial_key(baseline_trial)} if baseline else set()
     unusable = 0
     if baseline:
         trials.append({"config": baseline_trial, "scores":baseline["fold_scores"]})
@@ -469,7 +570,7 @@ def research(task_path, directory, deadline):
                     llm_reason = model.last_reason or "no_valid_tool_configuration"
                     break
                 continue
-        key = json.dumps(config, sort_keys=True)
+        key = _trial_key(config)
         if key in tested:
             if from_llm:
                 log("LLM_HYPOTHESIS status=duplicate")
@@ -527,10 +628,10 @@ def research(task_path, directory, deadline):
                   queue=(report or {}).get("auto_stop"))
         if report and report["saved"]:
             winner = candidate
-    ad_search = (baseline and baseline.get("feature_candidates", {}).get("ad_history")
-                 and available > 1800.)
+    budget_search = (baseline and (baseline.get("split") or {}).get("type") == "time"
+                     and available > 1800.)
     blend_estimate = min(90., quick)
-    if ad_search:
+    if budget_search:
         # Publish the best known blend before using the remaining budget.
         history = experiment_history(directory)
         if sum(bool(h.get("preds_file")) for h in history) >= 2:
@@ -541,7 +642,7 @@ def research(task_path, directory, deadline):
             log_phase("ensemble", started, budget=180., reason="blend_evaluated" if blend else "no_result",
                       checkpoint=True)
         started = time.monotonic()
-        search = search_remaining_budget(directory, spec, deadline, baseline, winner, tested)
+        search = search_remaining_budget(directory, spec, deadline, baseline, winner, tested, blend_estimate=blend_estimate)
         log_phase("search_remaining_budget", started, budget=round(max(0., deadline-started-180), 3),
                   **search)
     else:

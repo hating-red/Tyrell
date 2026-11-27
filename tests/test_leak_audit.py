@@ -1,0 +1,164 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from data_tools import _audit_lookup, _join_chunk, _plan_relation, _prepare_lookup, target_constraints
+from features import audit_event_kernel, event_activity
+from leak_audit import AuditBudget, LeakAuditError
+from postgres_loader import ForeignKey, Table
+from training import backend_available, train_and_predict
+
+
+@pytest.mark.parametrize("mode", ["start", "end"])
+def test_hourly_replay_at_strict_boundary_and_with_delayed_publication(mode, capsys):
+    end = pd.to_datetime(["2025-01-01 09:00", "2025-01-01 10:00", "2025-01-01 11:00"])
+    stamps = end - pd.Timedelta(hours=1) if mode == "start" else end
+    rows = pd.DataFrame({"zone_code": "a", "ts": stamps, "density": [8., 9., 10.]})
+    events = pd.DataFrame({"zone_code": "a", "called_at": [
+        "2025-01-01 10:30", "2025-01-01 11:00", "2025-01-01 11:00:00.000001"]})
+    lookup = _prepare_lookup(rows, "zone_code", "ts", mode, ["density"], "grid__")
+    joined = _join_chunk(events, lookup, "zone_code", "called_at")
+    assert joined["grid__density"].tolist() == [9., 9., 10.]
+    assert joined["grid__density__lag1h"].tolist() == [9., 9., 10.]
+    assert joined["grid__density__mean24h"].tolist() == [8.5, 8.5, 9.]
+    _audit_lookup([(events, joined.drop(columns=events.columns))], lookup, "zone_code",
+                  "called_at", AuditBudget(), "grid")
+    assert "LEAK_AUDIT status=pass" in capsys.readouterr().err
+
+    rows["release"] = end + pd.Timedelta(minutes=5)
+    delayed = _prepare_lookup(rows, "zone_code", "ts", mode, ["density"], "grid__", "release")
+    delayed_out = _join_chunk(events, delayed, "zone_code", "called_at")
+    assert delayed_out["grid__density"].tolist() == [9., 9., 9.]
+    assert np.isnan(delayed_out["grid__density__lag1h"].iloc[-1])
+    _audit_lookup([(events, delayed_out.drop(columns=events.columns))], delayed, "zone_code",
+                  "called_at", AuditBudget(), "grid_delayed")
+
+
+def test_audit_rejects_future_counts():
+    source = pd.DataFrame({"ts": pd.date_range("2025", periods=3, freq="h"), "client_key": ["a"] * 3})
+
+    def leaking(data, ask, *_):
+        return event_activity(data, ask, "ts", ["client_key"]).assign(future_count=len(data))
+
+    with pytest.raises(LeakAuditError, match="future_count"):
+        audit_event_kernel(leaking, source, source["ts"], source, "ts", "future_count")
+
+
+def test_replay_checks_a_leak_at_a_middle_boundary():
+    times = pd.date_range("2025", periods=7, freq="h")
+    source = pd.DataFrame({"ts": times, "value": ["same"] * len(times)})
+
+    def leaking(frame, query, *_):
+        out = pd.Series("same", index=query.index)
+        if times[2] in query["ts"].array:
+            value = frame.loc[frame["ts"].eq(times[2]), "value"]
+            if not value.empty:
+                out.loc[query["ts"].eq(times[2])] = value.iloc[0]
+        return out.to_frame("value")
+
+    with pytest.raises(LeakAuditError, match="feature value"):
+        audit_event_kernel(leaking, source, source["ts"], source, "ts", "middle_boundary")
+
+
+@pytest.mark.parametrize("metric", ["roc_auc", "rmse"])
+def test_private_renamed_schema_and_other_metrics(metric, capsys):
+    kind = "binary" if metric == "roc_auc" else "regression"
+    backend = next((name for name in ("lightgbm", "catboost", "xgboost") if backend_available(name)), None)
+    if backend is None:
+        pytest.skip("no boosting backend installed")
+    core = ("event_key", "client_key", "zone_code", "ts")
+    metadata = {
+        "column_types": {"ts": "timestamp without time zone"},
+        "foreign_keys": (ForeignKey(("client_key",), ("public", "clients"), ("client_key",)),),
+    }
+    train, test = Table("public", "archive", (*core, "delay_min"), **metadata), Table("public", "new_jobs", core, **metadata)
+    clients = Table("public", "clients", ("client_key", "segment", "total_orders"), primary_key=("client_key",))
+    readings = Table("public", "readings", ("zone_code", "ts", "load"), primary_key=("zone_code", "ts"),
+                     column_types={"ts": "timestamp without time zone"}, comments={"ts": "start of hour"})
+    assert _plan_relation(clients, train, test, "event_key", {"delay_min"}, "") == (
+        "client_key", "client_key", None, None, None, ["segment"])
+    assert _plan_relation(readings, train, test, "event_key", {"delay_min"}, "") == (
+        "zone_code", "zone_code", "ts", "ts", "start", ["load"])
+    n = 520
+    rows = np.arange(n)
+    data = pd.DataFrame({"ts": pd.date_range("2025", periods=n, freq="35min"),
+                         "client_key": rows % 15, "zone_code": rows % 5, "signal": rows % 29 / 29.})
+    gauges = pd.DataFrame({"ts": pd.date_range("2024-12-31", periods=460, freq="h").repeat(5),
+                           "zone_code": np.tile(np.arange(5), 460), "load": np.arange(2300) % 37})
+    lookup = _prepare_lookup(gauges, "zone_code", "ts", "start", ["load"], "readings__")
+    joined = _join_chunk(data, lookup, "zone_code", "ts")
+    _audit_lookup([(data.iloc[:15], joined.iloc[:15].drop(columns=data.columns)),
+                   (data.iloc[-15:], joined.iloc[-15:].drop(columns=data.columns))],
+                  lookup, "zone_code", "ts", AuditBudget(), "readings")
+    y = (data.signal > .5).astype(int) if kind == "binary" else 3 + 5 * data.signal
+    result = train_and_predict(joined.iloc[:460], y.iloc[:460], joined.iloc[460:], kind, metric, config={
+        "model": backend, "split": {"type": "time", "column": "ts"}, "n_folds": 3, "n_jobs": 2,
+        "num_boost_round": 15, "event_activity": True, "causal_history": True, "audit_required": True,
+        "label_delay_unit": "minutes" if kind == "regression" else None,
+    }, time_budget=20.)
+    assert np.isfinite(result["score"])
+    assert len(result["fold_scores"]) == 3
+    logs = capsys.readouterr().err
+    for group in ("readings", "event_activity", "causal_history", "model_input"):
+        assert f'LEAK_AUDIT status=pass {{"group": "{group}"' in logs
+
+
+def test_delay_needs_numeric_plausible_declared_duration():
+    rule = "delay_min is the duration from registration to response, in minutes."
+    assert target_constraints(rule, "delay_min", pd.Series([5, 10]), "regression").get("label_delay_unit") == "minutes"
+    for y in ([0, 0], [-1, 5], [55000, 95000]):
+        assert "label_delay_unit" not in target_constraints(rule, "delay_min", pd.Series(y), "regression")
+    assert "label_delay_unit" not in target_constraints("delay_min is a sensor reading.", "delay_min",
+                                                       pd.Series([5, 10]), "regression")
+
+
+def test_ordinary_labels_after_first_test_event_cannot_train_or_score(monkeypatch):
+    import training
+
+    hours = pd.date_range("2025", periods=48, freq="h")
+    X = pd.DataFrame({"ts": hours, "registered_index": np.arange(48)})
+    test = pd.DataFrame({"ts": [hours[25]], "registered_index": [100]})
+    seen = []
+
+    def fit(Xtr, ytr, weights, Xva, yva, query, *_):
+        seen.append(int(Xtr["registered_index"].max()))
+        return np.full(len(Xva), .5), np.full(len(query), .5), 1, False, 1
+
+    monkeypatch.setitem(training._BACKENDS, "lightgbm", fit)
+    result = train_and_predict(X, X.registered_index, test, "regression", "rmse", config={
+        "split": {"type": "time", "column": "ts"}, "audit_required": True, "n_folds": 3,
+    }, time_budget=20.)
+    assert max(seen) == 24
+    assert (result["fold_ids"][25:] == -1).all()
+
+
+def test_created_at_attributes_and_undated_profile_counts_are_conservative():
+    core = ("call_id", "client_key", "ts")
+    train = Table("public", "archive", (*core, "label"))
+    test = Table("public", "new_jobs", core)
+    profile = Table("public", "clients", ("client_key", "created_at", "category", "total_orders", "credit_score"))
+    assert _plan_relation(profile, train, test, "call_id", {"label"}, "")[-1] == ["category"]
+    raw = pd.DataFrame({"client_key": [1, 1], "category": ["a", "b"]})
+    static = _prepare_lookup(raw, "client_key", None, None, ["category"], "client__")
+    assert list(static) == ["client__category"]
+    assert static["client__category"].isna().all()
+
+
+def test_explicit_source_restriction_and_llm_whitelist():
+    from types import SimpleNamespace
+    from solution import hypothesis
+
+    core = ("call_id", "zone_code", "ts")
+    train = Table("public", "archive", (*core, "label"))
+    test = Table("public", "new_jobs", core)
+    readings = Table("public", "readings", ("zone_code", "ts", "load"), comments={"ts": "start of hour"})
+    with pytest.raises(ValueError, match="task.md"):
+        _plan_relation(readings, train, test, "call_id", {"label"},
+                       "readings available only after the investigation ends.")
+
+    spec = {"metric": "pr_auc", "available_backends": ["catboost"]}
+    for proposal in ({"model": "catboost", "feature_code": "arbitrary"},
+                     {"model": "lightgbm", "event_activity": True},
+                     {"model": "catboost", "mae_shift": True}):
+        model = SimpleNamespace(ask=lambda *_: proposal)
+        assert hypothesis(model, "", spec, [], [], None) is None
