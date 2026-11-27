@@ -13,6 +13,10 @@ class LeakAuditError(ValueError):
     pass
 
 
+class AuditTimeout(LeakAuditError):
+    pass
+
+
 def audit_log(status, group, **details):
     print("LEAK_AUDIT status=" + status + " " + json.dumps({"group": group, **details}, ensure_ascii=False),
           file=sys.stderr, flush=True)
@@ -21,29 +25,52 @@ def audit_log(status, group, **details):
 class AuditBudget:
     def __init__(self, seconds=60.):
         self.limit = seconds
-        self.remaining = seconds
+        self._elapsed = 0.
 
     @property
     def elapsed(self):
-        return round(self.limit - self.remaining, 6)
+        return round(self._elapsed, 6)
 
     @contextmanager
-    def check(self, group):
+    def check(self, group, seconds=None, *, retry=False, sample_sizes=None):
         start = time.monotonic()
+        limit = self.limit if seconds is None else seconds
 
         def check_time():
-            if time.monotonic() - start >= self.remaining:
-                raise LeakAuditError("audit time budget exhausted")
+            if time.monotonic() - start >= limit:
+                raise AuditTimeout("audit time budget exhausted")
 
         try:
             check_time()
             yield check_time
             check_time()
         except LeakAuditError as error:
-            audit_log("fail", group, reason=str(error))
+            if not (retry and isinstance(error, AuditTimeout)):
+                detail = {"sample_sizes": sample_sizes} if sample_sizes is not None else {}
+                audit_log("fail", group, reason=str(error), **detail)
             raise
         finally:
-            self.remaining -= time.monotonic() - start
+            self._elapsed += time.monotonic() - start
+
+    def sampled(self, group, sizes, verify):
+        """Reserve time for smaller samples and retry only on timeout."""
+        start = time.monotonic()
+        limits = list(dict.fromkeys(tuple(min(n, limit) for n in sizes) for limit in (2000, 500, 200)))
+        for i, counts in enumerate(limits):
+            retry = i < len(limits) - 1
+            left = self.limit - (time.monotonic() - start)
+            try:
+                with self.check(group, left * (0.55 if retry else 1), retry=retry,
+                                sample_sizes=counts) as check_time:
+                    detail = verify(counts, check_time)
+            except AuditTimeout:
+                if not retry:
+                    raise
+                audit_log("retry", group, reason="time_budget", sample_sizes=counts)
+                continue
+            audit_log("pass", group, **detail, rows=sum(counts), sample_sizes=counts,
+                      seconds=round(time.monotonic() - start, 6))
+            return
 
 
 def sample_positions(size, *, limit=2000, seed=42):

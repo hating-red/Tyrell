@@ -9,6 +9,73 @@ from postgres_loader import ForeignKey, Table
 from training import backend_available, train_and_predict
 
 
+@pytest.mark.parametrize(("frequency", "event", "stamps"), [
+    ("h", "2025-01-01 10:30", pd.date_range("2025-01-01 06:00", periods=5, freq="h")),
+    ("D", "2025-01-05 10:30", pd.date_range("2025-01-01", periods=5, freq="D")),
+])
+def test_inferred_step_renamed_without_primary_key(frequency, event, stamps):
+    fields = ("event_id", "zone", "call_time")
+    train = Table("public", "archive", (*fields, "target"))
+    test = Table("public", "new_jobs", fields)
+    gauge = Table("public", "observations", ("zone", "bucket", "reading"),
+                  column_types={"bucket": "timestamp without time zone"})
+    assert _plan_relation(gauge, train, test, "event_id", {"target"}, "") == (
+        "zone", "zone", "call_time", "bucket", "inferred", ["reading"])
+    source = pd.DataFrame({"zone": "a", "bucket": stamps, "reading": range(5)})
+    query = pd.DataFrame({"zone": "a", "call_time": [event, stamps[-1] + pd.Timedelta(1, unit=frequency),
+                                                   stamps[-1] + pd.Timedelta(1, unit=frequency) + pd.Timedelta(microseconds=1)]})
+    lookup = _prepare_lookup(source, "zone", "bucket", "inferred", ["reading"], "obs__",
+                             cadence_before=pd.Timestamp(event))
+    assert lookup.attrs["inferred_step"] == pd.Timedelta(1, unit=frequency)
+    joined = _join_chunk(query, lookup, "zone", "call_time")
+    assert joined["obs__reading"].tolist() == [3, 3, 4]
+    _audit_lookup([(query, joined[["obs__reading"]])], pd.DataFrame(lookup), "zone", "call_time",
+                  AuditBudget(), "observations")
+
+
+def test_irregular_and_undetermined_cadence_is_rejected():
+    from data_tools import _infer_interval
+
+    clock = pd.Series(pd.DatetimeIndex(["2025-01-01", "2025-01-02", "2025-01-04"]))
+    keys = pd.Series(["a", "a", "a"])
+    with pytest.raises(ValueError, match="нерегулярный шаг"):
+        _infer_interval(keys, clock, pd.Timestamp("2025-01-06"))
+    with pytest.raises(ValueError, match="неопределимый шаг"):
+        _infer_interval(keys, clock, pd.Timestamp("2025-01-03"))
+
+
+def test_dates_do_not_turn_campaign_metadata_into_an_interval_source():
+    core = ("call_id", "campaign_id", "ts")
+    train = Table("public", "archive", (*core, "label"))
+    test = Table("public", "new_jobs", core)
+    campaigns = Table("public", "campaigns", ("campaign_id", "name", "start_date", "end_date"),
+                      primary_key=("campaign_id",), column_types={"start_date": "date", "end_date": "date"})
+    assert _plan_relation(campaigns, train, test, "call_id", {"label"}, "") == (
+        "campaign_id", "campaign_id", None, None, None, ["name"])
+
+
+def test_adaptive_audit_retries_each_group_with_its_own_budget(monkeypatch, capsys):
+    import leak_audit
+
+    now = [0.]
+    monkeypatch.setattr(leak_audit.time, "monotonic", lambda: now[0])
+    budget = AuditBudget()
+    calls = []
+
+    def verify(counts, check):
+        calls.append(counts)
+        now[0] += 34 if counts[0] == 2000 else 15 if counts[0] == 500 else 1
+        check()
+        return {"features": ["x"]}
+
+    for group in ("first", "second"):
+        budget.sampled(group, [2500, 2200], verify)
+    assert calls == [(2000, 2000), (500, 500), (200, 200)] * 2
+    stderr = capsys.readouterr().err
+    assert stderr.count('"sample_sizes": [200, 200]') == 2
+    assert "status=fail" not in stderr
+
+
 @pytest.mark.parametrize("mode", ["start", "end"])
 def test_hourly_replay_at_strict_boundary_and_with_delayed_publication(mode, capsys):
     end = pd.to_datetime(["2025-01-01 09:00", "2025-01-01 10:00", "2025-01-01 11:00"])

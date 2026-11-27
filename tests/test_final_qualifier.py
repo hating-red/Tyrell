@@ -56,6 +56,58 @@ def test_audited_search_runs_interleaved_queues_through_tuning(monkeypatch, tmp_
         assert len([entry for entry in family if "params" in entry]) == 2
 
 
+@pytest.mark.parametrize("model", ["catboost", "xgboost"])
+def test_optuna_tuning_sees_only_prefix(model, monkeypatch):
+    import training
+
+    clock = pd.date_range("2025", periods=120, freq="h")
+    X = pd.DataFrame({"ts": clock, "feature": np.arange(len(clock))})
+    y = pd.Series(np.arange(len(clock), dtype=float))
+    seen = []
+
+    def train(inner, labels, probe, task_type, metric, config, time_budget):
+        seen.append(config["params"])
+        assert inner["ts"].max() == clock[19]
+        assert labels.max() == 19
+        assert probe["ts"].iloc[0] == clock[20]
+        assert config["model"] == model and config["n_folds"] == 3
+        return {"config": {"n_folds_done": 3, "n_folds": 3}, "score": 1.}
+
+    monkeypatch.setattr(training, "train_and_predict", train)
+    params = training.tune_backend(model, X, y, X.iloc[[-1]], "regression", "mae",
+                                   {"split": {"type": "time", "column": "ts"}}, 30.)
+    assert seen and params in seen
+
+
+def test_extended_search_uses_seeded_tail_until_budget_runs_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(pipeline, "experiment_history", lambda _: [])
+    now = [0.]
+    monkeypatch.setattr(solution.time, "monotonic", lambda: now[0])
+    collected = []
+
+    def train(directory, spec, deadline, budget, config, recipe="single", *, estimate):
+        collected.append((recipe, config))
+        now[0] += 8 if recipe == "tune" else 24
+        if recipe == "tune":
+            return {"tuned_params": {"depth": 5}}
+        return {"complete": True, "fit_time": 24.}
+
+    monkeypatch.setattr(solution, "run_trial", train)
+    results = []
+    for _ in range(2):
+        now[0] = 0
+        collected.clear()
+        retired = {"catboost": "queue_exhausted"}
+        assert solution._extended_search(tmp_path, {}, 160., {"recency_days": 30}, set(),
+                                         {"catboost": 20.}, retired) == (5, 5)
+        assert retired["catboost"] == "next_trial_does_not_fit"
+        results.append(list(collected))
+    assert results[0] == results[1]
+    assert results[0][0][0] == "tune"
+    assert results[0][1][1]["params"] == {"depth": 5}
+    assert all(config["recency_days"] == 30 for _, config in results[0])
+
+
 def test_duplicate_threshold_includes_split_column():
     train = pd.DataFrame({"x": [0., 2.], "period": [3, 4]})
     test = pd.DataFrame({"x": [-0.] * 1000, "period": [3] * 50 + [9] * 950})
@@ -122,7 +174,7 @@ def test_private_composite_clock_maps_between_postgres_timestamp_types():
                    column_types={"bucket_clock": "timestamp without time zone"},
                    primary_key=("line_key", "bucket_clock"))
     assert _plan_relation(lookup, train, test, "job_id", {"minutes"}, "") == (
-        "line_key", "line_key", "opened", "bucket_clock", "start", ["density"],
+        "line_key", "line_key", "opened", "bucket_clock", "inferred", ["density"],
     )
 
 

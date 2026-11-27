@@ -106,14 +106,17 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
             return {"skipped": "leak_audit_failed: automated transforms require a time split"}
         transformed = add_auto_features(X_train, X_test, priority, row_local=temporal)
         if audited:
-            from leak_audit import AuditBudget, audit_log, check_equal, sample_positions
-            a, b = sample_positions(len(X_train)), sample_positions(len(X_test))
-            with AuditBudget().check("calendar"):
+            from leak_audit import AuditBudget, check_equal, sample_positions
+
+            def verify_calendar(counts, check_time):
+                a = sample_positions(len(X_train), limit=counts[0])
+                b = sample_positions(len(X_test), limit=counts[1])
                 replayed = add_auto_features(X_train.iloc[a], X_test.iloc[b], row_local=True)
                 check_equal(transformed[0].iloc[a], replayed[0])
                 check_equal(transformed[1].iloc[b], replayed[1])
-            audit_log("pass", "calendar", features=[c for c in transformed[0] if c not in X_train],
-                      rule="current event values only", rows=len(a)+len(b))
+                return dict(features=[c for c in transformed[0] if c not in X_train], rule="current event values only")
+
+            AuditBudget().sampled("calendar", [len(X_train), len(X_test)], verify_calendar)
         X_train, X_test = transformed
 
     # Фолды одинаковые во всех экспериментах, иначе скоры несравнимы: агент их не меняет.
@@ -373,8 +376,9 @@ def run_ensemble(task_dir, task_spec, max_members=8, *, time_budget=None):
 
     def diversity(member):
         config = member["config"]
-        return config.get("model"), tuple(key for key in ("auto_features", "event_activity", "causal_history", "hourly_extended")
-                                          if config.get(key))
+        features = tuple((key, config[key]) for key in ("auto_features", "event_activity", "causal_history",
+                         "hourly_extended", "history_window", "history_smoothing", "recency_days") if config.get(key))
+        return config.get("model"), (features, config.get("seed", 42))
 
     diverse_pool = list(range(min(original_count, 6)))
     if audited:
@@ -429,8 +433,8 @@ def run_ensemble(task_dir, task_spec, max_members=8, *, time_budget=None):
         strongest = None
         def diversified(members):
             signatures = [diversity(candidates[i]) for i in members]
-            backends, features = zip(*signatures)
-            return all(backends) and len(set(backends)) == len(members) and len(set(features)) > 1
+            backends, variants = zip(*signatures)
+            return all(backends) and len(set(backends)) >= 2 and len(set(signatures)) == len(members) and len(set(variants)) > 1
 
         if audited:
             sets = chain.from_iterable(combinations(diverse_pool, width) for width in (2, 3))
@@ -626,6 +630,19 @@ if __name__ == "__main__":
     try:
         if args["recipe"] == "ensemble":
             report = run_ensemble(Path.cwd(), args["task_spec"], time_budget=args["time_budget"])
+        elif args["recipe"] == "tune":
+            from training import tune_backend
+
+            spec = args["task_spec"]
+            data = load_data(Path.cwd(), spec)
+            split = detect_split(data["X_train"], data["X_test"], time_column=spec.get("time_column"))
+            fixed = {"audit_required": True, "split": split, "n_folds": 5, "n_jobs": 8,
+                     "label_delay_unit": spec.get("label_delay_unit")}
+            if (split or {}).get("type") != "time":
+                raise ValueError("Prefix tuning requires a chronological split")
+            config = args["config"]
+            report = {"tuned_params": tune_backend(config["model"], data["X_train"], data["y_train"], data["X_test"],
+                                                   spec["task_type"], spec["metric"], config | fixed, args["time_budget"])}
         else:
             report = run_experiment(Path.cwd(), **args)
     except LeakAuditError as exc:

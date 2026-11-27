@@ -1,0 +1,10 @@
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+lightgbm==4.6.0
+xgboost==2.1.4
+catboost==1.2.8
+optuna==4.2.1
+openai==1.68.2
+psycopg[binary]==3.2.9
+psutil==6.1.1

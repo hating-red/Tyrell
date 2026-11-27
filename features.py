@@ -402,13 +402,18 @@ def history_reference(source, query, clock, availability, labels, entities, *, w
 
 
 def audit_event_kernel(builder, source, availability, queries, clock, group, *, labels=None, budget=None,
-                       reference=None, corrupted_reference=None):
+                       reference=None, corrupted_reference=None, train_rows=None):
     """Replay sampled queries after dropping future inputs and perturbing future labels."""
-    from leak_audit import AuditBudget, audit_log, check_equal, exact_cutoffs
+    from leak_audit import AuditBudget, check_equal, exact_cutoffs, sample_positions
 
     budget = budget or AuditBudget()
-    with budget.check(group) as check_time:
+    groups = [queries] if train_rows is None else [queries.iloc[:train_rows], queries.iloc[train_rows:]]
+
+    def verify(counts, check_time):
+        queries = pd.concat([frame.iloc[sample_positions(len(frame), limit=count)]
+                             for frame, count in zip(groups, counts)], ignore_index=True)
         expected = builder(source, queries, availability, labels)
+        check_time()
         if reference is not None:
             check_equal(expected, reference(source, queries, availability, labels))
         if corrupted_reference is not None:
@@ -440,14 +445,15 @@ def audit_event_kernel(builder, source, availability, queries, clock, group, *, 
                     changed[column] = changed[column].astype(object)
                     changed.loc[~retained, column] = "audit changed future entity"
             check_equal(expected.iloc[idx], builder(changed, original, availability, noisy))
-    checks = ["truncated_source", "corrupted_source"]
-    if reference is not None:
-        checks.append("per_row_cutoff")
-    if corrupted_reference is not None or reference is None:
-        checks.append("per_cutoff_corrupted_source")
-    audit_log("pass", group, features=list(expected), rows=len(queries), cutoffs=int(queries[clock].nunique()),
-              rule="strictly earlier registration" if labels is None else "fold labels available strictly before event",
-              checks=checks)
+        checks = ["truncated_source", "corrupted_source"]
+        if reference is not None:
+            checks.append("per_row_cutoff")
+        if corrupted_reference is not None or reference is None:
+            checks.append("per_cutoff_corrupted_source")
+        return dict(features=list(expected), cutoffs=int(queries[clock].nunique()), checks=checks,
+                    rule="strictly earlier registration" if labels is None else "fold labels available strictly before event")
+
+    budget.sampled(group, [len(frame) for frame in groups], verify)
 
 
 def add_ad_history(fit, queries, labels, clock, groups, *, window, smoothing):
