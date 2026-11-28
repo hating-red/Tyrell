@@ -6,8 +6,12 @@
 Полезность набора проверяется снаружи на тех же фолдах, что и остальные эксперименты.
 """
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 MAX_GROUP_COLUMNS = 3             # сколько категорий берем для групповых признаков
 MAX_GROUP_NUMERIC = 5             # сколько числовых признаков агрегируем по группам
@@ -44,90 +48,107 @@ def _parse_dates(s):
 
 
 def important_numeric(X, y, task_type, limit=MAX_GROUP_NUMERIC, seed=42):
-    """Самые важные числовые признаки по быстрой модели LightGBM."""
-    import lightgbm as lgb
+    """Rank numeric features on fit rows, with an inexpensive backend-independent fallback."""
+    from importlib import import_module
+    from training import backend_available
+    from time_budget import available_cpus
 
     numeric = [c for c in X if _is_numeric(X[c])]
     if len(numeric) <= limit:
         return numeric
-    frame = X.copy()
-    for column in frame:
-        if _is_categorical(frame[column]):
-            frame[column] = frame[column].astype("category")
-    labeled = pd.Series(np.asarray(y)).notna().to_numpy()
-    target = pd.Series(np.asarray(y))[labeled]
-    params = {"n_estimators": 200, "learning_rate": 0.1, "num_leaves": 31, "verbose": -1,
-              "importance_type": "gain", "random_state": seed, "n_jobs": 8}
-    if task_type == "regression":
-        model = lgb.LGBMRegressor(**params)
-        target = pd.to_numeric(target, errors="coerce")
-    else:
-        model = lgb.LGBMClassifier(**params)
-        target = target.astype(str)
-    model.fit(frame[labeled], target)
-    gain = pd.Series(model.feature_importances_, index=frame.columns)
-    return gain[numeric].sort_values(ascending=False).index[:limit].tolist()
+    target = pd.Series(np.asarray(y))
+    positions = np.flatnonzero(target.notna())
+    if len(positions) > 20000:
+        positions = np.random.default_rng(seed).choice(positions, 20000, replace=False)
+    frame = X[numeric].iloc[positions].reset_index(drop=True).replace([np.inf, -np.inf], np.nan)
+    target = target.iloc[positions].reset_index(drop=True)
+    regression = task_type == "regression"
+    if not regression:
+        target = pd.factorize(target, sort=True)[0]
+    for backend, class_prefix, options in (
+        ("lightgbm", "LGBM", {"importance_type": "gain", "verbosity": -1}),
+        ("xgboost", "XGB", {"importance_type": "gain", "tree_method": "hist", "verbosity": 0}),
+    ):
+        if backend_available(backend):
+            try:
+                model = getattr(import_module(backend), class_prefix + ("Regressor" if regression else "Classifier"))
+                estimator = model(n_estimators=60, max_depth=4, random_state=seed, n_jobs=available_cpus(), **options)
+                estimator.fit(frame, target)
+                gain = pd.Series(estimator.feature_importances_, index=numeric)
+                return gain.sort_values(ascending=False, kind="stable").index[:limit].tolist()
+            except (ImportError, OSError, ValueError, RuntimeError) as exc:
+                logger.info("AUTO_FEATURES rank_backend=%s reason=%s", backend, type(exc).__name__)
+    target = pd.Series(target, index=frame.index)
+    targets = [target] if regression else [target.eq(value) for value in target.unique()]
+    ranks = frame.rank()
+    scores = pd.concat([ranks.corrwith(values.rank()).abs() for values in targets], axis=1).max(axis=1)
+    return scores.sort_values(ascending=False, kind="stable").index[:limit].tolist()
 
 
-def add_auto_features(X_train, X_test, numeric_priority=None, *, row_local=False):
-    """Возвращает X_train и X_test с новыми колонками; исходные колонки не меняются."""
-    full = pd.concat([X_train, X_test], ignore_index=True)
-    new = {}
+def add_auto_features(X_train, X_test, numeric_priority=None, *, row_local=False, fit_on_train_only=True):
+    """Fit mappings on training rows and apply them independently to both frames."""
+    from data_tools import _EVENT_CLOCKS, parse_event_datetime, to_utc_naive
 
-    categorical = [c for c in full if _is_categorical(full[c])]
-    if row_local:
-        from data_tools import _EVENT_CLOCKS, parse_event_datetime
-    for column in full.columns:
-        if row_local:
-            series = full[column]
-            if pd.api.types.is_datetime64_any_dtype(series):
-                dates = series
-            elif column.lower() in _EVENT_CLOCKS and not pd.api.types.is_numeric_dtype(series):
-                dates = parse_event_datetime(series)
-            else:
+    if not row_local and not fit_on_train_only:
+        raise ValueError("Non-temporal automated features require fit-only statistics")
+    added_train, added_test = {}, {}
+    categorical = [c for c in X_train if _is_categorical(X_train[c])]
+    for column in X_train:
+        fit = X_train[column]
+        if not row_local:
+            dates = _parse_dates(fit)
+            if dates is None:
                 continue
+            queries = to_utc_naive(X_test[column])
+        elif pd.api.types.is_datetime64_any_dtype(fit):
+            dates, queries = fit, X_test[column]
+        elif column.lower() in _EVENT_CLOCKS and not pd.api.types.is_numeric_dtype(fit):
+            dates, queries = parse_event_datetime(fit), parse_event_datetime(X_test[column])
         else:
-            dates = _parse_dates(full[column])
-        if dates is None:
             continue
         if column in categorical:
             categorical.remove(column)
-        new[f"{column}__year"] = dates.dt.year
-        new[f"{column}__month"] = dates.dt.month
-        new[f"{column}__dayofweek"] = dates.dt.dayofweek
-        new[f"{column}__weekend"] = dates.dt.dayofweek.ge(5).astype("float32").where(dates.notna())
-        new[f"{column}__dayofyear"] = dates.dt.dayofyear
-        if row_local or (dates.dt.hour.fillna(0) != 0).any():
-            new[f"{column}__hour"] = dates.dt.hour
-        if row_local:
-            new[f"{column}__hour_of_week"] = dates.dt.dayofweek * 24 + dates.dt.hour
+        include_hour = row_local or (dates.dt.hour.fillna(0) != 0).any()
+        for values, added in ((dates, added_train), (queries, added_test)):
+            added[f"{column}__year"] = values.dt.year
+            added[f"{column}__month"] = values.dt.month
+            added[f"{column}__dayofweek"] = values.dt.dayofweek
+            added[f"{column}__weekend"] = values.dt.dayofweek.ge(5).astype("float32").where(values.notna())
+            added[f"{column}__dayofyear"] = values.dt.dayofyear
+            if include_hour:
+                added[f"{column}__hour"] = values.dt.hour
+            if row_local:
+                added[f"{column}__hour_of_week"] = values.dt.dayofweek * 24 + values.dt.hour
 
-    for column in ([] if row_local else categorical):
-        counts = full[column].value_counts()
-        new[f"{column}__freq"] = full[column].map(counts).astype(float)
+    if not row_local:
+        for column in categorical:
+            counts = X_train[column].value_counts()
+            counts = counts[counts > 0]
+            for frame, added in ((X_train, added_train), (X_test, added_test)):
+                values = frame[column]
+                added[f"{column}__freq"] = values.map(counts).astype(float).fillna(0).where(values.notna())
+        cardinality = X_train[categorical].nunique()
+        groups = cardinality[cardinality.between(2, MAX_GROUP_CARDINALITY)]
+        groups = groups.sort_values(ascending=False, kind="stable").index[:MAX_GROUP_COLUMNS]
+        numeric = [c for c in (numeric_priority or []) if c in X_train and _is_numeric(X_train[c])]
+        if not numeric:
+            numeric = [c for c in X_train if _is_numeric(X_train[c])][:MAX_GROUP_NUMERIC]
+        for group in groups:
+            means = X_train.groupby(group, observed=True)[numeric].mean()
+            for column in numeric:
+                for frame, added in ((X_train, added_train), (X_test, added_test)):
+                    mean = frame[group].map(means[column]).astype(float)
+                    added[f"{column}__mean_by_{group}"] = mean
+                    added[f"{column}__diff_by_{group}"] = frame[column] - mean
 
-    missing = full.isna().sum(axis=1)
+    missing = X_train.isna().sum(axis=1)
     if row_local or missing.any():
-        new["__missing_count"] = missing.astype(float)
+        added_train["__missing_count"] = missing.astype(float)
+        added_test["__missing_count"] = X_test.isna().sum(axis=1).astype(float)
 
-    groups = [] if row_local else [c for c in categorical if 2 <= X_train[c].nunique() <= MAX_GROUP_CARDINALITY]
-    groups = sorted(groups, key=lambda c: -X_train[c].nunique())[:MAX_GROUP_COLUMNS]
-    numeric = [c for c in (numeric_priority or []) if c in full and _is_numeric(full[c])]
-    if not numeric:
-        numeric = [c for c in full if _is_numeric(full[c])][:MAX_GROUP_NUMERIC]
-    for group in groups:
-        for column in numeric:
-            mean = full.groupby(group, observed=True)[column].transform("mean")
-            new[f"{column}__mean_by_{group}"] = mean
-            new[f"{column}__diff_by_{group}"] = full[column] - mean
-
-    if not new:
-        return X_train, X_test
-    added = pd.DataFrame(new).reset_index(drop=True)
-    added = added.loc[:, [c for c in added if c not in full.columns]]
-    result = pd.concat([full.reset_index(drop=True), added], axis=1)
-    n = len(X_train)
-    return result.iloc[:n].reset_index(drop=True), result.iloc[n:].reset_index(drop=True)
+    return tuple(pd.concat([frame, pd.DataFrame({c: v for c, v in added.items() if c not in frame},
+                                                 index=frame.index)], axis=1)
+                 for frame, added in ((X_train, added_train), (X_test, added_test)))
 
 
 def temporal_entity_candidates(frame, clock):

@@ -10,10 +10,13 @@ from __future__ import annotations
 import copy
 import importlib
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+from time_budget import available_cpus, limit_openmp
+
+limit_openmp()
 
 from data_tools import label_available_at as _label_available_at
 
@@ -28,7 +31,7 @@ from sklearn.metrics import (
     r2_score,
     roc_auc_score,
 )
-from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
 logger = logging.getLogger(__name__)
@@ -207,6 +210,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "clip_target": True,          # регрессия: клиппинг предсказаний в диапазон таргета train
     "num_boost_round": 3000,
     "early_stopping_rounds": 100,
+    "es_metric": "auto",
     "log_target": None,           # log1p таргета в регрессии, None - авто (только для rmsle)
     "class_weight": None,         # None или "balanced"
     "postprocess": True,          # подбор весов классов под метрику по меткам
@@ -221,6 +225,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ad_history_window": 20,
     "ad_history_smoothing": 20.,
     "audit_required": False,
+    "auto_features": False,
+    "rare_min_freq": 0,
+    "catboost_ordered_ctr": False,
     "event_activity": False,
     "causal_history": False,
     "history_window": 64,
@@ -235,7 +242,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _ROUND_KEYS = ("n_estimators", "num_iterations", "num_boost_round", "iterations", "num_rounds")
 _MIN_ROUNDS = 20                  # меньше этого по бюджету времени не урезаем
-_AUDITED_CAT_ONE_HOT = 32
 _TE_SMOOTHING = 2.0               # сглаживание среднего по ключу к общему среднему, «виртуальных строк»
 _TE_INNER_FOLDS = 5               # внутренние фолды для кодирования строк обучающей части
 _REFIT_ROUNDS = 1.15              # на всем train раундов больше, чем в среднем на фолде: данных больше
@@ -254,7 +260,11 @@ def _resolve_config(config: dict | None) -> dict:
         if key in cfg["params"]:
             cfg["num_boost_round"] = int(cfg["params"].pop(key))
     cfg["model"] = str(cfg["model"]).strip().lower()
-    max_jobs = min(8, os.cpu_count() or 1)
+    if cfg["es_metric"] not in ("auto", "logloss"):
+        raise ValueError("es_metric must be auto or logloss")
+    if cfg["rare_min_freq"] < 0:
+        raise ValueError("rare_min_freq must be nonnegative")
+    max_jobs = available_cpus()
     requested = int(cfg["n_jobs"] or max_jobs)
     cfg["n_jobs"] = min(max_jobs, requested) if requested > 0 else max_jobs
     for key in ("num_threads", "num_thread", "nthread", "nthreads", "n_jobs", "thread_count"):
@@ -271,24 +281,25 @@ def _resolve_config(config: dict | None) -> dict:
 def _check_backend(name: str) -> str:
     aliases = {"lightgbm": "lightgbm", "lgbm": "lightgbm", "lgb": "lightgbm",
                "catboost": "catboost", "cb": "catboost", "xgboost": "xgboost", "xgb": "xgboost"}
-    backend = aliases.get(name)
-    if backend is None:
-        logger.warning("Неизвестная модель %r, откат на LightGBM", name)
-        return "lightgbm"
-    if backend != "lightgbm":
-        try:
-            importlib.import_module(backend)
-        except ImportError:
-            logger.warning("Библиотека %s недоступна, откат на LightGBM", backend)
-            return "lightgbm"
-    return backend
+    backend = aliases.get(name, "lightgbm")
+    if backend_available(backend):
+        return backend
+    for fallback in ("lightgbm", "catboost", "xgboost"):
+        if fallback != backend and backend_available(fallback):
+            logger.warning("Backend %s unavailable, using %s", backend, fallback)
+            return fallback
+    raise RuntimeError("No supported boosting backend is available")
 
 
-def backend_available(name):
+def backend_available(name, *, diagnostics=None):
     try:
         importlib.import_module(name)
-    except (ImportError, OSError):
+    except (ImportError, OSError) as exc:
+        if diagnostics is not None:
+            diagnostics[name] = f"fail({type(exc).__name__}: {exc})".replace("\n", " ")
         return False
+    if diagnostics is not None:
+        diagnostics[name] = "ok"
     return True
 
 
@@ -312,7 +323,7 @@ def unseen_category_share(X: pd.DataFrame, X_test: pd.DataFrame) -> dict[str, fl
 
 
 def _prepare_features(X: pd.DataFrame, X_test: pd.DataFrame, features: list | None,
-                      cat_encoding: str = "native") -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+                      cat_encoding: str = "native", rare_min_freq: int = 0) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Отбор признаков и приведение типов. Одна копия на датафрейм, исходники не меняются.
 
     cat_encoding="frequency" заменяет категорию ее долей в train, новые значения test получают 0.
@@ -342,10 +353,18 @@ def _prepare_features(X: pd.DataFrame, X_test: pd.DataFrame, features: list | No
             t = Xtp[col]
             Xtp[col] = t.map(freq).astype(float).where(t.isna() | t.isin(freq.index), 0.0)
         elif _is_categorical(s):
-            cat = Xp[col].astype("category").cat.remove_unused_categories()
-            Xp[col] = cat
-            # Категории test строго по train, новые значения становятся NaN
-            Xtp[col] = pd.Categorical(Xtp[col], categories=cat.cat.categories)
+            if rare_min_freq:
+                counts = s.astype("string").value_counts()
+                known = counts.index[counts >= rare_min_freq]
+                categories = known.union(pd.Index(["__rare__"]), sort=False)
+                for frame in (Xp, Xtp):
+                    values = frame[col].astype("string")
+                    collapsed = values.where(values.isna() | values.isin(known), "__rare__")
+                    frame[col] = pd.Categorical(collapsed, categories=categories)
+            else:
+                cat = s.astype("category").cat.remove_unused_categories()
+                Xp[col] = cat
+                Xtp[col] = pd.Categorical(Xtp[col], categories=cat.cat.categories)
             cat_cols.append(col)
         elif pd.api.types.is_bool_dtype(s):
             Xp[col] = s.astype("float32")
@@ -415,13 +434,10 @@ def _make_folds(y_enc: np.ndarray, task_type: str, n_folds: int, seed: int,
         n_groups = len(pd.unique(groups))
         if n_groups >= 2:
             n_folds = min(n_folds, n_groups)
-            if task_type in CLASSIFICATION:
-                splitter = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-                return list(splitter.split(np.zeros(n), y_enc, groups))
             return list(GroupKFold(n_splits=n_folds).split(np.zeros(n), groups=groups))
-        logger.warning("В колонке разбиения меньше двух групп, использую случайные фолды")
+        raise ValueError("Grouped validation needs at least two groups")
     if task_type in CLASSIFICATION:
-        min_count = int(np.bincount(y_enc).min())
+        min_count = int(np.unique(y_enc, return_counts=True)[1].min())
         if min_count < n_folds:
             new = max(2, min_count)
             logger.warning("В редком классе %d объектов, число фолдов %d -> %d", min_count, n_folds, new)
@@ -430,6 +446,19 @@ def _make_folds(y_enc: np.ndarray, task_type: str, n_folds: int, seed: int,
         return list(splitter.split(np.zeros(n), y_enc))
     splitter = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
     return list(splitter.split(np.zeros(n)))
+
+
+def _iid_monitor(fit, y, task_type, seed, groups):
+    """Pick an inner holdout inside the outer fit, preserving group boundaries."""
+    inner_groups = groups[fit] if groups is not None else None
+    n_classes = np.unique(y[fit]).size
+    try:
+        for tr, va in _make_folds(y[fit], task_type, 5, seed, inner_groups):
+            if task_type == "regression" or np.unique(y[fit[tr]]).size == n_classes:
+                return fit[tr], fit[va]
+    except ValueError:
+        pass
+    return fit, fit[:2048]
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +618,8 @@ def _lgb_params(task_type, metric, n_classes, cfg):
                 params["alpha"] = .5
         params.update(objective=objective, metric="l1" if metric.name == "mae" else "l2")
     elif task_type == "binary":
-        params.update(objective="binary", metric="average_precision" if metric.name == "pr_auc" else "binary_logloss")
+        monitor_ap = metric.name == "pr_auc" and cfg["es_metric"] == "auto"
+        params.update(objective="binary", metric="average_precision" if monitor_ap else "binary_logloss")
     else:
         params.update(objective="multiclass", num_class=n_classes, metric="multi_logloss")
     params.update(cfg["params"])
@@ -651,7 +681,8 @@ def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg
         else:
             params.update(objective="reg:squarederror", eval_metric="rmse")
     elif task_type == "binary":
-        params.update(objective="binary:logistic", eval_metric="logloss")
+        monitor_ap = metric.name == "pr_auc" and cfg["es_metric"] == "auto" and np.unique(yva).size == 2
+        params.update(objective="binary:logistic", eval_metric="aucpr" if monitor_ap else "logloss")
     else:
         params.update(objective="multi:softprob", num_class=n_classes, eval_metric="mlogloss")
     params.update(cfg["params"])
@@ -668,13 +699,9 @@ def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg
     timer = TimeCallback()
     dtrain = xgb.DMatrix(Xtr, ytr, weight=wtr, enable_categorical=True, nthread=cfg["n_jobs"])
     dvalid = xgb.DMatrix(Xva, yva, enable_categorical=True, nthread=cfg["n_jobs"])
-    monitor_ap = metric.name == "pr_auc" and np.unique(yva).size == 2
-    def ap_metric(pred, dataset):
-        return "average_precision", float(average_precision_score(dataset.get_label(), pred))
     booster = xgb.train(
         params, dtrain, num_boost_round=cfg["num_boost_round"], evals=[(dvalid, "valid")],
-        custom_metric=ap_metric if monitor_ap else None,
-        callbacks=[xgb.callback.EarlyStopping(cfg["early_stopping_rounds"], maximize=True if monitor_ap else None), timer],
+        callbacks=[xgb.callback.EarlyStopping(cfg["early_stopping_rounds"]), timer],
         verbose_eval=False,
     )
     try:
@@ -691,19 +718,8 @@ def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg
     return pva, pte, best, timer.stopped, booster.num_boosted_rounds()
 
 
-class _CatAveragePrecision:
-    def evaluate(self, approxes, target, weight):
-        return float(average_precision_score(target, approxes[0])), 1.
-
-    def get_final_error(self, error, weight):
-        return error / weight
-
-    def is_max_optimal(self):
-        return True
-
-
 def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg, deadline,
-                  cat_cols=()):
+                  cat_cols=(), fit_times=None):
     from catboost import CatBoost, Pool
 
     params = {
@@ -721,13 +737,28 @@ def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
             params["eval_metric"] = "MAE"
     elif task_type == "binary":
         params.update(loss_function="Logloss", class_names=[0, 1])
-        if metric.name == "pr_auc" and np.unique(yva).size == 2:
-            params["eval_metric"] = _CatAveragePrecision()
+        monitor_ap = metric.name == "pr_auc" and cfg["es_metric"] == "auto" and np.unique(yva).size == 2
+        params["eval_metric"] = "PRAUC" if monitor_ap else "Logloss"
     else:
         params.update(loss_function="MultiClass", class_names=list(range(n_classes)))
     params.update(cfg["params"])
-    if cfg.get("audit_required") and (cfg.get("split") or {}).get("type") == "time":
-        params["one_hot_max_size"] = _AUDITED_CAT_ONE_HOT
+    temporal = (cfg.get("split") or {}).get("type") == "time"
+    params["has_time"] = temporal
+    if temporal:
+        from leak_audit import audit_log
+
+        ordered = (fit_times is not None and len(fit_times) == len(Xtr)
+                   and fit_times.is_monotonic_increasing and fit_times.notna().all())
+        if not ordered and cfg["audit_required"]:
+            audit_log("fail", "catboost_order", reason="fit rows must be sorted by valid event time")
+        assert ordered, "CatBoost fit rows must be sorted by valid event time"
+        ordered_ctr = cfg["catboost_ordered_ctr"] and fit_times.is_unique and not cfg["label_delay_unit"]
+        if not ordered_ctr:
+            # Tied event times and delayed labels cannot safely feed a row-order CTR.
+            params["one_hot_max_size"] = max((Xtr[col].nunique() for col in cat_cols), default=0)
+        if cfg["audit_required"]:
+            audit_log("pass", "catboost_order", sample_sizes=[len(Xtr)],
+                      rule="sorted event time", categorical_mode="ordered_ctr" if ordered_ctr else "one_hot")
 
     class TimeCallback:
         stopped = False
@@ -916,26 +947,23 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     # Колонки-ключи для кодирования по таргету сами в модель не идут, только их кодировки
     te_cols = [c for c in (cfg["target_encoding"] or []) if c in X.columns and c in X_test.columns]
     features = [c for c in (cfg["features"] or list(X.columns)) if c not in te_cols]
+    if not features or any(c not in X_test for c in features):
+        raise ValueError("Training and prediction require the same nonempty feature list")
+    Xp, Xtp = X[features].copy(deep=False), X_test[features].copy(deep=False)
     if temporal:
-        # In a time split even categorical vocabularies and frequencies are fitted per window.
-        Xp, Xtp, cat_cols = X[features].copy(deep=False), X_test[features].copy(deep=False), []
         clock = split["column"]
         if clock in features and not pd.api.types.is_numeric_dtype(X[clock]):
             Xp[clock] = times
             Xtp[clock] = _time_values(X_test[clock])
-    else:
-        Xp, Xtp, cat_cols = _prepare_features(X, X_test, features, cfg["cat_encoding"])
     cfg["features"] = list(Xp.columns)
     cfg["target_encoding"] = te_cols or None
     te_keys = {c: X[c].to_numpy()[labeled] for c in te_cols}
     te_keys_test = {c: X_test[c].to_numpy() for c in te_cols}
     groups = None
     if split.get("type") == "group":
-        groups = X[split["column"]].to_numpy()[labeled]
+        groups = pd.factorize(X[split["column"]].iloc[np.flatnonzero(labeled)], sort=True)[0]
     if not labeled.all():
         Xp = Xp.iloc[np.flatnonzero(labeled)]
-    if cfg["model"] == "catboost" and not temporal:
-        Xp, Xtp = _to_catboost_frame(Xp, cat_cols), _to_catboost_frame(Xtp, cat_cols)
 
     def training_weights(indices):
         weights = None
@@ -992,14 +1020,20 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             folds = eligible
     else:
         folds = _make_folds(y_fit, task_type, cfg["n_folds"], cfg["fold_seed"], groups)
+        if groups is not None and task_type in CLASSIFICATION:
+            folds = [(tr, va) for tr, va in folds if np.unique(y_fit[tr]).size == n_classes and
+                     (metric_obj.name not in ("roc_auc", "gini") or np.unique(y_fit[va]).size == n_classes)]
+            if not folds:
+                raise ValueError("No grouped validation window has sufficient class coverage")
     clip = task_type == "regression" and bool(cfg["clip_target"])
     cfg["n_folds"] = len(folds)
     fit_fn = _BACKENDS[cfg["model"]]
-    extra = {"cat_cols": cat_cols} if cfg["model"] == "catboost" else {}
+    extra = {}
     te_Y = _te_targets(y_train_scale, y_fit, task_type, n_classes) if te_cols or cfg["entity_history"] else None
     te_periods = None
     if te_cols and cfg["te_lag"] and groups is not None and pd.api.types.is_numeric_dtype(X[split['column']]):
-        te_periods = (groups.astype(float), X_test[split['column']].to_numpy().astype(float))
+        te_periods = (X[split["column"]].to_numpy()[labeled].astype(float),
+                      X_test[split["column"]].to_numpy().astype(float))
     te_names = _te_columns(te_cols, te_Y.shape[1] + 1, te_periods is not None) if te_cols else []
 
     candidates = {"entity_history": [], "categorical_ids": []}
@@ -1127,19 +1161,35 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                 Xtr = Xtr.copy()
                 for col in candidates["categorical_ids"]:
                     Xtr[col] = Xtr[col].astype("category")
-            Xtr, prepared, cats = _prepare_features(Xtr, evaluation, list(Xtr.columns), "native")
-            if cfg["model"] == "catboost":
+        else:
+            Xte = Xp.iloc[predict_idx] if predict_idx is not None else Xte
+            evaluation = pd.concat([Xva, Xte], ignore_index=True)
+            if cfg["auto_features"]:
+                from features import add_auto_features, important_numeric
+                priority = important_numeric(Xtr, y_fit[tr_idx], task_type, seed=cfg["fold_seed"])
+                raw_fit = Xtr
+                Xtr, evaluation = add_auto_features(raw_fit, evaluation, priority, fit_on_train_only=True)
                 if cfg["audit_required"]:
-                    # Keep CatBoost from computing target statistics in a shuffled training order.
-                    # High-cardinality categories use only the fold's unlabeled vocabulary.
-                    ordinal = [col for col in cats if len(Xtr[col].cat.categories) >= _AUDITED_CAT_ONE_HOT]
-                    for col in ordinal:
-                        Xtr[col] = Xtr[col].cat.codes.astype("float32")
-                        prepared[col] = prepared[col].cat.codes.astype("float32")
-                    cats = [col for col in cats if col not in ordinal]
-                extra["cat_cols"] = cats
-                Xtr, prepared = _to_catboost_frame(Xtr, cats), _to_catboost_frame(prepared, cats)
-            Xva, Xte = prepared.iloc[:len(va_idx)], prepared.iloc[len(va_idx):]
+                    from leak_audit import AuditBudget, check_equal, sample_positions
+
+                    def verify_fit_only(counts, check_time):
+                        positions = sample_positions(len(raw_fit), limit=counts[0])
+                        replayed, _ = add_auto_features(raw_fit, raw_fit.iloc[:0], priority, fit_on_train_only=True)
+                        check_time()
+                        check_equal(Xtr.iloc[positions], replayed.iloc[positions])
+                        return {"rule": "fit-only statistics; validation and test removed during replay",
+                                "features": list(Xtr.columns.difference(raw_fit.columns))}
+
+                    AuditBudget().sampled("auto_features_fit_only", [len(raw_fit)], verify_fit_only)
+
+        Xtr, prepared, cats = _prepare_features(Xtr, evaluation, list(Xtr.columns),
+                                                cfg["cat_encoding"], cfg["rare_min_freq"])
+        if cfg["model"] == "catboost":
+            extra["cat_cols"] = cats
+            if temporal:
+                extra["fit_times"] = labeled_times.iloc[tr_idx]
+            Xtr, prepared = _to_catboost_frame(Xtr, cats), _to_catboost_frame(prepared, cats)
+        Xva, Xte = prepared.iloc[:len(va_idx)], prepared.iloc[len(va_idx):]
         if te_cols and not temporal:
             enc_tr, enc_va, enc_te = _target_encode(te_keys, te_keys_test, te_Y, tr_idx, va_idx,
                                                     groups, cfg["fold_seed"], te_periods)
@@ -1152,7 +1202,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
 
     logger.info("Старт: %s, %s, метрика %s, модель %s, %d фолдов, %d строк, %d признаков (%d кат.)%s",
                 task_type, "log1p" if log_target else "raw", metric_obj.name, cfg["model"],
-                len(folds), len(y_fit), Xp.shape[1], len(cat_cols),
+                len(folds), len(y_fit), Xp.shape[1], sum(_is_categorical(Xp[c]) for c in Xp),
                 f", кодирование по таргету {te_cols}" if te_cols else "")
 
     n = len(y_fit)
@@ -1172,6 +1222,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         fold_deadline = now + 0.9 * (deadline - now) / (len(folds) - i + refit_slot)
         try:
             fit_idx, monitor_idx, fold_config = tr_idx, va_idx, cfg
+            monitor_deadline = fold_deadline
             if temporal:
                 fit_idx, monitor_idx, mode = _past_monitor(tr_idx, labeled_times, y_fit, task_type, available_at)
                 monitor_windows.append({
@@ -1183,7 +1234,21 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                 if mode == "training_monitor":
                     rounds = min(64, int(cfg["num_boost_round"]))
                     fold_config = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1}
-            Xtr, Xmon, Xpred = fold_frames(fit_idx, monitor_idx, va_idx if temporal else None)
+            elif cfg["audit_required"]:
+                fit_idx, monitor_idx = _iid_monitor(tr_idx, y_fit, task_type, cfg["fold_seed"], groups)
+                if fit_idx is tr_idx:
+                    rounds = min(64, int(cfg["num_boost_round"]))
+                    fold_config = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1}
+                else:
+                    monitor_deadline = now + .65 * (fold_deadline - now)
+            if temporal and cfg["model"] == "catboost":
+                fit_idx = fit_idx[np.argsort(labeled_times.iloc[fit_idx].to_numpy(), kind="stable")]
+            if not temporal and cfg["audit_required"]:
+                Xtr, queries, Xpred = fold_frames(fit_idx, np.concatenate([monitor_idx, va_idx]))
+                Xmon = queries.iloc[:len(monitor_idx)]
+                Xpred = pd.concat([queries.iloc[len(monitor_idx):], Xpred], ignore_index=True)
+            else:
+                Xtr, Xmon, Xpred = fold_frames(fit_idx, monitor_idx, va_idx if temporal else None)
             if not model_inputs:
                 model_inputs = {c: {"input_dtype": str(Xp[c].dtype) if c in Xp else "derived",
                                     "model_dtype": str(Xtr[c].dtype),
@@ -1191,10 +1256,28 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             fold_weight = training_weights(fit_idx)
             pva, pte, best_iter, stopped, last_iter = fit_fn(
                 Xtr, y_train_scale[fit_idx], fold_weight, Xmon, y_train_scale[monitor_idx], Xpred,
-                task_type, metric_obj, n_classes, fold_config, fold_deadline, **extra,
+                task_type, metric_obj, n_classes, fold_config, monitor_deadline, **extra,
             )
             if temporal:
                 pva = pte
+            elif cfg["audit_required"]:
+                if fit_idx is not tr_idx and time.monotonic() < fold_deadline:
+                    Xall, queries, Xfuture = fold_frames(tr_idx, np.concatenate([monitor_idx, va_idx]))
+                    Xmonitor = queries.iloc[:len(monitor_idx)]
+                    Xfuture = pd.concat([queries.iloc[len(monitor_idx):], Xfuture], ignore_index=True)
+                    refit_cfg = cfg | {"num_boost_round": best_iter, "early_stopping_rounds": best_iter + 1,
+                                       "final_fit": True}
+                    try:
+                        _, refit_predictions, _, refit_stopped, _ = fit_fn(
+                            Xall, y_train_scale[tr_idx], training_weights(tr_idx), Xmonitor, y_train_scale[monitor_idx],
+                            Xfuture, task_type, metric_obj, n_classes, refit_cfg, fold_deadline, **extra,
+                        )
+                    except (RuntimeError, ValueError, TimeoutError):
+                        logger.exception("Outer fit refit failed; retaining the inner-fit predictions")
+                    else:
+                        if not refit_stopped:
+                            pte = refit_predictions
+                pva, pte = pte[:len(va_idx)], pte[len(va_idx):]
         except Exception as e:
             raise RuntimeError(f"Ошибка обучения {cfg['model']} на фолде {i + 1}: "
                                f"{type(e).__name__}: {e}") from e
@@ -1270,6 +1353,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             # формально, берем небольшой кусок train
             rcfg = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1, "final_fit": True}
             all_idx = refit_idx
+            if temporal and cfg["model"] == "catboost":
+                all_idx = all_idx[np.argsort(labeled_times.iloc[all_idx].to_numpy(), kind="stable")]
             monitor = np.random.default_rng(cfg["seed"]).choice(all_idx, min(len(all_idx), 2000), replace=False)
             try:
                 Xall, Xmon, Xte = fold_frames(all_idx, monitor)
@@ -1749,7 +1834,6 @@ def compare_results(a: dict, b: dict) -> dict:
 _AUTO_MIN_STEP = 20.0             # меньше стольких секунд на модель не запускаем (не больше 10% бюджета)
 _AUTO_MAX_SEEDS = 3               # максимум моделей одного типа с разными сидами
 _AUTO_SAFETY = 1.3                # запас к оценке времени следующей модели
-_AUTO_UNSEEN_MAX = 0.01           # при большей доле новых категорий в test XGBoost не используем
 _AUTO_TUNE_MIN_TRIALS = 8         # подбор параметров, только если влезает столько обучений LightGBM
 _AUTO_TUNE_MAX_TRIALS = 40        # и не дольше стольких обучений
 
@@ -1761,7 +1845,8 @@ def tune_backend(model, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, tas
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     deadline = time.monotonic() + time_budget
-    greater = get_metric(metric, task_type).greater_is_better
+    metric_obj = get_metric(metric, task_type)
+    metric, greater = metric_obj.name, metric_obj.greater_is_better
     base = dict(config) | {"model": model, "postprocess": False, "refit_full": False}
     if diagnostics is not None:
         diagnostics.update(n_trials=0, completed=0, prefix_max=None)
@@ -1772,19 +1857,22 @@ def tune_backend(model, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, tas
         clock = detect_time_column(X, X_test)
         split = {"type": "time", "column": clock} if clock else None
     temporal = (split or {}).get("type") == "time"
-    if model != "lightgbm" and not temporal:
+    if not backend_available(model):
         return {}
     if temporal:
         clock = _time_values(X[split["column"]]).reset_index(drop=True)
         targets = pd.Series(np.asarray(y))
         eligible = targets.notna() & clock.notna()
-        times = pd.Index(clock[eligible].unique()).sort_values()
-        if len(times) < 2:
+        observed = np.flatnonzero(eligible)
+        if len(observed) < 12 or clock.iloc[observed].nunique() < 2:
             return {}
-        n_blocks = min(len(times), max(2, int(base.get("n_folds", DEFAULT_CONFIG["n_folds"])) + 1))
-        first_validation = times[(len(times) + n_blocks - 1) // n_blocks]
-        prefix = eligible & clock.lt(first_validation)
-        positions = np.flatnonzero(prefix)
+        labels = targets.iloc[observed]
+        y_fold = pd.factorize(labels)[0] if task_type in CLASSIFICATION else labels.to_numpy()
+        outer = _time_folds(clock.iloc[observed], y_fold, base.get("n_folds", DEFAULT_CONFIG["n_folds"]),
+                            task_type, metric)
+        fit, valid = outer[0]
+        positions = observed[fit]
+        first_validation = clock.iloc[observed[valid]].min()
         if base.get("label_delay_unit"):
             published = _label_available_at(clock.iloc[positions], targets.iloc[positions].to_numpy(),
                                             base["label_delay_unit"])
@@ -1802,7 +1890,39 @@ def tune_backend(model, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, tas
         column = split["column"]
         tz = getattr(X_test[column].dtype, "tz", None)
         X_test[column] = first_validation if tz is None else first_validation.tz_localize("UTC").tz_convert(tz)
-        base.update(n_folds=3, split=split)
+    else:
+        labels = pd.Series(np.asarray(y))
+        eligible = np.flatnonzero(labels.notna())
+        labels = labels.iloc[eligible]
+        if len(labels) < 12 or (task_type in CLASSIFICATION and labels.nunique() < 2):
+            return {}
+        groups = None
+        if split:
+            groups = pd.factorize(X[split["column"]].iloc[eligible], sort=True)[0]
+            if len(np.unique(groups)) < 4:
+                return {}
+        y_fold = pd.factorize(labels, sort=True)[0] if task_type in CLASSIFICATION else labels.to_numpy()
+        outer = _make_folds(y_fold, task_type, base.get("n_folds", DEFAULT_CONFIG["n_folds"]),
+                            base.get("fold_seed") or base.get("seed", 42), groups)
+        usable = [(fit, val) for fit, val in outer
+                  if task_type == "regression" or
+                  (np.unique(y_fold[fit]).size == labels.nunique() and
+                   (metric not in ("roc_auc", "gini") or np.unique(y_fold[val]).size == labels.nunique()))]
+        if not usable:
+            return {}
+        fit, valid = usable[0]
+        if (len(fit) < 12 or (groups is not None and len(np.unique(groups[fit])) < 3) or
+                (task_type in CLASSIFICATION and np.unique(y_fold[fit], return_counts=True)[1].min() < 3)):
+            return {}
+        X = X.iloc[eligible[fit]].reset_index(drop=True)
+        y = labels.iloc[fit].reset_index(drop=True)
+        X_test = X.iloc[[-1]].copy()
+        if diagnostics is not None:
+            diagnostics.update(outer_fit_rows=len(fit), outer_validation_rows=len(valid))
+    base.update(n_folds=3, split=split)
+    if diagnostics is not None:
+        diagnostics.update(inner_folds=3, fit_rows=len(y),
+                           validation_mode="prefix" if temporal else "group" if split else "iid")
 
     def suggest(trial):
         if model == "catboost":
@@ -1837,7 +1957,7 @@ def tune_backend(model, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, tas
                                 time_budget=min(left, max(20., time_budget / 3)) if model != "lightgbm" else left)
         trial.study.set_user_attr("trial_seconds", max(1., time.monotonic() - started))
         # Фолды, урезанные по времени, дают несравнимый скор
-        if res["config"]["n_folds_done"] < res["config"]["n_folds"]:
+        if res["config"]["n_folds_done"] != 3:
             raise optuna.TrialPruned()
         return res["score"]
 
@@ -1848,7 +1968,7 @@ def tune_backend(model, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, tas
                              "feature_fraction": 0.8, "bagging_fraction": 0.8, "lambda_l2": 1.0})
     t0 = time.monotonic()
     study.optimize(objective, timeout=max(0.0, deadline - time.monotonic()),
-                   n_trials=12 if temporal else None, catch=(ValueError, RuntimeError, TimeoutError))
+                   n_trials=12, catch=(ValueError, RuntimeError, TimeoutError))
     done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if diagnostics is not None:
         diagnostics.update(n_trials=len(study.trials), completed=len(done))
@@ -1954,16 +2074,9 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
             return previous
         return res
 
-    # XGBoost катастрофически ошибается на категориях, которых не было в train, а CV этого
-    # не видит: в OOF новых категорий не бывает. Поэтому при их заметной доле обходимся без него
-    features = base.get("features") or list(X.columns)
-    unseen = unseen_category_share(X[features], X_test[features])
     use_lgb = backend_available("lightgbm")
-    use_xgb = backend_available("xgboost") and max(unseen.values(), default=0.0) < _AUTO_UNSEEN_MAX
+    use_xgb = backend_available("xgboost")
     use_cat = backend_available("catboost")
-    if not use_xgb:
-        logger.warning("auto_train: в test новые категории %s, XGBoost не используем",
-                       {k: round(v, 3) for k, v in unseen.items() if v >= _AUTO_UNSEEN_MAX})
 
     # Шаг 1: два бустинга с дефолтами, LightGBM первым как самый быстрый
     if use_lgb:
@@ -1996,6 +2109,9 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
             if use_lgb:
                 queue.append((f"lgb_seed{k + 1}", {"model": "lightgbm", "seed": seed0 + k}))
 
+            if use_catboost and use_cat and "catboost" in members:
+                queue.append((f"cat_seed{k + 1}", {"model": "catboost", "seed": seed0 + k}))
+
     add_seeds(1, min(max_seeds, _AUTO_MAX_SEEDS))
     added = [run(name, extra) for name, extra in queue]
     if max_seeds > _AUTO_MAX_SEEDS:
@@ -2019,14 +2135,18 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     if any(added):
         best = blend(best)
 
-    # Шаг 3: CatBoost только по флагу, в самом конце и только при большом запасе
     if use_catboost and use_cat and "catboost" not in members:
         if remaining() > 0.5 * time_budget:
             if run("catboost", {"model": "catboost"}):
+                queue = []
+                add_seeds(1, max_seeds)
+                for name, extra in queue:
+                    if extra["model"] == "catboost":
+                        run(name, extra)
                 best = blend(best)
         else:
             skipped_budget.append("catboost")
-            logger.info("auto_train: CatBoost пропущен, осталось %.0f%% бюджета",
+            logger.info("auto_train: CatBoost skipped, %.0f%% of budget left",
                         100 * max(remaining(), 0) / time_budget)
 
     if best is None:

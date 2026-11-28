@@ -231,13 +231,17 @@ def detect_time_column(X_train, X_test, time_column=None):
     return candidates[0] if len(candidates) == 1 else None
 
 
-def detect_split(X_train, X_test, max_groups=50, min_unseen=0.9, time_column=None):
+def detect_split(X_train, X_test, max_groups=50, min_unseen=0.9, time_column=None, group_column=None):
     """Определяет временную ось событий или колонку независимых групп.
 
     Приоритет у времени события и числовых периодов, когда test следует за train.
     Для остальных колонок проверяем долю новых групп в test. Возвращает словарь
     с типом time/group и именем колонки или None для обычной валидации.
     """
+    if group_column is not None and time_column is None:
+        if group_column not in X_train or group_column not in X_test:
+            raise ValueError(f"Group column {group_column} must be present in train and test")
+        return {"type": "group", "column": group_column}
     clock = detect_time_column(X_train, X_test, time_column)
     if clock is not None:
         return {"type": "time", "column": clock}
@@ -246,7 +250,9 @@ def detect_split(X_train, X_test, max_groups=50, min_unseen=0.9, time_column=Non
         if name not in X_train:
             continue
         n_groups = X_train[name].nunique()
-        if not 2 <= n_groups <= max_groups:
+        if n_groups < 2:
+            continue
+        if n_groups > max_groups and n_groups * 2 > X_train[name].notna().sum():
             continue
         values = X_test[name].dropna()
         if values.empty:
@@ -413,6 +419,11 @@ def guess_task_spec(task_dir, task_text=""):
     explicit_clock = _task_clock(task_text)
     if explicit_clock:
         spec["time_column"] = detect_time_column(train, test, explicit_clock)
+    else:
+        group = re.search(r"(?:group(?:ing)? column|group key|колонка группировки|поле группы)"
+                          r"\s*[:=—-]\s*[`'\"]?(\w+)", task_text, re.I)
+        if group and group[1] in train and group[1] in test:
+            spec["group_column"] = group[1]
     spec.update(target_constraints(task_text, target, y, task_type))
     return spec, confident
 

@@ -12,6 +12,10 @@ from itertools import chain, combinations
 
 from pathlib import Path
 
+from time_budget import available_cpus, limit_openmp
+
+limit_openmp()
+
 import numpy as np
 import pandas as pd
 
@@ -25,7 +29,8 @@ output_directory = ContextVar("output_directory", default=None)
 # Ключи конфига, которые имеют смысл для всего рецепта auto, а не для одной модели
 AUTO_KEYS = ("features", "cat_encoding", "target_encoding", "refit_full", "entity_history", "log_target",
              "ad_history", "ad_history_window", "ad_history_smoothing", "event_activity", "causal_history",
-             "history_window", "history_smoothing", "mae_shift", "recency_days", "mae_objective")
+             "history_window", "history_smoothing", "mae_shift", "recency_days", "mae_objective",
+             "auto_features", "rare_min_freq", "catboost_ordered_ctr", "es_metric")
 
 
 def apply_feature_code(feature_code, X_train, X_test):
@@ -58,7 +63,13 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
     """Prepare identical inputs for outer training and hyperparameter selection."""
     if data is None:
         data = load_data(task_dir, task_spec)
-    split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"))
+    from leak_audit import LeakAuditError
+
+    audited = task_spec.get("audit_required", False)
+    if audited and feature_code:
+        raise LeakAuditError("custom transforms are not certified for audited folds")
+    split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"),
+                         group_column=task_spec.get("group_column"))
     temporal = (split or {}).get("type") == "time"
     X_train, X_test = data["X_train"].reset_index(drop=True), data["X_test"].reset_index(drop=True)
     if temporal:
@@ -70,10 +81,7 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
                 frame[clock] = parse_event_datetime(frame[clock])
     if feature_code:
         X_train, X_test = apply_feature_code(feature_code, X_train, X_test)
-    y_train = data["y_train"].reset_index(drop=True)
     cfg = dict(config or {})
-    from leak_audit import LeakAuditError
-    audited = task_spec.get("audit_required", False)
     if audited and temporal and any(cfg.get(key) for key in ("target_encoding", "entity_history", "ad_history")):
         raise LeakAuditError("temporal configuration uses an uncertified legacy feature group")
     hourly_extended = bool(cfg.pop("hourly_extended", False))
@@ -81,12 +89,9 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
     if audited and not hourly_extended:
         X_train, X_test = X_train.drop(columns=hourly_columns), X_test.drop(columns=hourly_columns)
     auto_features = bool(cfg.pop("auto_features", False))
-    if auto_features:
-        from features import add_auto_features, important_numeric
-        if audited and not temporal:
-            raise LeakAuditError("automated transforms require a time split")
-        priority = None if temporal else important_numeric(X_train, y_train, task_spec["task_type"])
-        transformed = add_auto_features(X_train, X_test, priority, row_local=temporal)
+    if auto_features and temporal:
+        from features import add_auto_features
+        transformed = add_auto_features(X_train, X_test, row_local=True)
         if audited:
             from leak_audit import AuditBudget, check_equal, sample_positions
 
@@ -100,10 +105,12 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
 
             AuditBudget().sampled("calendar", [len(X_train), len(X_test)], verify_calendar)
         X_train, X_test = transformed
+    elif auto_features:
+        cfg["auto_features"] = True
 
     for key in ("n_folds", "fold_seed", "split", "n_jobs"):
         cfg.pop(key, None)
-    fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": 8, "split": split, "audit_required": audited}
+    fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": available_cpus(), "split": split, "audit_required": audited}
     if task_spec.get("label_delay_unit"):
         fixed["label_delay_unit"] = task_spec["label_delay_unit"]
     return X_train, X_test, cfg | fixed
@@ -179,7 +186,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     cfg["params"] = dict(cfg.get("params") or {})
     for key in ("num_threads", "nthread", "thread_count", "n_jobs"):
         if key in cfg["params"]:
-            cfg["params"][key] = 8
+            cfg["params"][key] = fixed["n_jobs"]
     if recipe == "auto":
         result = auto_train(
             X_train, y_train, X_test, task_type, metric, time_budget,
@@ -209,8 +216,6 @@ def run_prefix_tuning(task_dir, task_spec, config, time_budget):
     started = time.monotonic()
     data = load_data(task_dir, task_spec)
     X_train, X_test, prepared = prepare_features(task_dir, task_spec | {"audit_required": True}, config, data=data)
-    if (prepared["split"] or {}).get("type") != "time":
-        raise ValueError("Prefix tuning requires a chronological split")
     prepared.pop("max_seeds", None)
     stats = {}
     left = max(0., time_budget - (time.monotonic() - started))
@@ -224,6 +229,21 @@ def _beats_fold_baselines(scores, baselines, greater):
         return False
     return all((score > base["score"] if greater else score < base["score"])
                for score, base in zip(scores, baselines))
+
+
+def _passes_quality_gate(control, candidate, compare_results):
+    if control.get("fold_signature") != candidate.get("fold_signature"):
+        return False
+    paired = compare_results(control, candidate)
+    folds = len(paired["diffs"])
+    direction = 1 if candidate["greater_is_better"] else -1
+
+    def baseline_wins(report):
+        return sum(direction * (score - base["score"]) > 0
+                   for score, base in zip(report["fold_scores"], report.get("fold_baselines", [])))
+
+    return (paired["n_better"] > folds / 2 and paired["diff_mean"] > paired["diff_std"] / math.sqrt(folds)
+            and baseline_wins(candidate) >= baseline_wins(control))
 
 
 def _record(task_dir, task_spec, data, history, result, report):
@@ -242,6 +262,8 @@ def _record(task_dir, task_spec, data, history, result, report):
     complete = n_folds_done == n_folds
     better = previous is None
     comparison = None
+    quality_pass = None
+    quality_audit = None
     if previous is not None:
         same_folds = signature == previous.get("fold_signature")
         if same_folds:
@@ -268,9 +290,37 @@ def _record(task_dir, task_spec, data, history, result, report):
         if task_spec.get("audit_required") and any(report.get("config", {}).get(key)
                                                   for key in ("event_activity", "causal_history", "auto_features", "hourly_extended")):
             better = bool(better and comparison and comparison["n_better"] > n_folds / 2)
+        if task_spec.get("audit_required") and report.get("recipe") != "ensemble":
+            from training import DEFAULT_CONFIG
+
+            quality_flags = ["rare_min_freq", "catboost_ordered_ctr", "es_metric"]
+            if (report.get("split") or {}).get("type") != "time":
+                quality_flags.append("auto_features")
+            config = report.get("config", {})
+            trial_flags = [key for key in quality_flags if config.get(key, DEFAULT_CONFIG[key]) not in
+                           (DEFAULT_CONFIG[key], previous.get("config", {}).get(key, DEFAULT_CONFIG[key]))]
+            if trial_flags:
+                control_config = config | {key: DEFAULT_CONFIG[key] for key in trial_flags}
+
+                def normalized(values):
+                    defaults = {key: DEFAULT_CONFIG[key] for key in quality_flags}
+                    return defaults | values
+
+                control = next((row for row in reversed(history)
+                                if row.get("complete") and row.get("recipe") == report.get("recipe")
+                                and normalized(row.get("config", {})) == normalized(control_config)), None)
+                candidate = {"fold_signature": signature, "fold_scores": result["fold_scores"],
+                             "greater_is_better": greater, "fold_baselines": baselines}
+                quality_pass = bool(complete and control and _passes_quality_gate(control, candidate, compare_results))
+                better = quality_pass and _passes_quality_gate(previous, candidate, compare_results)
+                gains = (compare_results(control, candidate)["diffs"] if control and
+                         signature == control.get("fold_signature") else None)
+                quality_audit = {"flags": {key: config[key] for key in trial_flags},
+                                 "paired_fold_gains": gains, "accepted": quality_pass}
+                print("QUALITY_FLAGS " + json.dumps(quality_audit), file=sys.stderr, flush=True)
     # Предсказания завершенных экспериментов храним на диске: в конце их можно смешать
     preds_file = None
-    if complete and "fold_ids" in result:
+    if complete and quality_pass is not False and "fold_ids" in result:
         preds_dir = task_dir / PREDS_DIR
         preds_dir.mkdir(exist_ok=True)
         preds_file = str(preds_dir / f"{len(history)}.npz")
@@ -295,6 +345,8 @@ def _record(task_dir, task_spec, data, history, result, report):
         "saved": better and not problems, "problems": problems,
         "best_saved_score": result["score"] if better and not problems else (previous["score"] if previous else None),
         "vs_saved": comparison and {k: comparison[k] for k in ("accept", "diff_mean", "diff_std", "n_better", "diffs")},
+        "quality_flags_pass": quality_pass,
+        "quality_flags_audit": quality_audit,
         "fold_signature": signature, "fold_windows": result["config"].get("fold_windows", []),
         "fit_time": result["fit_time"], "preds_file": preds_file, "class_order": result["class_order"],
     }
@@ -326,7 +378,8 @@ def _record(task_dir, task_spec, data, history, result, report):
         staged_history.replace(history_file)
     history.append(report)
     if task_spec.get("audit_required") and report["saved"] and comparison:
-        rules = {"auto_features": "current event values only",
+        rules = {"auto_features": ("fit-only statistics" if (report.get("split") or {}).get("type") != "time"
+                                   else "current event values only"),
                  "event_activity": "only registrations strictly before the event",
                  "causal_history": "only fit-fold labels available strictly before the event",
                  "hourly_extended": "interval end and recorded publication both strictly before the event"}

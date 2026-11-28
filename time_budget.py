@@ -1,8 +1,27 @@
 """Wall-clock supervision shared by the official CLI and the local diagnostics."""
 import math
+import os
 import subprocess
 import sys
 import time
+
+
+def available_cpus():
+    affinity = getattr(os, "sched_getaffinity", None)
+    try:
+        count = len(affinity(0)) if affinity else os.cpu_count()
+    except OSError:
+        count = os.cpu_count()
+    return max(1, min(8, count or 1))
+
+
+def limit_openmp():
+    maximum = available_cpus()
+    try:
+        requested = int(os.environ.get("OMP_NUM_THREADS", maximum))
+    except ValueError:
+        requested = maximum
+    os.environ["OMP_NUM_THREADS"] = str(max(1, min(requested, maximum)))
 
 
 def time_limit(value=7200):

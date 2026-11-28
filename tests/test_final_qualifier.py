@@ -17,45 +17,6 @@ from solution import ResearchModel, parse_model_object, serve_research_model
 from training import _past_encoding, train_and_predict
 
 
-def test_audited_search_crosses_completed_feature_bundles_with_seeds_and_parameters():
-    history = [
-        {"complete": True, "recipe": "single", "score": 3., "greater_is_better": False,
-         "config": {"model": "catboost", "event_activity": True}},
-        {"complete": True, "recipe": "single", "score": 4., "greater_is_better": False,
-         "config": {"model": "catboost", "causal_history": True}},
-        {"complete": False, "recipe": "single", "score": 2., "greater_is_better": False,
-         "config": {"model": "catboost", "log_target": True}},
-    ]
-    options = list(solution.audited_search_options(history, "catboost", {"auto_features": True}, (42, 101, 263)))
-    assert len(options) == 15
-    assert [row["seed"] for row in options if row.get("event_activity") and "seed" in row] == [42, 101, 263]
-    assert all(not row.get("log_target") for row in options)
-    assert len([row for row in options if "params" in row]) == 6
-
-
-def test_audited_search_runs_interleaved_queues_through_tuning(monkeypatch, tmp_path):
-    spec = {"audit_required": True, "metric": "mae", "available_backends": ["catboost", "xgboost"]}
-    history = [{"complete": True, "recipe": "single", "score": 3., "greater_is_better": False,
-                "config": {"model": "catboost", "event_activity": True}}]
-    trials = []
-
-    def train(directory, task, deadline, budget, config, *, estimate):
-        trials.append(config)
-        return {"complete": True, "fit_time": 22.}
-
-    monkeypatch.setattr(pipeline, "experiment_history", lambda _: history)
-    monkeypatch.setattr(solution, "run_trial", train)
-    result = solution.search_remaining_budget(tmp_path, spec, monotonic() + 5000,
-                                              {"fit_time": 20.}, {"auto_features": True}, set())
-    assert result["reason"] == "queue_exhausted"
-    assert result["completed"] == len(trials)
-    assert trials[0]["model"] == "catboost" and trials[1]["model"] == "xgboost"
-    for model in spec["available_backends"]:
-        family = [entry for entry in trials if entry["model"] == model and entry.get("event_activity")]
-        assert {entry["seed"] for entry in family if "seed" in entry} == {42, 101, 263}
-        assert len([entry for entry in family if "params" in entry]) == 2
-
-
 def test_duplicate_threshold_includes_split_column():
     train = pd.DataFrame({"x": [0., 2.], "period": [3, 4]})
     test = pd.DataFrame({"x": [-0.] * 1000, "period": [3] * 50 + [9] * 950})
@@ -338,24 +299,6 @@ def test_model_answer_parser_accepts_fenced_json_after_thinking():
     assert parse_model_object(text) == {"model": "xgboost"}
 
 
-def test_remaining_search_retries_incomplete_families(monkeypatch):
-    attempts = dict.fromkeys(("lightgbm", "xgboost", "catboost"), 0)
-
-    def trial(directory, spec, deadline, budget, config, *, estimate):
-        model = config["model"]
-        attempts[model] += 1
-        if model == "catboost":
-            return {"complete": attempts[model] > 1, "fit_time": 20}
-        return None
-
-    monkeypatch.setattr(solution, "run_trial", trial)
-    result = solution.search_remaining_budget(None, {}, monotonic() + 5000, {"fit_time": 20}, {}, set())
-    assert attempts == {"lightgbm": 3, "xgboost": 3, "catboost": 27}
-    assert result["completed"] == 26
-    assert result["families"]["catboost"] == "queue_exhausted"
-    assert result["families"]["lightgbm"] == "retry_limit_reached"
-
-
 def test_trial_fit_includes_thirty_percent_safety_margin(monkeypatch):
     monkeypatch.setattr(solution.time, "monotonic", lambda: 1000.)
     assert not solution.trial_fits(100., 1130.)
@@ -419,34 +362,6 @@ def test_tune_recipe_and_outer_experiment_use_identical_features(tmp_path, monke
     assert "ts__hour" in columns[0] and "measurements__x__mean24h" in columns[0]
     assert capsys.readouterr().err.count('LEAK_AUDIT status=pass {"group": "calendar"') == 2
 
-
-def test_extended_search_uses_seeded_tail_until_budget_runs_out(monkeypatch, tmp_path):
-    monkeypatch.setattr(pipeline, "experiment_history", lambda _: [])
-    now = [0.]
-    monkeypatch.setattr(solution.time, "monotonic", lambda: now[0])
-    collected = []
-
-    def train(directory, spec, deadline, budget, config, recipe="single", *, estimate):
-        collected.append((recipe, config))
-        now[0] += 8 if recipe == "tune" else 24
-        if recipe == "tune":
-            return {"tuned_params": {"depth": 5}}
-        return {"complete": True, "fit_time": 24.}
-
-    monkeypatch.setattr(solution, "run_trial", train)
-    results = []
-    for _ in range(2):
-        now[0] = 0
-        collected.clear()
-        retired = {"catboost": "queue_exhausted"}
-        assert solution._extended_search(tmp_path, {}, 160., {"recency_days": 30}, set(),
-                                         {"catboost": 20.}, retired) == (5, 5)
-        assert retired["catboost"] == "next_trial_does_not_fit"
-        results.append(list(collected))
-    assert results[0] == results[1]
-    assert results[0][0][0] == "tune"
-    assert results[0][1][1]["params"] == {"depth": 5}
-    assert all(config["recency_days"] == 30 for _, config in results[0])
 
 def test_ensemble_considers_triple_with_two_backends(tmp_path, monkeypatch):
     import training

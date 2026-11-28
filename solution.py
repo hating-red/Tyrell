@@ -5,7 +5,6 @@ PROCESS_STARTED = time.monotonic()
 import json
 import os
 from pathlib import Path
-from random import Random
 import re
 import shutil
 import subprocess
@@ -13,7 +12,6 @@ import sys
 import tempfile
 import threading
 import traceback
-from collections import deque
 from itertools import product
 
 if __name__ == "__main__":
@@ -22,7 +20,9 @@ if __name__ == "__main__":
     sys.stderr.reconfigure(encoding="utf-8")
 
 from publication import publication_run, published_result, receipt_directory
-from time_budget import pop_worker_deadline, run_until, shutdown_reserve, supervised_exit, time_limit, worker_command
+from time_budget import limit_openmp, pop_worker_deadline, run_until, shutdown_reserve, supervised_exit, time_limit, worker_command
+
+limit_openmp()
 
 
 def log(message):
@@ -309,7 +309,9 @@ def choose_variant(spec, baseline):
             return []
         backend = baseline.get("backend", models[0])
         candidates = baseline.get("feature_candidates", {})
-        variants = [{"auto_features": True}]
+        variants = [{"auto_features": True}, {"rare_min_freq": 5}]
+        if spec["metric"] == "pr_auc":
+            variants.append({"es_metric": "logloss"})
         if candidates.get("hourly_extended"):
             variants.extend([{"hourly_extended": True}, {"auto_features": True, "hourly_extended": True}])
         if candidates.get("event_activity"):
@@ -322,6 +324,11 @@ def choose_variant(spec, baseline):
         if spec["metric"] == "mae":
             variants.extend({"auto_features": True, "mae_objective": objective} for objective in ("quantile", "huber"))
             variants.extend([{"auto_features": True, "log_target": True}, {"mae_shift": True}])
+        if ("catboost" in models and (baseline.get("split") or {}).get("type") == "time"
+                and not spec.get("label_delay_unit")):
+            if backend != "catboost":
+                variants.append({"model": "catboost"})
+            variants.append({"model": "catboost", "catboost_ordered_ctr": True})
         return [{"model": backend} | variant for variant in variants]
     variants = []
     if baseline and (baseline.get("split") or {}).get("type") == "time":
@@ -343,32 +350,8 @@ def choose_variant(spec, baseline):
 
 
 _SEARCH_FEATURES = ("auto_features", "causal_history", "event_activity", "hourly_extended",
-                    "log_target", "mae_shift", "history_window", "history_smoothing", "mae_objective", "recency_days")
-_SEARCH_PARAMS = {
-    "lightgbm": ({"max_depth": 5, "num_leaves": 24, "lambda_l2": 3.},
-                 {"max_depth": 7, "num_leaves": 48, "lambda_l2": 8.}),
-    "catboost": ({"depth": 4, "l2_leaf_reg": 8.}, {"depth": 7, "l2_leaf_reg": 8.}),
-    "xgboost": ({"max_depth": 4, "min_child_weight": 8., "lambda": 4.},
-                {"max_depth": 7, "min_child_weight": 12., "lambda": 8.}),
-}
-
-
-def audited_search_options(history, model, winner, seeds):
-    """Rank complete feature bundles on the joint CV score before trying seeds and parameters."""
-    members = [row for row in history if row.get("complete") and row.get("recipe") == "single"]
-    members.sort(key=lambda row: (row["config"].get("model") != model,
-                                  -row["score"] if row["greater_is_better"] else row["score"]))
-    bundles = []
-    for config in [winner, *(row["config"] for row in members)]:
-        features = {key: config[key] for key in _SEARCH_FEATURES if config.get(key)}
-        if features not in bundles:
-            bundles.append(features)
-        if len(bundles) == 3:
-            break
-    for seed, features in product(seeds, bundles):
-        yield features | {"seed": seed}
-    for params, features in product(_SEARCH_PARAMS[model], bundles):
-        yield features | {"params": params}
+                    "log_target", "mae_shift", "history_window", "history_smoothing", "mae_objective", "recency_days",
+                    "rare_min_freq", "catboost_ordered_ctr", "es_metric", "class_weight")
 
 
 def _trial_key(config):
@@ -378,162 +361,131 @@ def _trial_key(config):
     return json.dumps(cleaned, sort_keys=True)
 
 
-def _random_params(model, rng):
-    l2 = round(10 ** rng.uniform(-.5, 1.4), 4)
-    rate = round(rng.uniform(.025, .13), 4)
-    depth = rng.randint(4, 8)
-    if model == "catboost":
-        return {"depth": depth, "l2_leaf_reg": l2, "learning_rate": rate}
-    if model == "xgboost":
-        return {"max_depth": depth, "lambda": l2, "eta": rate, "min_child_weight": rng.randint(2, 24)}
-    return {"max_depth": depth, "num_leaves": min(2**depth, rng.randint(16, 64)),
-            "lambda_l2": l2, "learning_rate": rate}
+_FINAL_RESERVE = 400.
+_CHECKPOINT_INTERVAL = 900.
+_MAX_STALE_TRIALS = 8
+_REGULARIZED = {
+    "lightgbm": [{"max_depth": depth, "num_leaves": 2**depth, "min_child_samples": leaf,
+                  "lambda_l2": l2, "feature_fraction": fraction}
+                 for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
+    "xgboost": [{"max_depth": depth, "min_child_weight": leaf, "lambda": l2, "colsample_bytree": fraction}
+                for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
+    "catboost": [{"depth": depth, "min_data_in_leaf": leaf, "l2_leaf_reg": l2, "rsm": fraction,
+                  "grow_policy": "Depthwise"}
+                 for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
+}
 
 
-def _extended_search(directory, spec, deadline, winner, tested, estimates, retired):
+def _extended_search(directory, spec, deadline, winner, tested, estimates, retired, *, checkpoint=None):
+    from math import sqrt
     from pipeline import experiment_history
+    from training import compare_results
 
-    rng = Random(42)
-    configs = {}
-    history = experiment_history(directory)
-    for model, reason in retired.items():
-        if reason != "queue_exhausted":
-            continue
-        members = [row for row in history if row.get("complete") and row.get("recipe") == "single"
-                   and row["config"].get("model") == model]
-        best = min(members, key=lambda row: -row["score"] if row["greater_is_better"] else row["score"],
-                   default={"config": winner})["config"]
-        configs[model] = {"model": model} | {k: best[k] for k in _SEARCH_FEATURES if best.get(k)}
-    queues = deque(configs)
-    tried_optuna = set()
-    failures = dict.fromkeys(configs, 0)
-    attempts = completed = 0
-    while queues:
-        model = queues.popleft()
-        estimate = 1.35 * estimates[model]
+    def rank():
+        rows = [row for row in experiment_history(directory) if row.get("complete") and row.get("recipe") == "single"
+                and row.get("quality_flags_pass") is not False]
+        return sorted(rows, key=lambda row: -row["score"] if row["greater_is_better"] else row["score"])
+
+    def model_config(row, model):
+        raw = row["config"] if row else {key: winner[key] for key in _SEARCH_FEATURES if key in winner}
+        return {key: raw[key] for key in (*_SEARCH_FEATURES, "params", "num_boost_round", "early_stopping_rounds")
+                if raw.get(key)} | {"model": model}
+
+    def best_configs():
+        rows = rank()
+        return {model: model_config(next((row for row in rows if row["config"].get("model") == model), None), model)
+                for model in estimates if retired.get(model) != "next_trial_does_not_fit"}
+
+    def queue():
+        for model, config in best_configs().items():
+            budget = min(180., max(18., 1.8 * estimates[model]))
+            if not trial_fits(budget + estimates[model], deadline):
+                continue
+            began = time.monotonic()
+            report = run_trial(directory, spec, deadline, budget, config, "tune", estimate=budget)
+            params = (report or {}).get("tuned_params")
+            diagnostics = (report or {}).get("tune_diagnostics", {})
+            log_phase("optuna_prefix", began, budget=budget, model=model,
+                      **({"n_trials": 0, "completed": 0, "prefix_max": None} | diagnostics),
+                      reason="parameters_selected" if params else "no_complete_trial")
+            if params:
+                yield config | {"params": params}, 1.25
+        configs = best_configs()
+        for model, config in configs.items():
+            rate = "eta" if model == "xgboost" else "learning_rate"
+            params = dict(config.get("params", {}))
+            params.pop("learning_rate" if model == "xgboost" else "eta", None)
+            yield config | {"params": params | {rate: .02}, "num_boost_round": 8000,
+                            "early_stopping_rounds": 250}, 1.8
+        for round_idx in range(2):
+            for model, config in configs.items():
+                yield config | {"params": config.get("params", {}) | _REGULARIZED[model][round_idx]}, 1.15
+        top = []
+        for row in rank():
+            model = row["config"].get("model")
+            if model not in configs:
+                continue
+            config = model_config(row, model)
+            if config not in top:
+                top.append(config)
+            if len(top) == 3:
+                break
+        for seed, config in product((101, 263, 419, 587), top):
+            yield config | {"seed": seed}, 1.
+
+    incumbent = next(iter(rank()), None)
+    attempts = completed = stale = 0
+    reason = "queue_exhausted"
+    last_checkpoint = time.monotonic()
+    for config, multiplier in queue():
+        if time.monotonic() >= deadline:
+            reason = "fit_deadline"
+            break
+        model = config["model"]
+        estimate = multiplier * estimates[model]
         if not trial_fits(estimate, deadline):
             retired[model] = "next_trial_does_not_fit"
             continue
-        config = configs[model]
-        params = None
-        if model in ("catboost", "xgboost") and model not in tried_optuna:
-            tried_optuna.add(model)
-            budget = min(240., max(45., estimate))
-            if trial_fits(budget + 1.3 * estimate, deadline):
-                began = time.monotonic()
-                report = run_trial(directory, spec, deadline, budget, config, "tune", estimate=budget)
-                params = (report or {}).get("tuned_params")
-                diagnostics = (report or {}).get("tune_diagnostics", {})
-                log_phase("optuna_prefix", began, budget=budget, model=model,
-                          **({"n_trials": 0, "completed": 0, "prefix_max": None} | diagnostics),
-                          reason="parameters_selected" if params else "no_complete_trial")
-        if not trial_fits(estimate, deadline):
-            retired[model] = "next_trial_does_not_fit"
-            continue
-        config = config | {"params": params or _random_params(model, rng), "seed": rng.randrange(1, 2**31)}
         key = _trial_key(config)
-        if key not in tested:
-            tested.add(key)
-            attempts += 1
-            report = run_trial(directory, spec, deadline, min(420., max(110., 1.8 * estimate)), config, estimate=estimate)
-            if report and report["complete"]:
-                completed += 1
-                failures[model] = 0
-                estimates[model] = max(20., report.get("elapsed_seconds", report["fit_time"]), .85 * estimates[model])
-            else:
-                failures[model] += 1
-                if failures[model] >= 3:
-                    retired[model] = "retry_limit_reached"
-                    continue
-        queues.append(model)
-    return attempts, completed
-
-
-def search_remaining_budget(directory, spec, deadline, baseline, winner, tested, *, blend_estimate=90.):
-    """Search additional windows and model settings with time left for the final blend."""
-    audited = spec.get("audit_required")
-    fit_deadline = deadline - max(180., 1.3 * blend_estimate + 30.)
-    estimate = max(20., baseline.get("elapsed_seconds", baseline["fit_time"]))
-    accepted = {key: winner[key] for key in ("entity_history", "target_encoding") if winner.get(key)}
-    windows, smoothings = (8, 20, 60), (8., 24., 64.)
-    models, seeds = ("lightgbm", "catboost", "xgboost"), (42, 101, 263)
-    if audited:
-        models = spec["available_backends"]
-        features = {key: True for key in ("auto_features", "causal_history", "event_activity", "hourly_extended",
-                                         "log_target", "mae_shift")
-                    if winner.get(key)}
-        feature_candidates = baseline.get("feature_candidates", {})
-        options = [features | {"recency_days": days} for days in (None, 7, 30, 90)]
-        if feature_candidates.get("causal_history"):
-            options += [features | {"causal_history": True, "history_window": window, "history_smoothing": smooth}
-                        for window, smooth in ((16, 24.), (64, 8.), (64, 64.), (256, 24.))]
-        if feature_candidates.get("event_activity"):
-            options.append(features | {"event_activity": True})
-        if spec["metric"] == "mae":
-            options.append(features | {"mae_shift": True})
-        from pipeline import experiment_history
-        initial_options = tuple(options)
-
-        def audited_queue(backend):
-            yield from initial_options
-            yield from audited_search_options(experiment_history(directory), backend, winner, seeds)
-
-        families = deque((model, audited_queue(model)) for model in models)
-    else:
-        families = deque((model, iter(product(seeds, windows, smoothings))) for model in models)
-    estimates = dict.fromkeys(models, estimate)
-    failures = dict.fromkeys(models, 0)
-    retired = {}
-    attempts = completed = 0
-    while families:
-        model, options = families.popleft()
-        choice = next(options, None)
-        if choice is None:
-            retired[model] = "queue_exhausted"
-            continue
-        if not trial_fits(estimates[model], fit_deadline):
-            retired[model] = "next_trial_does_not_fit"
-            continue
-        if audited:
-            config = {"model": model} | choice
-        else:
-            seed, window, smoothing = choice
-            config = accepted | {"model": model, "seed": seed, "auto_features": True, "ad_history": True,
-                                 "ad_history_window": window, "ad_history_smoothing": smoothing}
-        key = _trial_key(config) if audited else json.dumps(config, sort_keys=True)
         if key in tested:
-            families.append((model, options))
-            continue
-        tuning_cost = 1.35 if audited and config.get("params") else 1.
-        step_estimate = tuning_cost * estimates[model]
-        if not trial_fits(step_estimate, fit_deadline):
-            retired[model] = "next_trial_does_not_fit"
             continue
         tested.add(key)
         attempts += 1
-        budget = min(420., max(110., 1.8 * step_estimate))
-        report = run_trial(directory, spec, fit_deadline, budget, config, estimate=step_estimate)
+        stale += 1
+        report = run_trial(directory, spec, deadline, min(420., max(24., 1.55 * estimate)), config,
+                           estimate=estimate)
         if report and report["complete"]:
-            actual = report.get("elapsed_seconds", report["fit_time"])
-            estimates[model] = max(20., actual, estimates[model] * .85) if audited else max(20., actual)
-            failures[model] = 0
             completed += 1
-        else:
-            failures[model] += 1
-            if failures[model] >= 3:
-                retired[model] = "retry_limit_reached"
-                continue
-            log(f"SEARCH_RETRY model={model} remaining={3-failures[model]}")
-        families.append((model, options))
-    extra = (0, 0)
-    if audited and (baseline.get("split") or {}).get("type") == "time":
-        extra = _extended_search(directory, spec, fit_deadline, winner, tested, estimates, retired)
-    reason = ("next_trial_does_not_fit" if "next_trial_does_not_fit" in retired.values() else
-              "families_exhausted_after_retries" if "retry_limit_reached" in retired.values() else "queue_exhausted")
-    report = {"reason": reason, "families": retired, "attempts": attempts + extra[0], "completed": completed + extra[1]}
-    if audited:
-        report.update(extended_attempts=extra[0], extended_completed=extra[1])
-    return report
+            estimates[model] = max(2., report.get("elapsed_seconds", report["fit_time"]), .75 * estimates[model])
+            if incumbent is None:
+                incumbent, stale = report, 0
+            elif incumbent.get("fold_signature") == report.get("fold_signature"):
+                paired = compare_results(incumbent, report)
+                noise = paired["diff_std"] / sqrt(len(paired["diffs"]))
+                if paired["diff_mean"] > noise:
+                    incumbent, stale = report, 0
+        if checkpoint and time.monotonic() - last_checkpoint >= _CHECKPOINT_INTERVAL:
+            checkpoint()
+            last_checkpoint = time.monotonic()
+        if stale >= _MAX_STALE_TRIALS:
+            reason = "stagnation"
+            break
+    if reason == "queue_exhausted" and time.monotonic() >= deadline:
+        reason = "fit_deadline"
+    for model in estimates:
+        retired.setdefault(model, reason)
+    return {"reason": reason, "families": retired, "attempts": attempts, "completed": completed,
+            "extended_attempts": attempts, "extended_completed": completed, "consecutive_without_gain": stale}
+
+
+def search_remaining_budget(directory, spec, deadline, baseline, winner, tested, *, blend_estimate=90.,
+                            checkpoint=None):
+    """Run a finite candidate queue before the deadline reserved for final publication."""
+    fit_deadline = deadline - max(_FINAL_RESERVE, 1.3 * blend_estimate + 30.)
+    estimate = max(2., baseline.get("elapsed_seconds", baseline["fit_time"]))
+    models = spec.get("available_backends", _BACKENDS)
+    estimates = dict.fromkeys(models, estimate)
+    return _extended_search(directory, spec, fit_deadline, winner, tested, estimates, {}, checkpoint=checkpoint)
 
 
 def research(task_path, directory, deadline):
@@ -542,6 +494,8 @@ def research(task_path, directory, deadline):
     from leak_audit import AuditBudget, audit_log, restricted_inputs
     from training import backend_available
 
+    search_enabled = deadline - time.monotonic() > _FINAL_RESERVE + 45.
+    fit_deadline = deadline - _FINAL_RESERVE if search_enabled else deadline
     task = task_path.read_text(encoding="utf-8-sig")
     mailbox = directory / "research"
     model = ResearchModel(mailbox if mailbox.is_dir() else None)
@@ -562,14 +516,18 @@ def research(task_path, directory, deadline):
             if problems:
                 raise ValueError(problems)
             spec = guess
-        resolved = resolve_task(directory, task, model, deadline, early=publish)
+        resolved = resolve_task(directory, task, model, fit_deadline, early=publish)
         if resolved != spec:
             publish(resolved)
         import csv
         with (directory / "test.csv").open(encoding="utf-8-sig", newline="") as stream:
             fields = next(csv.reader(stream))
         blocked = restricted_inputs(task, fields)
-        backends = [backend for backend in _BACKENDS if backend_available(backend)]
+        backend_status = {}
+        backends = [backend for backend in _BACKENDS if backend_available(backend, diagnostics=backend_status)]
+        backend_available("sklearn.ensemble", diagnostics=backend_status)
+        backend_status["hgb"] = backend_status.pop("sklearn.ensemble")
+        log("BACKENDS " + " ".join(f"{name}={status}" for name, status in backend_status.items()))
         spec = spec | {"audit_required": True, "excluded_features": list(blocked), "available_backends": backends}
         for name, why in blocked.items():
             audit_log("excluded", "task.md", feature=name, reason=why)
@@ -579,10 +537,10 @@ def research(task_path, directory, deadline):
 
     if using_postgres:
         try:
-            prepare_postgres(task_path, directory, deadline=deadline, on_core_ready=core_ready, log=log, replay=replay)
+            prepare_postgres(task_path, directory, deadline=fit_deadline, on_core_ready=core_ready, log=log, replay=replay)
         finally:
             if join_started is not None:
-                log_phase("join", join_started, budget=round(max(0., deadline - join_started)*.4, 3),
+                log_phase("join", join_started, budget=round(max(0., fit_deadline - join_started)*.4, 3),
                           reason="join_plan_finished", leak_audit_seconds=replay.elapsed)
     else:
         # Local qualifier datasets also use this entry point.
@@ -596,15 +554,14 @@ def research(task_path, directory, deadline):
     import csv
     with (directory / "test.csv").open(encoding="utf-8-sig", newline="") as stream:
         columns = next(csv.reader(stream))
-    available = deadline - time.monotonic()
-    quick = min(420, max(15, available * 0.12))
+    quick = min(300., max(15., (fit_deadline - time.monotonic()) * .12))
     safety_started = time.monotonic()
     baseline = None
     baseline_trial = {}
     failed_trial = None
     for backend in spec["available_backends"]:
         baseline_trial = {"model": backend}
-        baseline = run_trial(directory, spec, deadline, quick, baseline_trial)
+        baseline = run_trial(directory, spec, fit_deadline, quick, baseline_trial)
         if baseline:
             baseline["backend"] = backend
             break
@@ -619,7 +576,7 @@ def research(task_path, directory, deadline):
     unusable = 0
     if baseline:
         trials.append({"config": baseline_trial, "scores":baseline["fold_scores"]})
-    search_deadline = time.monotonic() + .55 * max(0, deadline-time.monotonic())
+    search_deadline = time.monotonic() + .45 * max(0, fit_deadline-time.monotonic())
     llm_started = None
     llm_reason = "search_deadline"
     variant_trials = llm_trials = 0
@@ -696,35 +653,38 @@ def research(task_path, directory, deadline):
         if candidate in candidates[:index]:
             log_phase(phase, started, budget=0., reason="duplicate_configuration")
             continue
-        remaining = deadline-time.monotonic()
+        remaining = fit_deadline-time.monotonic()
         if remaining < max(15.,1.3*(baseline["fit_time"] if baseline else 5.)):
             log_phase(phase, started, budget=0., reason="next_trial_does_not_fit")
             continue
-        auto_budget = min(900, max(0., (remaining - 32.) / 1.3))
-        report = run_trial(directory, spec, deadline, auto_budget,
-                           candidate | {"max_seeds":3}, "auto")
+        auto_budget = min(420., .3 * remaining, max(0., (remaining - 32.) / 1.3))
+        report = run_trial(directory, spec, fit_deadline, auto_budget,
+                           candidate | {"max_seeds": 5 if search_enabled else 3}, "auto")
         log_phase(phase, started, budget=round(auto_budget, 3),
                   reason=(report.get("auto_stop") or {}).get("reason", "no_completed_model") if report else "no_completed_model",
                   queue=(report or {}).get("auto_stop"))
         if report and report["saved"]:
             winner = candidate
-    budget_search = (baseline and (baseline.get("split") or {}).get("type") == "time"
-                     and available > 1800.)
     blend_estimate = min(90., quick)
-    if budget_search:
-        # Publish the best known blend before using the remaining budget.
-        history = experiment_history(directory)
-        if sum(bool(h.get("preds_file")) for h in history) >= 2:
+    if search_enabled and baseline and baseline["complete"]:
+        def checkpoint():
+            nonlocal blend_estimate
+            history = experiment_history(directory)
+            if sum(bool(h.get("preds_file")) for h in history) < 2:
+                return
             started = time.monotonic()
-            blend = run_trial(directory, spec, deadline, 180., recipe="ensemble", estimate=blend_estimate)
+            blend = run_trial(directory, spec, fit_deadline, 120., recipe="ensemble", estimate=blend_estimate)
             if blend:
-                blend_estimate = max(5., blend["elapsed_seconds"])
-            log_phase("ensemble", started, budget=180., reason="blend_evaluated" if blend else "no_result",
-                      checkpoint=True)
+                blend_estimate = max(2., blend["elapsed_seconds"])
+            log_phase("ensemble", started, budget=120., reason="blend_evaluated" if blend else "no_result",
+                      checkpoint=True, saved=bool(blend and blend["saved"]))
+
+        checkpoint()
         started = time.monotonic()
-        search = search_remaining_budget(directory, spec, deadline, baseline, winner, tested, blend_estimate=blend_estimate)
-        log_phase("search_remaining_budget", started, budget=round(max(0., deadline-started-180), 3),
-                  **search)
+        search = search_remaining_budget(directory, spec, deadline, baseline, winner, tested,
+                                         blend_estimate=blend_estimate, checkpoint=checkpoint)
+        log_phase("search_remaining_budget", started, budget=round(max(0., deadline-started-_FINAL_RESERVE), 3),
+                  final_reserve_seconds=max(_FINAL_RESERVE, 1.3 * blend_estimate + 30.), **search)
     else:
         log_phase("search_remaining_budget", time.monotonic(), budget=0., reason="not_enabled_for_task_or_budget")
     history = experiment_history(directory)
