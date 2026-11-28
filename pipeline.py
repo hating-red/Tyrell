@@ -8,7 +8,6 @@ import shutil
 import tempfile
 import time
 from contextvars import ContextVar
-from itertools import chain, combinations
 
 from pathlib import Path
 
@@ -209,6 +208,8 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         "config": {k: v for k, v in cfg.items() if k != "features"} | {
             "auto_features": auto_features, "hourly_extended": hourly_extended, "interval_features": interval_features},
     }
+    if config.get("features") is not None:
+        report["config"]["features"] = config["features"]
     report["feature_candidates"] = result.get("feature_candidates", {}) | {
         "hourly_extended": any(name.endswith(_HOURLY_SUFFIXES) for name in data["X_train"]),
         "interval_features": any(name.endswith(INTERVAL_FEATURE_SUFFIXES) for name in data["X_train"]),
@@ -254,6 +255,38 @@ def _passes_quality_gate(control, candidate, compare_results):
             and baseline_wins(candidate) >= baseline_wins(control))
 
 
+def _archive_metadata(result):
+    cfg = result["config"]
+    return {"effective_model": cfg.get("model"), "effective_params": cfg.get("params"),
+            "effective_seed": cfg.get("seed"), "effective_class_weight": cfg.get("class_weight"),
+            "best_iterations": result.get("best_iterations", []), "fold_baselines": cfg.get("fold_baselines", []),
+            "fold_windows": cfg.get("fold_windows", []), "target_bounds": result.get("target_bounds"),
+            "fold_target_bounds": result.get("fold_target_bounds"), "integer_target": result.get("integer_target"),
+            "fold_integer_target": result.get("fold_integer_target"), "postprocess": result.get("postprocess")}
+
+
+def _archive_oof(task_dir, result, stem):
+    archive = Path(os.environ.get("TYRELL_OOF_RUN_DIR", task_dir))
+    test = result["probabilities"] if result["probabilities"] is not None else result["predictions"]
+    arrays = {"oof": np.asarray(result["oof"], dtype=np.float32),
+              "test": np.asarray(test, dtype=np.float64), "fold_ids": result["fold_ids"]}
+    if result.get("meta_known_from") is not None:
+        arrays["meta_known_from"] = result["meta_known_from"]
+    if result["class_order"] is not None:
+        arrays["predicted_class"] = pd.Index(result["class_order"]).get_indexer(result["predictions"])
+    for root in dict.fromkeys((archive, task_dir)):
+        try:
+            preds_dir = root / PREDS_DIR
+            preds_dir.mkdir(exist_ok=True)
+            path = preds_dir / f"{stem}.npz"
+            np.savez_compressed(path, **arrays)
+            return str(path)
+        except OSError as error:
+            if root == task_dir:
+                raise
+            print(f"OOF_ARCHIVE unavailable: {error}", file=sys.stderr, flush=True)
+
+
 def _record(task_dir, task_spec, data, history, result, report):
     """Сравнение с сохраненным, запись сабмита при улучшении, предсказания для ансамбля, журнал."""
     from training import compare_results
@@ -292,9 +325,13 @@ def _record(task_dir, task_spec, data, history, result, report):
                 better = candidate_wins and complete and (report.get("recipe") != "ensemble" or blend_improves)
         if report.get("config", {}).get("ad_history"):
             better = bool(better and same_folds and comparison["n_better"] > n_folds / 2)
-        if task_spec.get("audit_required") and report.get("recipe") == "ensemble" and task_spec["metric"] == "pr_auc":
-            better = bool(complete and comparison and comparison["n_better"] > n_folds / 2
-                          and comparison["diff_mean"] > 0 and _beats_fold_baselines(result["fold_scores"], baselines, greater))
+        if report.get("recipe") == "ensemble":
+            candidate = {"fold_signature": signature, "fold_scores": result["fold_scores"],
+                         "greater_is_better": greater, "fold_baselines": baselines}
+            better = complete and same_folds and _passes_quality_gate(previous, candidate, compare_results)
+            if (complete and same_folds and (report.get("refit") or {}).get("same_incumbent")
+                    and np.array_equal(previous["fold_scores"], result["fold_scores"])):
+                better = True
         if task_spec.get("audit_required") and any(report.get("config", {}).get(key)
                                                   for key in ("event_activity", "causal_history", "auto_features", "hourly_extended")):
             better = bool(better and comparison and comparison["n_better"] > n_folds / 2)
@@ -324,30 +361,31 @@ def _record(task_dir, task_spec, data, history, result, report):
                 quality_audit = {"flags": {key: config[key] for key in trial_flags},
                                  "paired_fold_gains": gains, "accepted": quality_pass}
                 print("QUALITY_FLAGS " + json.dumps(quality_audit), file=sys.stderr, flush=True)
-    # Предсказания завершенных экспериментов храним на диске: в конце их можно смешать
-    preds_file = None
-    if complete and "fold_ids" in result:
-        archive = Path(os.environ.get("TYRELL_OOF_RUN_DIR", task_dir))
-        test = result["probabilities"] if result["probabilities"] is not None else result["predictions"]
-        arrays = {"oof": np.asarray(result["oof"], dtype=np.float32),
-                  "test": np.asarray(test, dtype=np.float64), "fold_ids": result["fold_ids"]}
-        if result.get("meta_known_from") is not None:
-            arrays["meta_known_from"] = result["meta_known_from"]
-        if result["class_order"] is not None:
-            arrays["predicted_class"] = pd.Index(result["class_order"]).get_indexer(result["predictions"])
-        for root in dict.fromkeys((archive, task_dir)):
-            try:
-                preds_dir = root / PREDS_DIR
-                preds_dir.mkdir(exist_ok=True)
-                path = preds_dir / f"{len(history)}.npz"
-                np.savez_compressed(path, **arrays)
-            except OSError as error:
-                if root == task_dir:
-                    raise
-                print(f"OOF_ARCHIVE unavailable: {error}", file=sys.stderr, flush=True)
-            else:
-                preds_file = str(path)
-                break
+    preds_file = (_archive_oof(task_dir, result, str(len(history)))
+                  if complete and "fold_ids" in result else None)
+    if result.get("member_results"):
+        members = []
+        for name, candidate in result["member_results"].items():
+            if "fold_ids" not in candidate or candidate["config"]["n_folds_done"] != candidate["config"]["n_folds"]:
+                continue
+            stored = dict(report)
+            stored.pop("member_candidates", None)
+            stored["recipe"] = "member"
+            stored["config"] = report["config"] | {
+                key: candidate["config"][key] for key in (
+                    "model", "params", "seed", "class_weight", "log_target", "sqrt_target", "mae_objective",
+                    "regularized_ap", "es_metric") if key in candidate["config"]
+            }
+            stored.update(_archive_metadata(candidate), score=candidate["score"], score_std=candidate["score_std"],
+                          fold_scores=candidate["fold_scores"], greater_is_better=greater, complete=True,
+                          class_order=candidate["class_order"], saved=False, quality_flags_pass=quality_pass,
+                          fit_time=candidate["fit_time"], candidate_id=f"{len(history)}.{name}",
+                          n_folds_done=candidate["config"]["n_folds_done"],
+                          fold_signature=hashlib.sha256(np.asarray(candidate["fold_ids"], dtype="<i4").tobytes()).hexdigest(),
+                          preds_file=_archive_oof(task_dir, candidate, f"{len(history)}-{name}"))
+            members.append(stored)
+        if members:
+            report["member_candidates"] = members
 
     output = _output_path(task_dir)
     staged_csv = task_dir / ".tyrell_candidate.csv"
@@ -355,14 +393,14 @@ def _record(task_dir, task_spec, data, history, result, report):
     report = report | {
         "score": result["score"], "score_std": result["score_std"], "metric": task_spec["metric"],
         "fold_scores": [float(s) for s in result.get("fold_scores", [])],
-        "fold_baselines": baselines,
         "greater_is_better": result["greater_is_better"], "complete": complete, "n_folds_done": n_folds_done,
+        **_archive_metadata(result),
         "saved": better and not problems, "problems": problems,
         "best_saved_score": result["score"] if better and not problems else (previous["score"] if previous else None),
         "vs_saved": comparison and {k: comparison[k] for k in ("accept", "diff_mean", "diff_std", "n_better", "diffs")},
         "quality_flags_pass": quality_pass,
         "quality_flags_audit": quality_audit,
-        "fold_signature": signature, "fold_windows": result["config"].get("fold_windows", []),
+        "fold_signature": signature,
         "fit_time": result["fit_time"], "preds_file": preds_file, "class_order": result["class_order"],
     }
     history_file = task_dir / ".tyrell_experiments.json"
@@ -467,129 +505,239 @@ def _write_submission(output_path, task_spec, data, result):
     )
 
 
-def run_ensemble(task_dir, task_spec, max_members=8, *, time_budget=None):
-    """Смесь лучших завершенных экспериментов: разные наборы признаков ошибаются по-разному.
+def _ensemble_target_info(data, task_spec, split, fold_ids):
+    """Reconstruct fit bounds for archives written before the target metadata existed."""
+    y = pd.to_numeric(data["y_train"], errors="coerce").to_numpy(dtype=float)
+    observed = np.isfinite(y)
+    folds = np.unique(fold_ids[fold_ids >= 0])
+    temporal = (split or {}).get("type") == "time"
+    if temporal:
+        from training import _time_values
+        column = split["column"]
+        times = _time_values(data["X_train"][column])
+        releases = (label_available_at(times, y, task_spec["label_delay_unit"])
+                    if task_spec.get("label_delay_unit") else times)
+        cutoff = _time_values(data["X_test"][column]).min()
+        masks = [observed & releases.lt(times.iloc[np.flatnonzero(fold_ids == k)].min()).to_numpy() for k in folds]
+        observed &= releases.lt(cutoff).to_numpy()
+    else:
+        masks = [observed & (fold_ids != k) for k in folds]
 
-    Фолды у всех экспериментов одинаковые, поэтому OOF смешиваются честно; веса подбираются
-    с кросс-фиттингом, а сабмит заменяется по тому же правилу, что и после эксперимента.
-    """
-    from training import blend_results, compare_results, optimize_blend_weights
+    def bounds(mask):
+        values = y[mask]
+        return (float(values.min()), float(values.max())) if len(values) else None
 
+    def integer(mask):
+        values = y[mask]
+        return bool(len(values) and np.equal(values, np.round(values)).all())
+
+    return {"target_bounds": bounds(observed), "fold_target_bounds": [bounds(mask) for mask in masks],
+            "integer_target": integer(observed), "fold_integer_target": [integer(mask) for mask in masks]}
+
+
+def _refit_ensemble(task_dir, task_spec, data, selected, deadline):
+    from features import add_key_columns
+    from leak_audit import LeakAuditError
+    from training import DEFAULT_CONFIG, train_and_predict
+
+    predictions, details = {}, []
+    setups, estimates = {}, {}
+    y = data["y_train"].reset_index(drop=True)
+    for rank, (_, member) in enumerate(selected):
+        model = member.get("effective_model") or member["config"].get("model")
+        if not model or not member.get("best_iterations"):
+            continue
+        iterations = member["best_iterations"]
+        rounds = max(1, round(np.median(iterations) if model == "linear" else np.mean(iterations) * 1.1))
+        estimates[rank] = max(2., member["fit_time"] / max(2, len(iterations)))
+        setups[rank] = (member, model, rounds, int(member.get("effective_seed") or member["config"].get("seed", 42)))
+    for offset in (0, 1, 2):
+        for rank, (member, model, rounds, original_seed) in setups.items():
+            if offset and (rank >= 3 or rank not in predictions):
+                continue
+            usable = deadline - time.monotonic() - 10.
+            estimate = estimates[rank]
+            if usable < 1.35 * estimate:
+                continue
+            began = time.monotonic()
+            try:
+                original = member["config"]
+                X, X_test, config = prepare_features(task_dir, task_spec, original, data=data,
+                                                     feature_code=member.get("feature_code"))
+                config.pop("target_encoding", None)
+                if member.get("te_keys"):
+                    X, X_test, config["target_encoding"] = add_key_columns(
+                        X, X_test, member["te_keys"], raw_frames=(data["X_train"], data["X_test"]))
+                cfg = {key: val for key, val in config.items() if key in DEFAULT_CONFIG}
+                cfg.update(model=model, seed=original_seed + offset,
+                           params=member.get("effective_params") or original.get("params") or {},
+                           class_weight=member.get("effective_class_weight", original.get("class_weight")))
+                result = train_and_predict(X, y, X_test, task_spec["task_type"], task_spec["metric"], cfg,
+                                           time_budget=min(usable, 2.5 * estimate), refit_rounds=rounds)
+                if result["stopped"]:
+                    continue
+                predictions.setdefault(rank, []).append(result["test_predictions"])
+                details.append({"experiment": selected[rank][0], "model": model, "seed": result["seed"],
+                                "rounds": rounds, "seconds": round(time.monotonic() - began, 3)})
+                estimates[rank] = max(2., time.monotonic() - began)
+            except LeakAuditError:
+                raise
+            except (OSError, ValueError, RuntimeError, TimeoutError) as error:
+                print(f"ENSEMBLE_REFIT skipped model={model} seed={original_seed + offset} error={error}",
+                      file=sys.stderr, flush=True)
+    return {rank: np.mean(values, axis=0) for rank, values in predictions.items()}, details
+
+
+def run_ensemble(task_dir, task_spec, max_members=16, *, time_budget=None, refit=False):
+    """Cross-fit the selection and meta model, then optionally refit the final members."""
+    from leak_audit import audit_log
+    from training import _constrain_ensemble, apply_ensemble_meta, compare_results, select_ensemble
+
+    started = time.monotonic()
+    deadline = started + time_budget if time_budget is not None else float("inf")
     task_dir = Path(task_dir)
     history = experiment_history(task_dir)
-    candidates = [h for h in history if h.get("preds_file") and Path(h["preds_file"]).exists()
-                  and h["recipe"] != "ensemble" and h.get("quality_flags_pass") is not False]
-    if len(candidates) < 2:
-        raise ValueError("Для ансамбля нужно хотя бы два завершенных эксперимента.")
-    greater = candidates[0]["greater_is_better"]
-    ranked = sorted(candidates, key=lambda h: h["score"], reverse=greater)
-    candidates = ranked[:max_members]
-    audited = task_spec.get("audit_required")
-    original_count = len(candidates)
-    deadline = time.monotonic() + time_budget if time_budget is not None else float("inf")
-
-    def diversity(member):
-        config = member["config"]
-        features = tuple((key, config[key]) for key in ("auto_features", "event_activity", "causal_history",
-                         "hourly_extended", "history_window", "history_smoothing", "recency_days") if config.get(key))
-        return config.get("model"), (features, config.get("seed", 42))
-
-    diverse_pool = list(range(min(original_count, 6)))
-    if audited:
-        for model in task_spec.get("available_backends", ()):
-            signatures = set()
-            for member in ranked:
-                backend, features = diversity(member)
-                if backend != model or features in signatures:
-                    continue
-                signatures.add(features)
-                if member not in candidates:
-                    candidates.append(member)
-                position = candidates.index(member)
-                if position not in diverse_pool:
-                    diverse_pool.append(position)
-                if len(signatures) == 2:
-                    break
-
+    incumbent_pair = next(((i, row) for i, row in reversed(list(enumerate(history))) if row["saved"]), None)
+    incumbent_id, incumbent = incumbent_pair or (None, None)
+    roster = [(item.get("candidate_id", i), item) for i, row in enumerate(history)
+              for item in [row, *row.get("member_candidates", [])]]
+    eligible = [(i, row) for i, row in roster
+                if row.get("preds_file") and Path(row["preds_file"]).exists() and row["recipe"] != "ensemble"
+                and row.get("quality_flags_pass") is not False
+                and (not incumbent or not incumbent.get("complete") or not incumbent.get("fold_signature")
+                     or row.get("fold_signature") == incumbent["fold_signature"])]
+    if not eligible or (len(eligible) < 2 and not refit):
+        raise ValueError("Insufficient eligible completed experiments for ensemble")
     data = load_data(task_dir, task_spec)
-    is_regression = task_spec["task_type"] == "regression"
-    results = []
-    for h in candidates:
-        with np.load(h["preds_file"]) as archive:
-            stored = dict(archive)
-        order = np.asarray(h["class_order"], dtype=object)
-        labels = (stored["test"].astype(float) if is_regression
-                  else order[stored.get("predicted_class", stored["test"].argmax(1))])
-        results.append({
-            "oof": stored["oof"].astype(float), "fold_ids": stored["fold_ids"],
-            "meta_known_from": stored.get("meta_known_from"),
-            "predictions": labels,
-            "probabilities": None if is_regression else stored["test"].astype(float),
-            "class_order": h["class_order"], "score": h["score"], "score_std": h["score_std"],
-            "fold_scores": h["fold_scores"], "greater_is_better": greater, "fit_time": h["fit_time"],
-            "config": {"task_type": task_spec["task_type"], "split": h.get("split"), "fold_windows": h.get("fold_windows", []),
-                       "fold_baselines": h.get("fold_baselines", []),
-                       "n_folds": h["n_folds_done"],
-                       "n_folds_done": h["n_folds_done"], "seed": 42, "fold_seed": 42},
-        })
     y = data["y_train"].reset_index(drop=True)
-    metric = task_spec["metric"]
-    started = time.monotonic()
-    result = optimize_blend_weights(results[:original_count], y, metric)
-    pair_estimate = max(.25, (time.monotonic() - started) / 8)
-    incumbent = next((h for h in reversed(history) if h["saved"]), None)
-    chosen = None
-    if incumbent and incumbent.get("fold_baselines") and (audited or not _beats_fold_baselines(
-            incumbent["fold_scores"], incumbent["fold_baselines"], greater)):
-        # Equal-weight pairs offer complementary rankings with no fitted weights.
-        # Compare them only on the same temporal folds and require majority improvement.
-        incumbent_stats = {k: incumbent[k] for k in ("fold_scores", "greater_is_better")}
-        strongest = None
-        def diversified(members):
-            signatures = [diversity(candidates[i]) for i in members]
-            backends, variants = zip(*signatures)
-            return all(backends) and len(set(backends)) >= 2 and len(set(signatures)) == len(members) and len(set(variants)) > 1
+    is_regression = task_spec["task_type"] == "regression"
+    width = 1 if is_regression else max(2, y.nunique())
+    capacity = max(2, min(96, 450_000_000 // max(1, (len(y) + len(data.get("X_test", ()))) * width * 8)))
+    # Membership of the memory-bounded roster depends only on chronology of the journal.
+    if len(eligible) > capacity:
+        eligible = [eligible[0], *eligible[-capacity + 1:]]
+    results = []
+    for _, row in eligible:
+        with np.load(row["preds_file"]) as archive:
+            stored = dict(archive)
+        if (task_spec.get("label_delay_unit") and (row.get("split") or {}).get("type") == "time"
+                and "meta_known_from" not in stored):
+            column = row["split"]["column"]
+            times = parse_event_datetime(data["X_train"][column])
+            available = label_available_at(times, y.to_numpy(), task_spec["label_delay_unit"])
+            folds = stored["fold_ids"]
+            cutoffs = pd.Index([times.iloc[np.flatnonzero(folds == k)].min() for k in np.unique(folds[folds >= 0])])
+            stored["meta_known_from"] = cutoffs.searchsorted(available, side="right")
+        order = np.asarray(row["class_order"], dtype=object)
+        values = stored["test"].astype(float)
+        labels = values if is_regression else order[stored.get("predicted_class", values.argmax(1))]
+        params = row["config"] | {
+            "task_type": task_spec["task_type"], "split": row.get("split"), "fold_windows": row.get("fold_windows", []),
+            "fold_baselines": row.get("fold_baselines", []), "n_folds": row["n_folds_done"],
+            "n_folds_done": row["n_folds_done"], "seed": 42, "fold_seed": 42,
+            "model": row.get("effective_model") or row["config"].get("model") or "auto",
+            "class_weight": row.get("effective_class_weight", row["config"].get("class_weight")),
+        }
+        if is_regression:
+            metadata = {key: row.get(key) for key in
+                        ("target_bounds", "fold_target_bounds", "integer_target", "fold_integer_target")}
+            if metadata["target_bounds"] is None:
+                metadata = (_ensemble_target_info(data, task_spec, row.get("split"), stored["fold_ids"])
+                            if "X_train" in data else {})
+            params.update(metadata)
+        results.append({"oof": stored["oof"], "fold_ids": stored["fold_ids"], "meta_known_from": stored.get("meta_known_from"),
+                        "predictions": labels, "probabilities": None if is_regression else values,
+                        "class_order": row["class_order"], "score": row["score"], "score_std": row["score_std"],
+                        "fold_scores": row["fold_scores"], "greater_is_better": row["greater_is_better"],
+                        "fit_time": row["fit_time"], "config": params})
 
-        if audited:
-            sets = chain.from_iterable(combinations(diverse_pool, width) for width in (2, 3))
-            sets = (members for members in sets if diversified(members))
-        else:
-            sets = combinations(range(len(results)), 2)
-        def fixed_candidates():
-            nonlocal pair_estimate
-            for members in sets:
-                if time.monotonic() + 1.3 * pair_estimate + 3. > deadline:
-                    break
-                began = time.monotonic()
-                candidate = blend_results([results[i] for i in members], y, metric)
-                pair_estimate = max(.05, time.monotonic() - began, .8 * pair_estimate)
-                yield members, candidate
+    selection_deadline = deadline
+    if refit and time_budget is not None:
+        selection_deadline = deadline - min(180., time_budget * .45)
+    result, plan, stats = select_ensemble(results, y, task_spec["metric"], limit=min(16, max_members),
+                                          deadline=selection_deadline, nonnegative=_nonnegative(task_spec))
+    indices, predict = plan
+    candidate = {"fold_signature": eligible[0][1].get("fold_signature"),
+                 "fold_scores": result["fold_scores"], "greater_is_better": result["greater_is_better"],
+                 "fold_baselines": result["config"].get("fold_baselines", [])}
+    reuse_meta = False
+    if refit and incumbent and incumbent.get("complete") and not _passes_quality_gate(incumbent, candidate, compare_results):
+        positions = {tag: i for i, (tag, _) in enumerate(eligible)}
+        cfg = incumbent.get("config", {})
+        if incumbent_id in positions:
+            i = positions[incumbent_id]
+            indices = [i]
+            result = results[i] | {"config": results[i]["config"] | {"blend_type": "best_single", "blend_space": "prob"}}
+            bounds = result["config"].get("target_bounds")
+            predict = lambda p: _constrain_ensemble(p[0], bounds, not is_regression, _nonnegative(task_spec))
+        elif (cfg.get("final_meta") and cfg.get("selected") and all(tag in positions for tag in cfg["selected"])
+              and incumbent.get("preds_file") and Path(incumbent["preds_file"]).is_file()):
+            indices = [positions[tag] for tag in cfg["selected"]]
+            reference = results[indices[0]]
+            with np.load(incumbent["preds_file"]) as archive:
+                stored = dict(archive)
+            values = stored["test"]
+            labels = values if is_regression else np.asarray(reference["class_order"], dtype=object)[
+                stored.get("predicted_class", values.argmax(1))]
+            result = reference | {"predictions": labels, "probabilities": None if is_regression else values,
+                                  "oof": stored["oof"], "score": incumbent["score"], "score_std": incumbent["score_std"],
+                                  "fold_scores": incumbent["fold_scores"], "postprocess": incumbent.get("postprocess"),
+                                  "config": reference["config"] | cfg}
+            bounds = reference["config"].get("target_bounds")
+            predict = lambda p: apply_ensemble_meta(cfg["final_meta"], p, task_spec["task_type"], task_spec["metric"],
+                                                    bounds, _nonnegative(task_spec))
+            reuse_meta = True
+    selected = [eligible[i] for i in indices]
+    selected_ids = [idx for idx, _ in selected]
+    report_config = {key: result["config"].get(key) for key in
+                     ("blend_type", "blend_space", "blend_weights", "fold_meta", "final_meta")}
+    report_config["selected"] = selected_ids
+    if not reuse_meta:
+        for key in ("fold_meta", "final_meta"):
+            meta = report_config.get(key)
+            for record in (meta if isinstance(meta, list) else [meta] if meta else []):
+                record["members"] = [eligible[i][0] for i in record["members"]]
+    stats["pool"] = [eligible[i][0] for i in stats["pool"]]
+    stats["selected"] = selected_ids
+    stats["strategy"] = report_config["blend_type"]
+    stats["fold_scores"] = result["fold_scores"]
+    stats["best_single"] = eligible[stats["best_single"]][0]
+    stats["duplicates"] = [[eligible[i][0], eligible[j][0], value] for i, j, value in stats["duplicates"]]
+    report = {"task_spec": task_spec, "recipe": "ensemble", "split": eligible[0][1].get("split"), "feature_code": None,
+              "members": {f"exp{i}": {"score": row["score"], "recipe": row["recipe"],
+                                     "model": row.get("effective_model") or row["config"].get("model"),
+                                     "variant": row["config"]} for i, row in eligible if i in stats["pool"]},
+              "config": report_config, "ensemble": stats}
 
-        fixed = fixed_candidates()
-        for pair, candidate in chain([(None, result)], fixed):
-            if not _beats_fold_baselines(candidate["fold_scores"], incumbent["fold_baselines"], greater):
-                continue
-            comparison = compare_results(incumbent_stats, {"fold_scores": candidate["fold_scores"]})
-            if comparison["n_better"] > len(candidate["fold_scores"]) / 2 and comparison["diff_mean"] > 0:
-                rank = candidate["score"] * (1 if greater else -1)
-                if strongest is None or rank > strongest[0]:
-                    strongest = rank, pair, candidate
-        if strongest is not None:
-            _, pair, result = strongest
-            if pair is not None:
-                chosen = [candidates[i] for i in pair]
-                result["config"]["blend_type"] = "equal_pair_beats_all_baselines" if len(pair) == 2 else "equal_triple"
-    candidates = chosen if chosen is not None else candidates[:original_count]
-    if result.get("predictions") is None and result.get("probabilities") is not None:
-        # Лучшей оказалась одиночная модель из файла: метки восстанавливаем из вероятностей
-        order = np.asarray(result["class_order"], dtype=object)
-        result = result | {"predictions": order[np.asarray(result["probabilities"]).argmax(1)]}
-    result.setdefault("config", {})
-    result["config"] = result["config"] | {"n_folds": candidates[0]["n_folds_done"]}
-    report = {"task_spec": task_spec, "recipe": "ensemble", "split": candidates[0].get("split"), "feature_code": None,
-              "members": {f"exp{history.index(h)}": {"score": h["score"], "recipe": h["recipe"]} for h in candidates},
-              "config": {"blend_weights": result["config"].get("blend_weights"),
-                         "blend_type": result["config"].get("blend_type")}}
+    if task_spec.get("audit_required"):
+        temporal = (report["split"] or {}).get("type") == "time"
+        audit_log("pass", "ensemble_meta", sample_sizes=[m["fit_rows"] for m in report_config.get("fold_meta") or []],
+                  rule="only earlier folds and released labels" if temporal else "only other validation folds")
+    if refit and deadline - time.monotonic() > 12.:
+        began = time.monotonic()
+        fresh, fits = _refit_ensemble(task_dir, task_spec, data, selected, deadline)
+        if fresh:
+            key = "predictions" if is_regression else "probabilities"
+            values = np.stack([fresh.get(k, results[i][key]) for k, i in enumerate(indices)])
+            predictions = predict(values)
+            if is_regression:
+                result["predictions"] = predictions
+            else:
+                result["probabilities"] = predictions
+                weights = np.ones(predictions.shape[1])
+                if report_config["blend_type"] == "best_single" and not result.get("postprocess"):
+                    post = selected[0][1].get("postprocess") or {}
+                    stored_weights = post.get("weights", {})
+                    if isinstance(stored_weights, dict):
+                        weights = [stored_weights.get(str(c), stored_weights.get(c, 1.)) for c in result["class_order"]]
+                result["predictions"] = np.asarray(result["class_order"], dtype=object)[(predictions * weights).argmax(1)]
+            same = ((report_config["blend_type"] == "best_single" and selected_ids == [incumbent_id])
+                    or bool(incumbent and all(incumbent.get("config", {}).get(key) == report_config[key]
+                                              for key in ("blend_type", "blend_space", "selected"))))
+            report["refit"] = {"seconds": round(time.monotonic() - began, 3), "fits": fits,
+                               "same_incumbent": same}
+    print("ENSEMBLE " + json.dumps(stats, ensure_ascii=False), file=sys.stderr, flush=True)
+    result["fit_time"] = time.monotonic() - started
     return _record(task_dir, task_spec, data, history, result, report)
 
 
@@ -743,7 +891,8 @@ if __name__ == "__main__":
     receipt_directory.set(args.pop("receipt_dir", None))
     try:
         if args["recipe"] == "ensemble":
-            report = run_ensemble(Path.cwd(), args["task_spec"], time_budget=args["time_budget"])
+            report = run_ensemble(Path.cwd(), args["task_spec"], time_budget=args["time_budget"],
+                                  refit=bool(args["config"].get("refit")))
         elif args["recipe"] == "tune":
             report = run_prefix_tuning(Path.cwd(), args["task_spec"], args["config"], args["time_budget"])
         else:

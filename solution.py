@@ -84,6 +84,7 @@ def run_trial(directory, spec, deadline, budget, config=None, recipe="single", *
 _CV_TOOL = "run_cv_experiment"
 _CV_FLAGS = {"auto_features", "event_activity", "causal_history", "hourly_extended", "log_target", "mae_shift"}
 _BACKENDS = ("lightgbm", "catboost", "xgboost")
+_LEVEL1 = ("hgb", "linear")
 
 
 def parse_model_object(content):
@@ -343,7 +344,8 @@ def choose_variant(spec, baseline, *, include_losses=True):
             return []
         backend = baseline.get("backend", models[0])
         candidates = baseline.get("feature_candidates", {})
-        variants = [{"auto_features": True}, {"rare_min_freq": 5}]
+        variants = [{"model": name} for name in _LEVEL1 if name in models and name != backend]
+        variants += [{"auto_features": True}, {"rare_min_freq": 5}]
         variants.extend({key: True} for key in ("interval_features", "event_calendar") if candidates.get(key))
         variants.append({"fold_preprocess": True})
         if spec["metric"] == "pr_auc":
@@ -422,7 +424,7 @@ def _extended_search(directory, spec, deadline, winner, tested, estimates, retir
     def best_configs():
         rows = rank()
         return {model: model_config(next((row for row in rows if row["config"].get("model") == model), None), model)
-                for model in estimates if retired.get(model) != "next_trial_does_not_fit"}
+                for model in estimates if model in REGULARIZED_PARAMS and retired.get(model) != "next_trial_does_not_fit"}
 
     def queue():
         for model, config in best_configs().items():
@@ -552,9 +554,8 @@ def research(task_path, directory, deadline):
             fields = next(csv.reader(stream))
         blocked = restricted_inputs(task, fields)
         backend_status = {}
-        backends = [backend for backend in _BACKENDS if backend_available(backend, diagnostics=backend_status)]
-        backend_available("sklearn.ensemble", diagnostics=backend_status)
-        backend_status["hgb"] = backend_status.pop("sklearn.ensemble")
+        backends = [backend for backend in (*_BACKENDS, *_LEVEL1)
+                    if backend_available(backend, diagnostics=backend_status)]
         log("BACKENDS " + " ".join(f"{name}={status}" for name, status in backend_status.items()))
         spec = spec | {"audit_required": True, "excluded_features": list(blocked), "available_backends": backends}
         for name, why in blocked.items():
@@ -652,7 +653,8 @@ def research(task_path, directory, deadline):
                 log("LLM_HYPOTHESIS status=insufficient_time")
                 llm_reason = "next_trial_does_not_fit"
             break
-        report = run_trial(directory, spec, search_deadline, quick, config, estimate=estimate)
+        trial_budget = min(quick, 90.) if config.get("model") in _LEVEL1 else quick
+        report = run_trial(directory, spec, search_deadline, trial_budget, config, estimate=estimate)
         if from_llm:
             llm_trials += 1
             status = ("completed" if report and report["complete"] else "incomplete")
@@ -727,13 +729,14 @@ def research(task_path, directory, deadline):
     started = time.monotonic()
     blend_budget = max(0., deadline-started)
     blend = None
-    if sum(bool(h.get("preds_file")) and h.get("quality_flags_pass") is not False
-           for h in history if h.get("recipe") != "ensemble") < 2:
+    if not any(h.get("preds_file") and h.get("quality_flags_pass") is not False
+               for h in history if h.get("recipe") != "ensemble"):
         blend_reason = "insufficient_completed_members"
     elif not trial_fits(blend_estimate, deadline):
         blend_reason = "next_trial_does_not_fit"
     else:
-        blend = run_trial(directory, spec, deadline, blend_budget, recipe="ensemble", estimate=blend_estimate)
+        blend = run_trial(directory, spec, deadline, blend_budget, {"refit": True},
+                          recipe="ensemble", estimate=blend_estimate)
         blend_reason = "blend_evaluated" if blend else "no_result"
     log_phase("ensemble", started, budget=round(blend_budget, 3),
               reason=blend_reason, checkpoint=False)

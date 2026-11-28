@@ -299,11 +299,12 @@ def _resolve_config(config: dict | None) -> dict:
 
 def _check_backend(name: str) -> str:
     aliases = {"lightgbm": "lightgbm", "lgbm": "lightgbm", "lgb": "lightgbm",
-               "catboost": "catboost", "cb": "catboost", "xgboost": "xgboost", "xgb": "xgboost"}
+               "catboost": "catboost", "cb": "catboost", "xgboost": "xgboost", "xgb": "xgboost",
+               "hgb": "hgb", "linear": "linear"}
     backend = aliases.get(name, "lightgbm")
     if backend_available(backend):
         return backend
-    for fallback in ("lightgbm", "catboost", "xgboost"):
+    for fallback in ("lightgbm", "catboost", "xgboost", "hgb", "linear"):
         if fallback != backend and backend_available(fallback):
             logger.warning("Backend %s unavailable, using %s", backend, fallback)
             return fallback
@@ -312,7 +313,7 @@ def _check_backend(name: str) -> str:
 
 def backend_available(name, *, diagnostics=None):
     try:
-        importlib.import_module(name)
+        importlib.import_module({"hgb": "sklearn.ensemble", "linear": "sklearn.linear_model"}.get(name, name))
     except (ImportError, OSError) as exc:
         if diagnostics is not None:
             diagnostics[name] = f"fail({type(exc).__name__}: {exc})".replace("\n", " ")
@@ -797,7 +798,153 @@ def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
     return np.asarray(pva), np.asarray(pte), int(model.get_best_iteration() or 0) + 1, timer.stopped, timer.last_round
 
 
-_BACKENDS = {"lightgbm": _fit_lightgbm, "xgboost": _fit_xgboost, "catboost": _fit_catboost}
+def _sample_fit(y, limit, seed, classification=False):
+    if len(y) <= limit:
+        return np.arange(len(y))
+    rng = np.random.default_rng(seed)
+    sample = rng.choice(len(y), limit, replace=False)
+    if classification:
+        _, first = np.unique(y, return_index=True)
+        sample = np.union1d(sample, first)
+    return np.sort(sample)
+
+
+def _monitor_score(y, prediction, metric, classification):
+    if classification and (np.unique(y).size < prediction.shape[1] or not metric.needs_proba):
+        return _logloss(y, prediction), False
+    return _score_fold(y, prediction, metric), metric.greater_is_better
+
+
+def _fit_hgb(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg, deadline):
+    from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+    from threadpoolctl import threadpool_limits
+
+    classification = task_type in CLASSIFICATION
+    ids = _sample_fit(ytr, 70_000, cfg["seed"], classification)
+    Xtr, ytr = Xtr.iloc[ids].copy(), ytr[ids]
+    wtr = wtr[ids] if wtr is not None else None
+    Xva, Xte = Xva.copy(), Xte.copy()
+    for name, values in Xtr.items():
+        if isinstance(values.dtype, pd.CategoricalDtype):
+            known = pd.Index(values.value_counts().index[:254].to_numpy())
+            for frame in (Xtr, Xva, Xte):
+                frame[name] = pd.Categorical(frame[name], categories=known)
+        else:
+            for frame in (Xtr, Xva, Xte):
+                frame[name] = frame[name].replace([np.inf, -np.inf], np.nan)
+
+    max_rounds = min(240, cfg["num_boost_round"])
+    batch = max(1, min(16, max_rounds))
+    params = cfg["params"]
+    options = {"learning_rate": float(params.get("learning_rate", .08)),
+               "l2_regularization": float(np.clip(params.get("l2_regularization", 3.), 1., 20.)),
+               "max_leaf_nodes": int(np.clip(params.get("max_leaf_nodes", 31), 15, 63)),
+               "random_state": cfg["seed"], "categorical_features": "from_dtype",
+               "early_stopping": False, "warm_start": True}
+    model = (HistGradientBoostingClassifier(**options) if classification else
+             HistGradientBoostingRegressor(**options, loss="absolute_error" if metric.name == "mae" else "squared_error"))
+    predict = model.predict_proba if classification else model.predict
+    best = None
+    # sklearn 1.5 owns a random validation split when early_stopping=True.
+    # Use the supplied inner monitor to preserve chronology and groups.
+    with threadpool_limits(limits=cfg["n_jobs"]):
+        for iteration in range(batch, max_rounds + batch, batch):
+            iteration = min(iteration, max_rounds)
+            model.set_params(max_iter=iteration).fit(Xtr, ytr, sample_weight=wtr)
+            pva = predict(Xva)
+            score, greater = _monitor_score(yva, pva, metric, classification)
+            if cfg.get("final_fit") or best is None or _is_better(score, best[0], greater):
+                best = (score, iteration, pva, predict(Xte))
+            stopped = time.monotonic() >= deadline
+            if stopped or (not cfg.get("final_fit") and iteration - best[1] >= min(48, cfg["early_stopping_rounds"])):
+                break
+    return best[2], best[3], best[1], stopped, iteration
+
+
+def _linear_matrices(frames, y, task_type, n_classes, clock):
+    from scipy.sparse import csr_matrix, hstack
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    fit, monitor, test = frames
+    cats = [c for c in fit if _is_categorical(fit[c])]
+    low = [c for c in cats if fit[c].nunique() <= 32]
+    numeric = [c for c in fit if c not in cats]
+    dense = [[], [], []]
+    for col in numeric:
+        values = [pd.to_numeric(frame[col], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+                  for frame in frames]
+        observed = values[0][np.isfinite(values[0])]
+        lo, median, hi = np.quantile(observed, [.005, .5, .995]) if len(observed) else (0., 0., 0.)
+        for parts, raw in zip(dense, values):
+            missing = ~np.isfinite(raw)
+            parts.extend([np.clip(np.where(missing, median, raw), lo, hi), missing])
+    targets = _te_targets(y, y, task_type, n_classes)
+    for col in cats:
+        if col in low:
+            continue
+        keys = [frame[col].astype("string").fillna("__missing__").to_numpy(dtype=object) for frame in frames]
+        if clock is not None:
+            fit_times, available, mon_times, test_times = clock
+            encoded = [_past_encoding(keys[0], available, targets, k, t, smoothing=10)
+                       for k, t in zip(keys, (fit_times, mon_times, test_times))]
+        else:
+            frame = pd.DataFrame(targets).assign(key=keys[0])
+            by_key = frame.groupby("key", sort=False)
+            n = by_key["key"].transform("size").to_numpy(dtype=float) - 1
+            sums = by_key[list(range(targets.shape[1]))].transform("sum").to_numpy() - targets
+            prior = (targets.sum(axis=0) - targets) / max(1, len(targets) - 1)
+            fit_encoding = np.column_stack([(sums + 10 * prior) / (n[:, None] + 10), np.log1p(n)])
+            encoded = [fit_encoding]
+            for key in keys[1:]:
+                stats = _te_stats(keys[0], targets, key)
+                stats[:, -1] = np.log1p(stats[:, -1])
+                encoded.append(stats)
+        for parts, matrix in zip(dense, encoded):
+            parts.extend(np.nan_to_num(matrix, nan=0.).T)
+    transformed = [np.column_stack(parts).astype("float32") if parts else np.empty((len(frame), 0))
+                   for parts, frame in zip(dense, frames)]
+    if transformed[0].shape[1]:
+        scaler = StandardScaler().fit(transformed[0])
+        transformed = [scaler.transform(matrix) for matrix in transformed]
+    if low:
+        arrays = [frame[low].astype("string").fillna("__missing__").to_numpy(dtype=object) for frame in frames]
+        onehot = OneHotEncoder(min_frequency=10, handle_unknown="infrequent_if_exist", dtype=np.float32).fit(arrays[0])
+        transformed = [hstack([csr_matrix(matrix), onehot.transform(array)], format="csr")
+                       for matrix, array in zip(transformed, arrays)]
+    return transformed
+
+
+def _fit_linear(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg, deadline, *, clock=None):
+    from sklearn.linear_model import LogisticRegression, Ridge
+    from threadpoolctl import threadpool_limits
+
+    classification = task_type in CLASSIFICATION
+    ids = _sample_fit(ytr, 45_000, cfg["seed"], classification)
+    if clock is not None:
+        clock = (clock[0].iloc[ids], clock[1].iloc[ids], *clock[2:])
+    Xtr, Xva, Xte = _linear_matrices((Xtr.iloc[ids], Xva, Xte), ytr[ids], task_type, n_classes, clock)
+    ytr, wtr = ytr[ids], wtr[ids] if wtr is not None else None
+    grid = (.2, .05, 1., .01) if classification else (1., .1, 10., 100.)
+    indices = (min(len(grid), cfg["num_boost_round"]) - 1,) if cfg.get("final_fit") else range(len(grid))
+    best = None
+    with threadpool_limits(limits=cfg["n_jobs"]):
+        for index in indices:
+            model = (LogisticRegression(C=grid[index], max_iter=120, random_state=cfg["seed"]) if classification else
+                     Ridge(alpha=grid[index], solver="lsqr", tol=1e-4))
+            model.fit(Xtr, ytr, sample_weight=wtr)
+            predict = model.predict_proba if classification else model.predict
+            pva = predict(Xva)
+            score, greater = _monitor_score(yva, pva, metric, classification)
+            if best is None or _is_better(score, best[0], greater):
+                best = (score, index + 1, pva, model)
+            if time.monotonic() >= deadline:
+                break
+        pte = best[3].predict_proba(Xte) if classification else best[3].predict(Xte)
+    return best[2], pte, best[1], time.monotonic() >= deadline, index + 1
+
+
+_BACKENDS = {"lightgbm": _fit_lightgbm, "xgboost": _fit_xgboost, "catboost": _fit_catboost,
+             "hgb": _fit_hgb, "linear": _fit_linear}
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +1024,7 @@ def _cross_fit_class_weights(oof: np.ndarray, y_enc: np.ndarray, folds: list, me
 
 def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str,
                       metric: str, config: dict | None = None,
-                      time_budget: float | None = None) -> dict:
+                      time_budget: float | None = None, *, refit_rounds: int | None = None) -> dict:
     """Кросс-валидация, OOF и предсказание на test средним по моделям фолдов.
 
     Строки X и y сопоставляются по позиции. Порядок строк X_test сохраняется.
@@ -945,7 +1092,9 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     if cfg["regularized_ap"]:
         if metric_obj.name != "pr_auc":
             raise ValueError("regularized_ap requires the PR-AUC metric")
-        cfg["params"] = REGULARIZED_PARAMS[cfg["model"]][0] | cfg["params"]
+        defaults = (REGULARIZED_PARAMS[cfg["model"]][0] if cfg["model"] in REGULARIZED_PARAMS else
+                    {"l2_regularization": 8., "max_leaf_nodes": 15} if cfg["model"] == "hgb" else {})
+        cfg["params"] = defaults | cfg["params"]
 
     # log1p таргета
     log_target = cfg["log_target"]
@@ -1052,7 +1201,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                      (metric_obj.name not in ("roc_auc", "gini") or np.unique(y_fit[va]).size == n_classes)]
             if not folds:
                 raise ValueError("No grouped validation window has sufficient class coverage")
-    clip = task_type == "regression" and bool(cfg["clip_target"])
+    clip = task_type == "regression" and bool(cfg["audit_required"] or cfg["clip_target"])
     cfg["n_folds"] = len(folds)
     fit_fn = _BACKENDS[cfg["model"]]
     extra = {}
@@ -1175,6 +1324,12 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             else:
                 parts.append(Xte)
             evaluation = pd.concat(parts, ignore_index=True)
+            if cfg["model"] == "linear":
+                availability = available_at if available_at is not None else labeled_times
+                test_times = (labeled_times.iloc[predict_idx] if predict_idx is not None else
+                              _time_values(X_test[clock]))
+                extra["clock"] = (labeled_times.iloc[tr_idx], availability.iloc[tr_idx],
+                                  labeled_times.iloc[va_idx], test_times)
             history_cols = candidates["entity_history"] if cfg["entity_history"] else []
             if te_cols or history_cols:
                 # Monitor, validation and test rows query the fit history but never enter it.
@@ -1261,6 +1416,27 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         return Xtr, Xva, Xte
 
     # Переобучение на всем train идет после фолдов, под него держим долю бюджета
+    def fit_full(rounds):
+        rcfg = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1, "final_fit": True}
+        idx = refit_idx
+        if temporal and cfg["model"] == "catboost":
+            idx = idx[np.argsort(labeled_times.iloc[idx].to_numpy(), kind="stable")]
+        monitor = np.random.default_rng(cfg["seed"]).choice(idx, min(len(idx), 2000), replace=False)
+        Xall, Xmon, Xte = fold_frames(idx, monitor)
+        _, preds, _, stopped, _ = fit_fn(
+            Xall, y_train_scale[idx], training_weights(idx), Xmon, y_train_scale[monitor], Xte,
+            task_type, metric_obj, n_classes, rcfg, deadline, **extra,
+        )
+        preds = original_scale(preds)
+        if not np.isfinite(preds).all():
+            raise ValueError("Refit returned nonfinite predictions")
+        return preds, stopped
+
+    if refit_rounds is not None:
+        predicted, stopped = fit_full(max(1, int(refit_rounds)))
+        return {"test_predictions": predicted, "stopped": stopped, "model": cfg["model"],
+                "seed": cfg["seed"], "fit_time": time.monotonic() - t_start}
+
     refit_slot = 2.0 if temporal else (1.25 if cfg["refit_full"] else 0.0)
 
     logger.info("Старт: %s, %s, метрика %s, модель %s, %d фолдов, %d строк, %d признаков (%d кат.)%s",
@@ -1276,6 +1452,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     time_stopped_any = False
     monitor_windows = []
 
+    inner_monitor = bool(cfg["audit_required"] or cfg["model"] in ("linear", "hgb"))
     for i, (tr_idx, va_idx) in enumerate(folds):
         now = time.monotonic()
         if now >= deadline:
@@ -1297,7 +1474,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                 if mode == "training_monitor":
                     rounds = min(64, int(cfg["num_boost_round"]))
                     fold_config = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1}
-            elif cfg["audit_required"]:
+            elif inner_monitor:
                 fit_idx, monitor_idx = _iid_monitor(tr_idx, y_fit, task_type, cfg["fold_seed"], groups)
                 if fit_idx is tr_idx:
                     rounds = min(64, int(cfg["num_boost_round"]))
@@ -1306,7 +1483,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                     monitor_deadline = now + .65 * (fold_deadline - now)
             if temporal and cfg["model"] == "catboost":
                 fit_idx = fit_idx[np.argsort(labeled_times.iloc[fit_idx].to_numpy(), kind="stable")]
-            if not temporal and cfg["audit_required"]:
+            if not temporal and inner_monitor:
                 Xtr, queries, Xpred = fold_frames(fit_idx, np.concatenate([monitor_idx, va_idx]))
                 Xmon = queries.iloc[:len(monitor_idx)]
                 Xpred = pd.concat([queries.iloc[len(monitor_idx):], Xpred], ignore_index=True)
@@ -1323,7 +1500,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             )
             if temporal:
                 pva = pte
-            elif cfg["audit_required"]:
+            elif inner_monitor:
                 if fit_idx is not tr_idx and time.monotonic() < fold_deadline:
                     Xall, queries, Xfuture = fold_frames(tr_idx, np.concatenate([monitor_idx, va_idx]))
                     Xmonitor = queries.iloc[:len(monitor_idx)]
@@ -1413,20 +1590,10 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             rounds = max(1, round(np.mean(best_iters) * 1.1)) if temporal else max(_MIN_ROUNDS, int(np.mean(best_iters) * _REFIT_ROUNDS))
             # Ранней остановки нет: число раундов известно из фолдов. Валидация нужна бэкендам
             # формально, берем небольшой кусок train
-            rcfg = cfg | {"num_boost_round": rounds, "early_stopping_rounds": rounds + 1, "final_fit": True}
-            all_idx = refit_idx
-            if temporal and cfg["model"] == "catboost":
-                all_idx = all_idx[np.argsort(labeled_times.iloc[all_idx].to_numpy(), kind="stable")]
-            monitor = np.random.default_rng(cfg["seed"]).choice(all_idx, min(len(all_idx), 2000), replace=False)
+            if cfg["model"] == "linear":
+                rounds = max(1, int(round(np.median(best_iters))))
             try:
-                Xall, Xmon, Xte = fold_frames(all_idx, monitor)
-                _, pte, _, stopped, _ = fit_fn(
-                    Xall, y_train_scale[all_idx], training_weights(all_idx), Xmon, y_train_scale[monitor], Xte,
-                    task_type, metric_obj, n_classes, rcfg, deadline, **extra,
-                )
-                pte = original_scale(pte)
-                if not np.isfinite(pte).all():
-                    raise ValueError("Refit returned nonfinite predictions")
+                pte, stopped = fit_full(rounds)
                 if temporal:
                     test_pred = pte
                 elif not stopped:
@@ -1450,7 +1617,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     if clip:
         score_clip = float(np.nanmean(fold_scores))
         # Temporal windows apply the configured rule without selecting it on future outcomes.
-        clip = temporal or _is_better(score_clip, score_raw, metric_obj.greater_is_better)
+        clip = cfg["audit_required"] or temporal or _is_better(score_clip, score_raw, metric_obj.greater_is_better)
         logger.info("Клиппинг в диапазон таргета: %s %.5f -> %.5f, %s", metric_obj.name, score_raw,
                     score_clip, "применяю" if clip else "не улучшает, отключаю")
         if clip:
@@ -1463,7 +1630,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                             "range": [float(y_fit.min()), float(y_fit.max())]}
 
     # Постобработка для метрик по меткам: веса классов, честная оценка через кросс-фиттинг
-    if (not temporal and task_type in CLASSIFICATION and not metric_obj.needs_proba and cfg["postprocess"]
+    if (not temporal and not cfg["audit_required"] and task_type in CLASSIFICATION
+            and not metric_obj.needs_proba and cfg["postprocess"]
             and len(done_folds) >= 2):
         weights, cross_scores, postprocess_info = _cross_fit_class_weights(
             oof, y_fit, [folds[i] for i in done_folds], metric_obj, score_raw)
@@ -1548,6 +1716,14 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "fold_scores_raw": [float(s) for s in fold_scores_raw],
         "fold_times": fold_times,
         "best_iterations": best_iters,
+        "fold_target_bounds": ([(float(y_fit[folds[i][0]].min()), float(y_fit[folds[i][0]].max()))
+                                for i in done_folds] if task_type == "regression" else None),
+        "target_bounds": ((float(y_fit[refit_idx].min()), float(y_fit[refit_idx].max()))
+                          if task_type == "regression" else None),
+        "fold_integer_target": ([bool(np.equal(y_fit[folds[i][0]], np.round(y_fit[folds[i][0]])).all())
+                                 for i in done_folds] if task_type == "regression" else None),
+        "integer_target": (bool(np.equal(y_fit[refit_idx], np.round(y_fit[refit_idx])).all())
+                           if task_type == "regression" else None),
         "feature_candidates": candidates | {"ad_history": bool(ad_groups), "event_activity": datetime_clock,
                                             "causal_history": bool(general_entities) and task_type != "multiclass",
                                             "event_calendar": datetime_clock, "sqrt_target": bool(sqrt_candidate)},
@@ -1691,7 +1867,7 @@ def _prepare_blend(results: list[dict], y: pd.Series, metric: str) -> _BlendData
 
 
 def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, config: dict,
-                  t_start: float, members_fit_time: float) -> dict:
+                  t_start: float, members_fit_time: float, *, preprocessed=False) -> dict:
     """Скор по фолдам, постобработка и итоговый словарь в формате train_and_predict."""
     metric_obj, y_enc, folds = data.metric, data.y_enc, data.folds
     oof = oof.copy()
@@ -1701,7 +1877,11 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
     postprocess_info = None
 
     temporal = (data.cfg0.get("split") or {}).get("type") == "time"
-    if data.task_type == "regression" and temporal:
+    if preprocessed:
+        probabilities = None if data.task_type == "regression" else test_pred
+        predictions = (test_pred if probabilities is None else
+                       np.asarray(data.class_order, dtype=object)[test_pred.argmax(axis=1)])
+    elif data.task_type == "regression" and temporal:
         predictions = _finalize_regression(test_pred, y_enc, False)
         probabilities = None
     elif data.task_type == "regression":
@@ -1794,15 +1974,18 @@ def _blend_objective(data: _BlendData) -> Metric:
 
 
 def _greedy_blend_weights(oofs: np.ndarray, y: np.ndarray, objective: Metric,
-                          n_iter: int = 50, patience: int = 10) -> np.ndarray:
+                          n_iter: int = 50, patience: int = 10, *, decode=None, deadline=float("inf")) -> np.ndarray:
     """Жадный отбор моделей с повторениями (Caruana): веса неотрицательны, сумма 1."""
     counts = np.zeros(len(oofs))
     total = np.zeros_like(oofs[0])
     best_score, best_counts, stale = None, None, 0
     for it in range(1, n_iter + 1):
+        if it > 1 and time.monotonic() >= deadline:
+            break
         step_score, step_model = None, 0
         for m in range(len(oofs)):
-            s = _score_fold(y, (total + oofs[m]) / it, objective)
+            pred = (total + oofs[m]) / it
+            s = _score_fold(y, decode(pred) if decode else pred, objective)
             if step_score is None or _is_better(s, step_score, objective.greater_is_better):
                 step_score, step_model = s, m
         total += oofs[step_model]
@@ -1869,6 +2052,414 @@ def optimize_blend_weights(results: list[dict], y: pd.Series, metric: str) -> di
     return res
 
 
+_RANK_METRICS = {"pr_auc", "roc_auc", "gini"}
+_LABEL_POST_METRICS = {"f1", "macro_f1", "balanced_accuracy"}
+_FEATURE_OPTIONS = ("auto_features", "interval_features", "event_calendar", "fold_preprocess", "event_activity",
+                    "causal_history", "hourly_extended", "history_since_positive", "history_smoothing",
+                    "entity_history", "target_encoding", "rare_min_freq", "categorical_ids")
+
+
+def select_ensemble_pool(results, oof, scores, classification, limit=16):
+    """Rank by paired CV first, deduplicate predictions on the supplied fit rows."""
+    from scipy.stats import rankdata
+
+    direction = 1 if results[0]["greater_is_better"] else -1
+    order = sorted(range(len(results)), key=lambda i: -direction * scores[i] if np.isfinite(scores[i]) else np.inf)
+    vectors = oof[:, :, 1] if oof.ndim == 3 and oof.shape[2] == 2 else oof
+    if classification:
+        vectors = rankdata(vectors, axis=1)
+    vectors = vectors.reshape(len(results), -1)
+    centered = vectors - vectors.mean(axis=1, keepdims=True)
+    norm = np.linalg.norm(centered, axis=1)
+    normalized = np.divide(centered, norm[:, None], out=np.zeros_like(centered), where=norm[:, None] > 0)
+    corr = np.clip(normalized @ normalized.T, -1., 1.)
+    unique, discarded = [], []
+    for i in order:
+        duplicate = next((j for j in unique if corr[i, j] > .995 or
+                          (not norm[i] and not norm[j] and np.array_equal(vectors[i], vectors[j]))), None)
+        if duplicate is None:
+            unique.append(i)
+        else:
+            discarded.append((i, duplicate, float(corr[i, duplicate]) if norm[i] else 1.))
+
+    chosen, families, variants = [], {}, set()
+    for i in unique:
+        backend = results[i]["config"].get("model", "auto")
+        if families.get(backend, 0) < 2 and len(chosen) < limit:
+            families[backend] = families.get(backend, 0) + 1
+            chosen.append(i)
+    for i in [*chosen, *unique]:
+        config = results[i]["config"]
+        signature = (config.get("mae_objective"), bool(config.get("log_target")), bool(config.get("sqrt_target")),
+                     bool(config.get("regularized_ap")), config.get("es_metric"),
+                     tuple((key, repr(config[key])) for key in _FEATURE_OPTIONS if key in config))
+        if i not in chosen and signature not in variants and len(chosen) < limit:
+            chosen.append(i)
+        variants.add(signature)
+    return chosen, corr, discarded
+
+
+def _ensemble_space(values, space, blocks=None):
+    from scipy.stats import rankdata
+
+    if space == "logit":
+        p = np.clip(values, 1e-6, 1. - 1e-6)
+        if p.shape[-1] == 2:
+            return np.log(p[..., 1]) - np.log1p(-p[..., 1])
+        return np.log(p)
+    if space == "rank":
+        ranks = np.empty_like(values)
+        for idx in (blocks if blocks is not None else [np.arange(values.shape[1])]):
+            ranks[:, idx] = rankdata(values[:, idx], axis=1) / (len(idx) + 1.)
+        return ranks
+    return values
+
+
+def _from_ensemble_space(values, space, classification):
+    from scipy.special import expit, softmax
+
+    if not classification:
+        return values
+    if space == "logit":
+        if values.ndim == 1:
+            positive = expit(values)
+            return np.column_stack([1. - positive, positive])
+        return softmax(values, axis=1)
+    p = np.clip(values, 0., 1.)
+    total = p.sum(axis=1, keepdims=True)
+    return np.divide(p, total, out=np.full_like(p, 1. / p.shape[1]), where=total > 0)
+
+
+def _fit_stacker_matrix(values, y, metric, classification, block_ids, temporal, deadline):
+    from scipy.optimize import minimize
+    from sklearn.linear_model import LogisticRegression, Ridge
+    from threadpoolctl import threadpool_limits
+
+    n_models = len(values)
+    x = values.swapaxes(0, 1).reshape(len(y), -1)
+    if metric.name == "mae":
+        equal = np.full(n_models, 1. / n_models)
+        scale = max(.01, float(np.mean(np.abs(y - np.median(y)))))
+        strength = .02 * scale
+
+        def objective(parameters):
+            weights, shift = parameters[:-1], parameters[-1]
+            residual = x @ weights + shift - y
+            diff = weights - equal
+            signs = np.sign(residual)
+            return (float(np.abs(residual).mean() + strength * (diff @ diff)),
+                    np.r_[signs @ x / len(y) + 2 * strength * diff, signs.mean()])
+
+        initial = np.r_[equal, np.median(y - x @ equal)]
+        with threadpool_limits(limits=2):
+            res = minimize(objective, initial, jac=True, method="L-BFGS-B",
+                           bounds=[(0., None)] * n_models + [(None, None)], options={"maxiter": 70})
+        parameters = res.x if np.isfinite(res.x).all() and np.isfinite(res.fun) else initial
+        return (lambda array: parameters[:-1] @ array + parameters[-1]), {
+            "weights": parameters[:-1].tolist(), "shift": float(parameters[-1])}
+
+    rmsle = metric.name == "rmsle"
+    if rmsle:
+        x, y_fit = np.log1p(np.maximum(x, 0.)), np.log1p(np.maximum(y, 0.))
+    else:
+        y_fit = y
+    labels = np.unique(y) if classification else None
+    if classification:
+        grid = (.05, .01, .2, 1.)
+        make = lambda value: LogisticRegression(C=value, max_iter=150, random_state=42)
+    else:
+        grid = (1., .1, 10., 100.)
+        make = lambda value: Ridge(alpha=value, positive=True)
+
+    if temporal:
+        inner_val = np.flatnonzero(block_ids == block_ids.max())
+        inner_fit = np.flatnonzero(block_ids != block_ids.max())
+    else:
+        order = np.random.default_rng(42).permutation(len(y))
+        split = len(order) // 5
+        inner_val, inner_fit = order[:split], order[split:]
+    fitted, best = grid[0], None
+    with threadpool_limits(limits=2):
+        if len(inner_fit) >= 12 and len(inner_val) >= 4 and (
+            not classification or np.array_equal(np.unique(y[inner_fit]), labels)
+        ):
+            for parameter in grid:
+                if time.monotonic() >= deadline:
+                    break
+                estimator = make(parameter).fit(x[inner_fit], y_fit[inner_fit])
+                p = (estimator.predict_proba(x[inner_val]) if classification else
+                     estimator.predict(x[inner_val]))
+                if rmsle:
+                    p = np.expm1(p)
+                score, greater = _monitor_score(y[inner_val], p, metric, classification)
+                if np.isfinite(score) and (best is None or _is_better(score, best, greater)):
+                    fitted, best = parameter, score
+        estimator = make(fitted).fit(x, y_fit)
+
+    def predict(array):
+        matrix = array.swapaxes(0, 1).reshape(array.shape[1], -1)
+        if classification:
+            return estimator.predict_proba(matrix)
+        if rmsle:
+            return np.expm1(estimator.predict(np.log1p(np.maximum(matrix, 0.))))
+        return estimator.predict(matrix)
+
+    label = "C" if classification else "alpha"
+    return predict, {label: fitted, "weights": estimator.coef_.tolist(),
+                     "shift": np.asarray(estimator.intercept_).tolist()}
+
+
+def _fit_ensemble_strategy(kind, space, inputs, y, metric, classification, n_classes, block_ids,
+                           temporal, deadline):
+    def decode(prediction):
+        return _from_ensemble_space(prediction, space, classification)
+
+    weights = np.full(len(inputs), 1. / len(inputs))
+    if kind == "caruana" and len(y) >= 4:
+        objective = METRICS["logloss"] if classification and not metric.needs_proba else metric
+        if classification and objective.name in _RANK_METRICS and np.unique(y).size < n_classes:
+            objective = METRICS["logloss"]
+        w = _greedy_blend_weights(inputs, y, objective, n_iter=18, patience=5, decode=decode, deadline=deadline)
+        weights = .7 * w + .3 * weights
+    if kind == "l2_stacker" and len(y) >= 12 and (not classification or np.unique(y).size == n_classes):
+        try:
+            return _fit_stacker_matrix(inputs, y, metric, classification, block_ids, temporal, deadline)
+        except (FloatingPointError, RuntimeError, ValueError):
+            logger.exception("Level-2 fit failed, using equal weights")
+    return lambda array: decode(np.tensordot(weights, array, axes=1)), {"weights": weights.tolist()}
+
+
+def _constrain_ensemble(pred, bounds, classification, nonnegative):
+    if classification:
+        p = np.where(np.isfinite(pred), pred, 0.)
+        return _from_ensemble_space(p, "prob", True)
+    low, high = bounds if bounds is not None else (-np.inf, np.inf)
+    if nonnegative:
+        low, high = max(0., low), max(0., high)
+    replacement = (low + high) / 2 if np.isfinite(low) and np.isfinite(high) else 0.
+    return np.clip(np.where(np.isfinite(pred), pred, replacement), low, high)
+
+
+def _fit_ensemble_postprocess(pred, y, metric, allow_round):
+    if allow_round:
+        return lambda p: np.round(p), {"type": "round"}
+    if metric.name == "logloss" and len(y) and np.unique(y).size > 1:
+        from scipy.special import softmax
+
+        def scale(p, t):
+            return softmax(np.log(np.clip(p, 1e-8, 1.)) / t, axis=1)
+
+        grid = (*np.geomspace(.2, 5., 13), 1.)
+        temperature = min(grid, key=lambda t: _logloss(y, scale(pred, t)))
+        return lambda p: scale(p, temperature), {"type": "temperature", "temperature": float(temperature)}
+    if metric.name in _LABEL_POST_METRICS and len(y) and np.unique(y).size > 1:
+        w, _ = fit_class_weights(pred, y, metric, n_passes=2, max_rows=6000)
+        return lambda p: _from_ensemble_space(p * w, "prob", True), {"type": "class_weights", "weights": w.tolist()}
+    return lambda p: p, {}
+
+
+def apply_ensemble_meta(meta, predictions, task_type, metric, bounds=None, nonnegative=False):
+    """Apply a previously selected, serialized meta model to full-history predictions."""
+    from scipy.special import expit, softmax
+
+    classification = task_type != "regression"
+    space = meta["space"]
+    inputs = _ensemble_space(predictions, space)
+    weights = np.asarray(meta["weights"])
+    if "C" in meta or "alpha" in meta:
+        x = inputs.swapaxes(0, 1).reshape(inputs.shape[1], -1)
+        if metric == "rmsle":
+            x = np.log1p(np.maximum(x, 0.))
+        prediction = x @ weights.T + np.asarray(meta["shift"])
+        if metric == "rmsle":
+            prediction = np.expm1(prediction)
+        elif classification and prediction.shape[1] == 1:
+            positive = expit(prediction[:, 0])
+            prediction = np.column_stack([1. - positive, positive])
+        elif classification:
+            prediction = softmax(prediction, axis=1)
+    else:
+        prediction = _from_ensemble_space(np.tensordot(weights, inputs, axes=1), space, classification)
+        if "shift" in meta:
+            prediction = prediction + meta["shift"]
+    prediction = _constrain_ensemble(prediction, bounds, classification, nonnegative)
+    post = meta.get("postprocess", {})
+    if post.get("type") == "round":
+        prediction = np.round(prediction)
+    elif post.get("type") == "temperature":
+        prediction = softmax(np.log(np.clip(prediction, 1e-8, 1.)) / post["temperature"], axis=1)
+    elif post.get("type") == "class_weights":
+        prediction *= np.asarray(post["weights"])
+    return _constrain_ensemble(prediction, bounds, classification, nonnegative)
+
+
+def _quality_pair(control, candidate):
+    paired = compare_results(control, candidate)
+    direction = 1 if control["greater_is_better"] else -1
+
+    def wins(result):
+        baselines = result["config"].get("fold_baselines", ())
+        return sum(direction * (score - base["score"]) > 0 for score, base in zip(result["fold_scores"], baselines))
+
+    n = paired["n_folds"]
+    return bool(n > 0 and paired["n_better"] > n / 2 and paired["diff_mean"] > paired["diff_std"] / np.sqrt(n)
+                and wins(candidate) >= wins(control))
+
+
+def _ensemble_setup(data, results, limit):
+    fold_ids = np.full(len(data.y_enc), -1, dtype=int)
+    for k, (_, valid) in enumerate(data.folds):
+        fold_ids[valid] = k
+    active = np.flatnonzero(fold_ids >= 0)
+    classification = data.class_order is not None
+    # Full OOF correlation is affordable for ordinary rosters. Very wide multiclass
+    # matrices use a bounded common sample to keep ranking and centered copies small.
+    final_sample = (active if data.oofs.nbytes <= 480_000_000 else
+                    active[_sample_fit(data.y_enc[active], 24_000, 42, classification)])
+    final, corr, discarded = select_ensemble_pool(results, data.oofs[:, final_sample],
+                                                  [r["score"] for r in results], classification, limit)
+    pools = []
+    for fit, _ in data.folds:
+        if len(fit) < 4:
+            pools.append(list(range(min(len(results), limit))))
+            continue
+        sample = fit[_sample_fit(data.y_enc[fit], 9000, 42, classification)]
+        scores = [_score_fold(data.y_enc[sample], candidate, data.metric) for candidate in data.oofs[:, sample]]
+        shortlisted, _, _ = select_ensemble_pool(results, data.oofs[:, sample], scores, classification, limit)
+        pools.append(shortlisted)
+    return fold_ids, final, pools, corr, discarded
+
+
+def _crossfit_ensemble(data, results, setup, kind, space, deadline, nonnegative, *, try_postprocess=False):
+    started = time.monotonic()
+    fold_ids, final, pools, _, _ = setup
+    classification = data.class_order is not None
+    temporal = (data.cfg0.get("split") or {}).get("type") == "time"
+    n_classes = len(data.class_order) if classification else 0
+    folds = data.folds
+    bound_folds = data.cfg0.get("fold_target_bounds") or [None] * len(folds)
+    integer_folds = data.cfg0.get("fold_integer_target") or [None] * len(folds)
+    bounds_final = data.cfg0.get("target_bounds")
+    if bounds_final is None and not classification:
+        bounds_final = (float(data.y_enc.min()), float(data.y_enc.max()))
+
+    def program(ids, train, bounds, integer):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Ensemble fit deadline")
+        take = train[_sample_fit(data.y_enc[train], 6500, 42, classification)]
+        y = data.y_enc[take]
+        tags = fold_ids[take]
+        blocks = [np.flatnonzero(tags == k) for k in np.unique(tags)]
+        # A first temporal fold has no meta training examples. Its predictions are
+        # the arithmetic mean, including for strategies that otherwise use logits.
+        mixed_calibration = classification and len({repr(results[i]["config"].get("class_weight")) for i in ids}) > 1
+        use_space = space if len(take) else ("logit" if mixed_calibration else "prob")
+        features = _ensemble_space(data.oofs[np.ix_(ids, take)], use_space, blocks)
+        predict, diagnostics = _fit_ensemble_strategy(kind, use_space, features, y, data.metric, classification,
+                                                        n_classes, tags, temporal, deadline)
+        post, post_info = (lambda p: p), {}
+        if try_postprocess and len(take):
+            integral = not classification and (integer if integer is not None else
+                                                   np.equal(data.y_enc[train], np.round(data.y_enc[train])).all())
+            post, post_info = _fit_ensemble_postprocess(
+                _constrain_ensemble(predict(features), bounds, classification, nonnegative), y, data.metric, integral)
+
+        def apply(predictions):
+            p = _constrain_ensemble(predict(_ensemble_space(predictions, use_space)), bounds, classification, nonnegative)
+            return _constrain_ensemble(post(p), bounds, classification, nonnegative)
+
+        return apply, diagnostics | {"members": list(ids), "space": use_space, "fit_rows": len(take),
+                                     "postprocess": post_info}
+
+    oof = np.full_like(data.oofs[0], np.nan)
+    fold_meta = []
+    for k, (fit, valid) in enumerate(folds):
+        ids = pools[k]
+        predict, meta = program(ids, fit, bound_folds[k], integer_folds[k])
+        oof[valid] = predict(data.oofs[np.ix_(ids, valid)])
+        fold_meta.append(meta)
+    fitted, plan = program(final, np.flatnonzero(fold_ids >= 0), bounds_final, data.cfg0.get("integer_target"))
+    config = {"blend_type": kind, "blend_space": space, "blend_weights": plan.get("weights"),
+              "blend_fold_weights": [m.get("weights") for m in fold_meta],
+              "fold_meta": fold_meta, "final_meta": plan, "blend_of": [results[i]["config"] for i in final]}
+    result = _finish_blend(data, oof, fitted(data.tests[final]), config, started,
+                           float(sum(results[i]["fit_time"] for i in final)), preprocessed=True)
+    result["postprocess"] = plan["postprocess"] or None
+    return result, (final, fitted)
+
+
+def fit_causal_stacker(results, y, metric, *, limit=16, deadline=float("inf"), nonnegative=False):
+    """Cross-fit the meta learner on earlier observable folds or the other IID folds."""
+    data = _prepare_blend(results, y, metric)
+    setup = _ensemble_setup(data, results, limit)
+    result, _ = _crossfit_ensemble(data, results, setup, "l2_stacker", "logit" if data.class_order else "prob",
+                                    deadline, nonnegative)
+    return result
+
+
+def select_ensemble(results, y, metric, *, limit=16, deadline=float("inf"), nonnegative=False):
+    """Select with paired CV and keep a callable plan for replacing test inputs after refit."""
+    data = _prepare_blend(results, y, metric)
+    setup = _ensemble_setup(data, results, limit)
+    fold_ids, pool, _, corr, discarded = setup
+    greater = data.metric.greater_is_better
+    best_idx = max(range(len(results)), key=lambda i: results[i]["score"] if greater else -results[i]["score"])
+    classification = data.class_order is not None
+    bounds = data.cfg0.get("target_bounds") or ((float(data.y_enc.min()), float(data.y_enc.max()))
+                                                if not classification else None)
+    one = lambda p: _constrain_ensemble(p[0], bounds, classification, nonnegative)
+    best = dict(results[best_idx])
+    best["config"] = best["config"] | {"blend_type": "best_single", "blend_space": "prob"}
+    if classification:
+        best["probabilities"] = one(data.tests[[best_idx]])
+    else:
+        best["predictions"] = one(data.tests[[best_idx]])
+    reference = best
+    plan = ([best_idx], one)
+    winning_setup, winning_kind, winning_space = (
+        (fold_ids, [best_idx], [[best_idx]] * len(data.folds), corr, discarded), "best_single", "prob")
+    if data.metric.name in _RANK_METRICS:
+        spaces = ("rank", "logit")
+    elif data.metric.name == "logloss" or (classification and any(
+        (r["config"].get("class_weight") or "default") != (results[0]["config"].get("class_weight") or "default")
+        for r in results
+    )):
+        spaces = ("logit",)
+    else:
+        spaces = ("prob", "logit") if classification else ("prob",)
+    candidates = [("equal_blend", spaces[0]), *(("caruana", space) for space in spaces)]
+    if classification or metric in ("mae", "rmse", "rmsle"):
+        candidates.insert(1, ("l2_stacker", "logit" if classification else "prob"))
+    diagnostics = []
+    for kind, space in candidates:
+        try:
+            candidate, fitted = _crossfit_ensemble(data, results, setup, kind, space, deadline, nonnegative)
+        except TimeoutError:
+            break
+        accept = _quality_pair(reference, candidate)
+        diagnostics.append({"strategy": kind, "space": space, "scores": candidate["fold_scores"], "accepted": accept})
+        if accept and _is_better(candidate["score"], best["score"], greater):
+            best, plan = candidate, fitted
+            winning_setup, winning_kind, winning_space = setup, kind, space
+    if data.metric.name not in _RANK_METRICS:
+        try:
+            calibrated, fitted = _crossfit_ensemble(data, results, winning_setup, winning_kind, winning_space,
+                                                     deadline, nonnegative, try_postprocess=True)
+        except TimeoutError:
+            calibrated = None
+        if calibrated and calibrated["postprocess"]:
+            accept = _quality_pair(best, calibrated) and _quality_pair(reference, calibrated)
+            diagnostics.append({"strategy": winning_kind, "postprocess": calibrated["postprocess"],
+                                "scores": calibrated["fold_scores"], "accepted": accept})
+            if accept:
+                best, plan = calibrated, fitted
+    stats = {"pool": pool, "correlations": corr[np.ix_(pool, pool)].round(6).tolist(),
+             "duplicates": discarded, "selected": plan[0], "strategy": best["config"]["blend_type"],
+             "best_single": best_idx, "best_single_scores": reference["fold_scores"],
+             "fold_scores": best["fold_scores"], "strategies": diagnostics}
+    return best, plan, stats
+
+
 def compare_results(a: dict, b: dict) -> dict:
     """Попарное сравнение b с a по одинаковым фолдам.
 
@@ -1906,6 +2497,8 @@ _AUTO_TUNE_MAX_TRIALS = 40        # и не дольше стольких обу
 def tune_backend(model, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
                  config: dict, time_budget: float, *, diagnostics=None) -> dict:
     """Search before the first outer validation window and rescore winners on outer OOF."""
+    if model not in REGULARIZED_PARAMS:
+        return {}
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -2121,6 +2714,9 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         return True
 
     def blend(previous: dict | None) -> dict | None:
+        if base.get("audit_required") and members:
+            best = max(members.values(), key=lambda result: result["score"] if result["greater_is_better"] else -result["score"])
+            return dict(best)
         if len(members) < 2:
             return previous
         if remaining() < 1.2 * blend_estimate():
@@ -2153,7 +2749,11 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     if not members and use_cat and use_lgb:
         run("catboost", {"model": "catboost"})
     if not members:
-        raise RuntimeError("No boosting backend completed validation")
+        for backend in ("hgb", "linear"):
+            if backend_available(backend) and run(backend, {"model": backend}, force=True):
+                break
+    if not members:
+        raise RuntimeError("No backend completed validation")
     best = blend(None)
 
     # Шаг 2: сиды XGBoost и LightGBM, пока следующая модель укладывается в остаток

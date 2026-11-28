@@ -251,7 +251,7 @@ def test_failed_later_trial_preserves_published_model(tmp_path, monkeypatch):
         assert [h["score"] for h in pipeline.experiment_history(tmp_path)] == [2., 1.]
 
 
-def test_ensemble_must_improve_majority_and_clear_each_baseline(tmp_path, monkeypatch):
+def test_ensemble_must_improve_majority_above_noise(tmp_path, monkeypatch):
     (tmp_path / "sample_submission.csv").write_text("id,y\na,0\nb,0\n", encoding="utf-8")
     monkeypatch.setenv("TYRELL_OUTPUT_DIR", str(tmp_path))
     data = {"test_ids": pd.Series(["a", "b"], name="id"), "sample_path": tmp_path / "sample_submission.csv"}
@@ -265,7 +265,7 @@ def test_ensemble_must_improve_majority_and_clear_each_baseline(tmp_path, monkey
         "fold_scores": [2.01, 2.01, 1.9, 1.9, 1.98],
     }
     pipeline._record(tmp_path, spec, data, history, result, {"recipe": "single"})
-    almost = result | {"score": 1.95, "fold_scores": [1.99, 1.99, 1.91, 1.91, 1.97]}
+    almost = result | {"score": 1.932, "fold_scores": [1.96, 1.96, 1.91, 1.91, 1.92]}
     report = pipeline._record(tmp_path, spec, data, history, almost, {"recipe": "ensemble"})
     assert report["saved"] and report["vs_saved"]["n_better"] == 3
     weak = result | {"score": 1.62, "fold_scores": [2.01, 1.6, 1.5, 1.5, 1.5]}
@@ -363,29 +363,31 @@ def test_tune_recipe_and_outer_experiment_use_identical_features(tmp_path, monke
     assert capsys.readouterr().err.count('LEAK_AUDIT status=pass {"group": "calendar"') == 2
 
 
-def test_ensemble_considers_triple_with_two_backends(tmp_path, monkeypatch):
+def test_ensemble_scores_the_whole_candidate_roster(tmp_path, monkeypatch):
     import training
 
     spec = {"task_type": "regression", "metric": "mae", "audit_required": True,
-            "available_backends": ["catboost", "xgboost"]}
+            "available_backends": ["lightgbm", "xgboost", "catboost", "hgb", "linear"]}
     history = []
-    for i, (model, seed) in enumerate((("catboost", 42), ("catboost", 101), ("xgboost", 42))):
+    names = spec["available_backends"] * 2
+    for i, model in enumerate(names):
         artifact = tmp_path / f"experiment{i}.npz"
         np.savez(artifact, test=[2.], oof=np.full(5, 2.), fold_ids=np.arange(5))
-        history.append({"config": {"model": model, "seed": seed}, "recipe": "single", "score": 2.,
+        history.append({"config": {"model": model, "seed": 42 + i}, "recipe": "single", "score": 2.,
                         "score_std": 0., "fold_scores": [2.] * 5, "fold_baselines": [{"score": 3.}] * 5,
                         "greater_is_better": False, "n_folds_done": 5, "fit_time": 1., "class_order": None,
                         "preds_file": str(artifact), "saved": i == 0})
 
-    def blend(members, y, metric):
-        score = 1. if len(members) == 3 else 1.5
-        return {"score": score, "fold_scores": [score] * 5, "config": {}, "predictions": [score]}
+    def select(members, y, metric, *, limit, **kwargs):
+        assert len(members) == len(names) and limit == 16
+        assert [m["config"]["model"] for m in members] == names
+        stats = {"pool": list(range(len(members))), "selected": [0], "best_single": 0, "duplicates": []}
+        return members[0] | {"config": {"blend_type": "best_single"}}, ([0], lambda p: p[0]), stats
 
     monkeypatch.setattr(pipeline, "experiment_history", lambda _: history)
     monkeypatch.setattr(pipeline, "load_data", lambda *_: {"y_train": pd.Series(np.zeros(5))})
     monkeypatch.setattr(pipeline, "_record", lambda *args: args[-1])
-    monkeypatch.setattr(training, "blend_results", blend)
-    monkeypatch.setattr(training, "optimize_blend_weights", lambda *args: {"score": 2., "fold_scores": [2.] * 5})
+    monkeypatch.setattr(training, "select_ensemble", select)
     result = pipeline.run_ensemble(tmp_path, spec)
-    assert result["config"]["blend_type"] == "equal_triple"
-    assert len(result["members"]) == 3
+    assert result["config"]["blend_type"] == "best_single"
+    assert len(result["members"]) == len(names)

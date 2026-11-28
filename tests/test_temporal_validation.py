@@ -178,10 +178,11 @@ def test_saved_ensemble_retains_postprocessed_labels(tmp_path, monkeypatch):
     pipeline._record(tmp_path, spec, data, history, result, report)
     pipeline._record(tmp_path, spec, data, history, result, report)
     monkeypatch.setattr(pipeline, "load_data", lambda *args: data)
-    def observe(results, y, metric):
+    def observe(results, y, metric, **kwargs):
         assert all(list(r["predictions"]) == [1, 1] for r in results)
-        return results[0]
-    monkeypatch.setattr(training, "optimize_blend_weights", observe)
+        stats = {"pool": [0, 1], "selected": [0], "best_single": 0, "duplicates": []}
+        return results[0], ([0], lambda p: p[0]), stats
+    monkeypatch.setattr(training, "select_ensemble", observe)
     pipeline.run_ensemble(tmp_path, spec)
 
 
