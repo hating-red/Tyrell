@@ -19,7 +19,7 @@ limit_openmp()
 import numpy as np
 import pandas as pd
 
-from data_tools import detect_split, load_data, parse_event_datetime, label_available_at
+from data_tools import INTERVAL_FEATURE_SUFFIXES, detect_split, load_data, parse_event_datetime, label_available_at
 from publication import MODEL_SUCCESS, TRAINED_FALLBACK, SCHEMA_FALLBACK, csv_digest, prepare_publication, receipt_directory
 from submission import make_submission, validate_submission
 
@@ -30,7 +30,9 @@ output_directory = ContextVar("output_directory", default=None)
 AUTO_KEYS = ("features", "cat_encoding", "target_encoding", "refit_full", "entity_history", "log_target",
              "ad_history", "ad_history_window", "ad_history_smoothing", "event_activity", "causal_history",
              "history_window", "history_smoothing", "mae_shift", "recency_days", "mae_objective",
-             "auto_features", "rare_min_freq", "catboost_ordered_ctr", "es_metric")
+             "auto_features", "rare_min_freq", "catboost_ordered_ctr", "es_metric", "event_calendar",
+             "fold_preprocess", "sqrt_target", "history_since_positive", "regularized_ap")
+_HOURLY_SUFFIXES = ("__mean24h", "__mean168h", "__delta1_3h", "__dev7d")
 
 
 def apply_feature_code(feature_code, X_train, X_test):
@@ -85,9 +87,12 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
     if audited and temporal and any(cfg.get(key) for key in ("target_encoding", "entity_history", "ad_history")):
         raise LeakAuditError("temporal configuration uses an uncertified legacy feature group")
     hourly_extended = bool(cfg.pop("hourly_extended", False))
-    hourly_columns = [name for name in X_train if name.endswith(("__mean24h", "__mean168h", "__delta1_3h", "__dev7d"))]
-    if audited and not hourly_extended:
-        X_train, X_test = X_train.drop(columns=hourly_columns), X_test.drop(columns=hourly_columns)
+    interval_features = bool(cfg.pop("interval_features", False))
+    dropped = [name for name in X_train if
+               (audited and not hourly_extended and name.endswith(_HOURLY_SUFFIXES)) or
+               (not interval_features and name.endswith(INTERVAL_FEATURE_SUFFIXES))]
+    if dropped:
+        X_train, X_test = X_train.drop(columns=dropped), X_test.drop(columns=dropped)
     auto_features = bool(cfg.pop("auto_features", False))
     if auto_features and temporal:
         from features import add_auto_features
@@ -144,7 +149,7 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     config = dict(config or {})
     auto_features = bool(config.get("auto_features"))
     hourly_extended = bool(config.get("hourly_extended"))
-    hourly_columns = [name for name in data["X_train"] if name.endswith(("__mean24h", "__mean168h", "__delta1_3h", "__dev7d"))]
+    interval_features = bool(config.get("interval_features"))
     try:
         X_train, X_test, cfg = prepare_features(task_dir, task_spec, config, data=data, feature_code=feature_code)
     except LeakAuditError as exc:
@@ -202,9 +207,12 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         "auto_features": auto_features, "target_encoding": target_encoding or False, "te_keys": te_specs,
         "split": split, "members": result.get("members"),
         "config": {k: v for k, v in cfg.items() if k != "features"} | {
-            "auto_features": auto_features, "hourly_extended": hourly_extended},
+            "auto_features": auto_features, "hourly_extended": hourly_extended, "interval_features": interval_features},
     }
-    report["feature_candidates"] = result.get("feature_candidates", {}) | {"hourly_extended": bool(hourly_columns)}
+    report["feature_candidates"] = result.get("feature_candidates", {}) | {
+        "hourly_extended": any(name.endswith(_HOURLY_SUFFIXES) for name in data["X_train"]),
+        "interval_features": any(name.endswith(INTERVAL_FEATURE_SUFFIXES) for name in data["X_train"]),
+    }
     if "auto_stop" in result:
         report["auto_stop"] = result["auto_stop"]
     return _record(task_dir, task_spec, data, history, result, report)
@@ -293,22 +301,20 @@ def _record(task_dir, task_spec, data, history, result, report):
         if task_spec.get("audit_required") and report.get("recipe") != "ensemble":
             from training import DEFAULT_CONFIG
 
-            quality_flags = ["rare_min_freq", "catboost_ordered_ctr", "es_metric"]
+            quality_flags = ["rare_min_freq", "catboost_ordered_ctr", "es_metric", "event_calendar",
+                             "fold_preprocess", "sqrt_target", "regularized_ap", "log_target",
+                             "mae_objective", "history_smoothing", "history_since_positive"]
             if (report.get("split") or {}).get("type") != "time":
                 quality_flags.append("auto_features")
             config = report.get("config", {})
-            trial_flags = [key for key in quality_flags if config.get(key, DEFAULT_CONFIG[key]) not in
-                           (DEFAULT_CONFIG[key], previous.get("config", {}).get(key, DEFAULT_CONFIG[key]))]
+            defaults = ({key: DEFAULT_CONFIG[key] for key in quality_flags} | {"interval_features": False})
+            trial_flags = [key for key, default in defaults.items() if config.get(key, default) not in
+                           (default, previous.get("config", {}).get(key, default))]
             if trial_flags:
-                control_config = config | {key: DEFAULT_CONFIG[key] for key in trial_flags}
-
-                def normalized(values):
-                    defaults = {key: DEFAULT_CONFIG[key] for key in quality_flags}
-                    return defaults | values
-
+                control_config = defaults | config | {key: defaults[key] for key in trial_flags}
                 control = next((row for row in reversed(history)
                                 if row.get("complete") and row.get("recipe") == report.get("recipe")
-                                and normalized(row.get("config", {})) == normalized(control_config)), None)
+                                and (defaults | row.get("config", {})) == control_config), None)
                 candidate = {"fold_signature": signature, "fold_scores": result["fold_scores"],
                              "greater_is_better": greater, "fold_baselines": baselines}
                 quality_pass = bool(complete and control and _passes_quality_gate(control, candidate, compare_results))
@@ -320,19 +326,28 @@ def _record(task_dir, task_spec, data, history, result, report):
                 print("QUALITY_FLAGS " + json.dumps(quality_audit), file=sys.stderr, flush=True)
     # Предсказания завершенных экспериментов храним на диске: в конце их можно смешать
     preds_file = None
-    if complete and quality_pass is not False and "fold_ids" in result:
-        preds_dir = task_dir / PREDS_DIR
-        preds_dir.mkdir(exist_ok=True)
-        preds_file = str(preds_dir / f"{len(history)}.npz")
+    if complete and "fold_ids" in result:
+        archive = Path(os.environ.get("TYRELL_OOF_RUN_DIR", task_dir))
         test = result["probabilities"] if result["probabilities"] is not None else result["predictions"]
-        extras = {}
+        arrays = {"oof": np.asarray(result["oof"], dtype=np.float32),
+                  "test": np.asarray(test, dtype=np.float64), "fold_ids": result["fold_ids"]}
         if result.get("meta_known_from") is not None:
-            extras["meta_known_from"] = result["meta_known_from"]
+            arrays["meta_known_from"] = result["meta_known_from"]
         if result["class_order"] is not None:
-            extras["predicted_class"] = pd.Index(result["class_order"]).get_indexer(result["predictions"])
-        np.savez_compressed(preds_file, oof=np.asarray(result["oof"], dtype=np.float32),
-                            test=np.asarray(test, dtype=np.float64), fold_ids=result["fold_ids"],
-                            **extras)
+            arrays["predicted_class"] = pd.Index(result["class_order"]).get_indexer(result["predictions"])
+        for root in dict.fromkeys((archive, task_dir)):
+            try:
+                preds_dir = root / PREDS_DIR
+                preds_dir.mkdir(exist_ok=True)
+                path = preds_dir / f"{len(history)}.npz"
+                np.savez_compressed(path, **arrays)
+            except OSError as error:
+                if root == task_dir:
+                    raise
+                print(f"OOF_ARCHIVE unavailable: {error}", file=sys.stderr, flush=True)
+            else:
+                preds_file = str(path)
+                break
 
     output = _output_path(task_dir)
     staged_csv = task_dir / ".tyrell_candidate.csv"
@@ -377,6 +392,14 @@ def _record(task_dir, task_spec, data, history, result, report):
     else:
         staged_history.replace(history_file)
     history.append(report)
+    if "TYRELL_OOF_RUN_DIR" in os.environ:
+        archive_history = Path(os.environ["TYRELL_OOF_RUN_DIR"]) / "experiments.json"
+        staged_archive = archive_history.with_suffix(".tmp")
+        try:
+            shutil.copyfile(history_file, staged_archive)
+            staged_archive.replace(archive_history)
+        except OSError as error:
+            print(f"OOF_ARCHIVE unavailable: {error}", file=sys.stderr, flush=True)
     if task_spec.get("audit_required") and report["saved"] and comparison:
         rules = {"auto_features": ("fit-only statistics" if (report.get("split") or {}).get("type") != "time"
                                    else "current event values only"),
@@ -455,7 +478,7 @@ def run_ensemble(task_dir, task_spec, max_members=8, *, time_budget=None):
     task_dir = Path(task_dir)
     history = experiment_history(task_dir)
     candidates = [h for h in history if h.get("preds_file") and Path(h["preds_file"]).exists()
-                  and h["recipe"] != "ensemble"]
+                  and h["recipe"] != "ensemble" and h.get("quality_flags_pass") is not False]
     if len(candidates) < 2:
         raise ValueError("Для ансамбля нужно хотя бы два завершенных эксперимента.")
     greater = candidates[0]["greater_is_better"]

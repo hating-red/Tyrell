@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import copy
 import importlib
+import json
 import logging
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -211,7 +213,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "num_boost_round": 3000,
     "early_stopping_rounds": 100,
     "es_metric": "auto",
+    "regularized_ap": False,
     "log_target": None,           # log1p таргета в регрессии, None - авто (только для rmsle)
+    "sqrt_target": False,
     "class_weight": None,         # None или "balanced"
     "postprocess": True,          # подбор весов классов под метрику по меткам
     "n_jobs": None,               # None - min(8, число CPU)
@@ -226,14 +230,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ad_history_smoothing": 20.,
     "audit_required": False,
     "auto_features": False,
+    "event_calendar": False,
+    "fold_preprocess": False,
     "rare_min_freq": 0,
     "catboost_ordered_ctr": False,
     "event_activity": False,
     "causal_history": False,
     "history_window": 64,
     "history_smoothing": 24.,
+    "history_since_positive": True,
     "recency_days": None,
-    "mae_objective": "l1",
+    "mae_objective": None,        # explicit l1, huber or quantile loss for regression
     "mae_shift": False,
     "profile_categories": False,
     "label_delay_unit": None,     # duration target from event time until the label is known
@@ -245,6 +252,16 @@ _MIN_ROUNDS = 20                  # меньше этого по бюджету 
 _TE_SMOOTHING = 2.0               # сглаживание среднего по ключу к общему среднему, «виртуальных строк»
 _TE_INNER_FOLDS = 5               # внутренние фолды для кодирования строк обучающей части
 _REFIT_ROUNDS = 1.15              # на всем train раундов больше, чем в среднем на фолде: данных больше
+REGULARIZED_PARAMS = {
+    "lightgbm": [{"max_depth": depth, "num_leaves": 2**depth, "min_child_samples": leaf,
+                  "lambda_l2": l2, "feature_fraction": fraction}
+                 for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
+    "xgboost": [{"max_depth": depth, "min_child_weight": leaf, "lambda": l2, "colsample_bytree": fraction}
+                for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
+    "catboost": [{"depth": depth, "min_data_in_leaf": leaf, "l2_leaf_reg": l2, "rsm": fraction,
+                  "grow_policy": "Depthwise"}
+                 for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
+}
 
 
 def _resolve_config(config: dict | None) -> dict:
@@ -264,6 +281,8 @@ def _resolve_config(config: dict | None) -> dict:
         raise ValueError("es_metric must be auto or logloss")
     if cfg["rare_min_freq"] < 0:
         raise ValueError("rare_min_freq must be nonnegative")
+    if cfg["mae_objective"] not in (None, "l1", "huber", "quantile"):
+        raise ValueError("mae_objective must be l1, huber or quantile")
     max_jobs = available_cpus()
     requested = int(cfg["n_jobs"] or max_jobs)
     cfg["n_jobs"] = min(max_jobs, requested) if requested > 0 else max_jobs
@@ -611,11 +630,9 @@ def _lgb_params(task_type, metric, n_classes, cfg):
         "num_threads": cfg["n_jobs"], "seed": cfg["seed"],
     }
     if task_type == "regression":
-        objective = {"mae": "l1", "mape": "mape"}.get(metric.name, "regression")
-        if metric.name == "mae":
-            objective = cfg.get("mae_objective", "l1")
-            if objective == "quantile":
-                params["alpha"] = .5
+        objective = cfg.get("mae_objective") or {"mae": "l1", "mape": "mape"}.get(metric.name, "regression")
+        if objective == "quantile":
+            params["alpha"] = .5
         params.update(objective=objective, metric="l1" if metric.name == "mae" else "l2")
     elif task_type == "binary":
         monitor_ap = metric.name == "pr_auc" and cfg["es_metric"] == "auto"
@@ -672,14 +689,12 @@ def _fit_xgboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cfg
         "nthread": cfg["n_jobs"], "seed": cfg["seed"], "verbosity": 0,
     }
     if task_type == "regression":
-        if metric.name == "mae":
-            objective = cfg.get("mae_objective", "l1")
-            params.update(objective={"l1": "reg:absoluteerror", "quantile": "reg:quantileerror",
-                                     "huber": "reg:pseudohubererror"}[objective], eval_metric="mae")
-            if objective == "quantile":
-                params["quantile_alpha"] = .5
-        else:
-            params.update(objective="reg:squarederror", eval_metric="rmse")
+        loss = cfg.get("mae_objective") or ("l1" if metric.name == "mae" else None)
+        objective = {"l1": "reg:absoluteerror", "quantile": "reg:quantileerror",
+                     "huber": "reg:pseudohubererror"}.get(loss, "reg:squarederror")
+        params.update(objective=objective, eval_metric="mae" if metric.name == "mae" else "rmse")
+        if loss == "quantile":
+            params["quantile_alpha"] = .5
     elif task_type == "binary":
         monitor_ap = metric.name == "pr_auc" and cfg["es_metric"] == "auto" and np.unique(yva).size == 2
         params.update(objective="binary:logistic", eval_metric="aucpr" if monitor_ap else "logloss")
@@ -730,11 +745,10 @@ def _fit_catboost(Xtr, ytr, wtr, Xva, yva, Xte, task_type, metric, n_classes, cf
         "verbose": False, "allow_writing_files": False, "use_best_model": not cfg.get("final_fit", False),
     }
     if task_type == "regression":
-        params["loss_function"] = "MAE" if metric.name == "mae" else "RMSE"
-        if metric.name == "mae":
-            params["loss_function"] = {"l1": "MAE", "quantile": "Quantile:alpha=0.5",
-                                       "huber": "Huber:delta=1.0"}[cfg.get("mae_objective", "l1")]
-            params["eval_metric"] = "MAE"
+        loss = cfg.get("mae_objective") or ("l1" if metric.name == "mae" else None)
+        params["loss_function"] = {"l1": "MAE", "quantile": "Quantile:alpha=0.5",
+                                   "huber": "Huber:delta=1.0"}.get(loss, "RMSE")
+        params["eval_metric"] = "MAE" if metric.name == "mae" else "RMSE"
     elif task_type == "binary":
         params.update(loss_function="Logloss", class_names=[0, 1])
         monitor_ap = metric.name == "pr_auc" and cfg["es_metric"] == "auto" and np.unique(yva).size == 2
@@ -928,21 +942,34 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             task_type = "binary"
 
     metric_obj = get_metric(metric, task_type)
+    if cfg["regularized_ap"]:
+        if metric_obj.name != "pr_auc":
+            raise ValueError("regularized_ap requires the PR-AUC metric")
+        cfg["params"] = REGULARIZED_PARAMS[cfg["model"]][0] | cfg["params"]
 
     # log1p таргета
     log_target = cfg["log_target"]
     if log_target is None:
-        log_target = task_type == "regression" and metric_obj.name == "rmsle"
+        log_target = task_type == "regression" and metric_obj.name == "rmsle" and not cfg["sqrt_target"]
     if log_target and task_type != "regression":
         logger.warning("log_target имеет смысл только для регрессии, отключаю")
         log_target = False
-    if log_target and not temporal and y_fit.min() < 0:
-        logger.warning("В таргете есть отрицательные значения, log1p отключен")
-        log_target = False
     cfg["log_target"] = bool(log_target)
+    sqrt_target = cfg["sqrt_target"]
+    if sqrt_target and (task_type != "regression" or log_target):
+        raise ValueError("sqrt_target requires regression and cannot be combined with log_target")
     # Signed log1p agrees with log1p for positive durations. Its domain is independent
     # of later validation targets and it has a well-defined inverse for negative values.
     y_train_scale = np.sign(y_fit) * np.log1p(np.abs(y_fit)) if log_target else y_fit
+    if sqrt_target:
+        y_train_scale = np.sign(y_fit) * np.sqrt(np.abs(y_fit))
+
+    def original_scale(prediction):
+        if log_target:
+            return np.sign(prediction) * np.expm1(np.abs(prediction))
+        if sqrt_target:
+            return np.sign(prediction) * np.square(prediction)
+        return prediction
 
     # Колонки-ключи для кодирования по таргету сами в модель не идут, только их кодировки
     te_cols = [c for c in (cfg["target_encoding"] or []) if c in X.columns and c in X_test.columns]
@@ -1075,6 +1102,25 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     from features import activity_reference, audit_event_kernel, causal_target_history, event_activity, history_reference
 
     budget = AuditBudget()
+    if cfg["event_calendar"]:
+        from features import event_calendar
+        from leak_audit import check_equal
+
+        if not datetime_clock:
+            raise ValueError("Event calendar requires a datetime event clock")
+        event_features = [event_calendar(frame[clock]) for frame in (Xp, Xtp)]
+        if set(Xp).intersection(event_features[0]):
+            raise ValueError("colliding calendar feature names")
+        if cfg["audit_required"]:
+            def verify_event_calendar(counts, check_time):
+                for frame, transformed, count in zip((Xp, Xtp), event_features, counts):
+                    check_time()
+                    ids = sample_positions(len(frame), limit=count)
+                    check_equal(transformed.iloc[ids], event_calendar(frame[clock].iloc[ids]))
+                return {"features": list(event_features[0]), "rule": "current event clock only"}
+
+            budget.sampled("event_calendar", [len(Xp), len(Xtp)], verify_event_calendar)
+        Xp, Xtp = (pd.concat([frame, values], axis=1) for frame, values in zip((Xp, Xtp), event_features))
     if cfg["event_activity"] or cfg["causal_history"]:
         train_sample = sample_positions(len(Xp))
         query = pd.concat([Xp.iloc[train_sample], Xtp.iloc[sample_positions(len(Xtp))]], ignore_index=True)
@@ -1094,7 +1140,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     def target_features(source, evaluation, observed, y):
         return causal_target_history(source, evaluation, clock, observed, y, general_entities,
                                      window=cfg["history_window"], smoothing=cfg["history_smoothing"],
-                                     median=metric_obj.name == "mae")
+                                     median=metric_obj.name == "mae", since_positive=cfg["history_since_positive"])
 
     if cfg["causal_history"] and cfg["audit_required"]:
         first_fit, _, _ = _past_monitor(folds[0][0], labeled_times, y_fit, task_type, available_at)
@@ -1103,14 +1149,18 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         def reference(source, evaluation, known, labels, *, corrupt_future=False):
             return history_reference(source, evaluation, clock, known, labels, general_entities,
                                      window=cfg["history_window"], smoothing=cfg["history_smoothing"],
-                                     median=metric_obj.name == "mae", corrupt_future=corrupt_future)
+                                     median=metric_obj.name == "mae", corrupt_future=corrupt_future,
+                                     since_positive=cfg["history_since_positive"])
 
         audit_event_kernel(target_features, Xp.iloc[first_fit][key_columns], observed, query, clock,
                            "causal_history", labels=y_fit[first_fit], budget=budget, reference=reference,
                            train_rows=len(train_sample),
                            corrupted_reference=lambda *args: reference(*args, corrupt_future=True))
     if cfg["audit_required"]:
-        audit_log("pass", "model_input", features=list(Xp.columns), rule="declared row values and audited transforms")
+        if temporal and clock in Xp:
+            audit_log("excluded", "event_clock", feature=clock, reason="absolute event time is not a model input")
+        audit_log("pass", "model_input", features=[col for col in Xp if not temporal or col != clock],
+                  rule="declared row values and audited transforms")
     category_probes = {c: [] for c in probe_columns}
     model_inputs = {}
     fold_diagnostics = []
@@ -1155,6 +1205,11 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                 target_frame = pd.concat([Xtr[[clock, *general_entities]], evaluation[[clock, *general_entities]]],
                                          ignore_index=True)
                 derived = target_features(Xtr, target_frame, observed, y_fit[tr_idx])
+                if predict_idx is None and metric_obj.name == "pr_auc" and cfg["history_since_positive"]:
+                    from features import since_positive_drift
+                    drift = since_positive_drift(Xte, derived.iloc[len(Xtr) + len(va_idx):], clock, general_entities)
+                    if drift:
+                        print("HISTORY_DRIFT " + json.dumps(drift), file=sys.stderr, flush=True)
                 Xtr = pd.concat([Xtr, derived.iloc[:len(Xtr)].set_axis(Xtr.index)], axis=1)
                 evaluation = pd.concat([evaluation, derived.iloc[len(Xtr):].set_axis(evaluation.index)], axis=1)
             if cfg["categorical_ids"]:
@@ -1182,6 +1237,14 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
 
                     AuditBudget().sampled("auto_features_fit_only", [len(raw_fit)], verify_fit_only)
 
+        event_clock = clock if temporal else None
+        if cfg["fold_preprocess"]:
+            from features import preprocess_fold
+            Xtr, evaluation = preprocess_fold(Xtr, evaluation, event_clock, audit=cfg["audit_required"])
+        elif temporal and clock in Xtr:
+            Xtr, evaluation = Xtr.drop(columns=clock), evaluation.drop(columns=clock)
+        if not Xtr.shape[1]:
+            Xtr, evaluation = Xtr.assign(__missing_count=0.), evaluation.assign(__missing_count=0.)
         Xtr, prepared, cats = _prepare_features(Xtr, evaluation, list(Xtr.columns),
                                                 cfg["cat_encoding"], cfg["rare_min_freq"])
         if cfg["model"] == "catboost":
@@ -1201,7 +1264,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     refit_slot = 2.0 if temporal else (1.25 if cfg["refit_full"] else 0.0)
 
     logger.info("Старт: %s, %s, метрика %s, модель %s, %d фолдов, %d строк, %d признаков (%d кат.)%s",
-                task_type, "log1p" if log_target else "raw", metric_obj.name, cfg["model"],
+                task_type, "sqrt" if sqrt_target else "log1p" if log_target else "raw", metric_obj.name, cfg["model"],
                 len(folds), len(y_fit), Xp.shape[1], sum(_is_categorical(Xp[c]) for c in Xp),
                 f", кодирование по таргету {te_cols}" if te_cols else "")
 
@@ -1281,8 +1344,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         except Exception as e:
             raise RuntimeError(f"Ошибка обучения {cfg['model']} на фолде {i + 1}: "
                                f"{type(e).__name__}: {e}") from e
-        if log_target:
-            pva, pte = np.sign(pva) * np.expm1(np.abs(pva)), np.sign(pte) * np.expm1(np.abs(pte))
+        pva, pte = original_scale(pva), original_scale(pte)
         if not np.isfinite(pva).all() or not np.isfinite(pte).all():
             raise ValueError("Model returned nonfinite predictions")
         prediction = pva[:, 1] if task_type == "binary" else pva
@@ -1362,8 +1424,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                     Xall, y_train_scale[all_idx], training_weights(all_idx), Xmon, y_train_scale[monitor], Xte,
                     task_type, metric_obj, n_classes, rcfg, deadline, **extra,
                 )
-                if log_target:
-                    pte = np.sign(pte) * np.expm1(np.abs(pte))
+                pte = original_scale(pte)
                 if not np.isfinite(pte).all():
                     raise ValueError("Refit returned nonfinite predictions")
                 if temporal:
@@ -1466,6 +1527,9 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     logger.info("Итог: %s=%.5f +- %.5f (до постобработки %.5f), %.1f с",
                 metric_obj.name, score, score_std, score_raw, fit_time)
 
+    first_targets = y_fit[folds[0][0]]
+    sqrt_candidate = (task_type == "regression" and len(first_targets) >= 3
+                      and first_targets.min() >= 0 and pd.Series(first_targets).skew() > 1)
     return {
         "score": score,
         "score_std": score_std,
@@ -1485,7 +1549,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "fold_times": fold_times,
         "best_iterations": best_iters,
         "feature_candidates": candidates | {"ad_history": bool(ad_groups), "event_activity": datetime_clock,
-                                            "causal_history": bool(general_entities) and task_type != "multiclass"},
+                                            "causal_history": bool(general_entities) and task_type != "multiclass",
+                                            "event_calendar": datetime_clock, "sqrt_target": bool(sqrt_candidate)},
         "model_inputs": model_inputs,
         "fold_diagnostics": fold_diagnostics,
         "category_probes": ({"smoothing_rows": 20, "source": "labels in model-fit prefix before monitor",
@@ -2092,15 +2157,14 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
     best = blend(None)
 
     # Шаг 2: сиды XGBoost и LightGBM, пока следующая модель укладывается в остаток
-    task_final = next(iter(members.values()))["config"]["task_type"]
+    first_member = next(iter(members.values()))
+    task_final = first_member["config"]["task_type"]
     queue = []
     if use_lgb and task_final in CLASSIFICATION:
         queue.append(("lgb_balanced", {"model": "lightgbm", "class_weight": "balanced"}))
-    elif use_lgb:
-        y_num = pd.to_numeric(pd.Series(np.asarray(y)), errors="coerce").dropna()
-        if len(y_num) and y_num.min() >= 0 and y_num.skew() > 1:
-            # Тяжелый хвост: log1p-модель как кандидат в бленд, веса решат, нужна ли она
-            queue.append(("lgb_log1p", {"model": "lightgbm", "log_target": True}))
+    elif (use_lgb and first_member.get("feature_candidates", {}).get("sqrt_target")
+          and not (base.get("sqrt_target") or base.get("log_target"))):
+        queue.append(("lgb_log1p", {"model": "lightgbm", "log_target": True}))
 
     def add_seeds(first: int, last: int) -> None:
         for k in range(first, last):

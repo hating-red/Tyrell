@@ -27,6 +27,7 @@ class AutoTrainIncumbentTests(unittest.TestCase):
                                            metric=metric_name),
                             "score": scores[index], "score_std": 0.01, "fit_time": 1.0,
                             "greater_is_better": greater, "predictions": [index],
+                            "feature_candidates": {"sqrt_target": not greater},
                             "postprocess_time": 100.0 if index == 2 and final_mix == "no_time" else 0.,
                         }
                         models.append(model)

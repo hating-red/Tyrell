@@ -302,7 +302,41 @@ def run_agent(task_path, directory, deadline):
             raise
 
 
-def choose_variant(spec, baseline):
+_STAGE_B_FEATURES = ("interval_features", "event_calendar", "fold_preprocess")
+
+
+def _loss_variants(spec, baseline, accepted_features=()):
+    if not baseline or not spec.get("available_backends"):
+        return []
+    backend = baseline.get("backend", spec["available_backends"][0])
+    candidates = baseline.get("feature_candidates", {})
+    full = {"auto_features": True} | {key: True for key in ("hourly_extended", "event_activity", "causal_history")
+                                     if candidates.get(key)}
+    variants = [full]
+    for key in _STAGE_B_FEATURES:
+        if key in accepted_features:
+            full = full | {key: True}
+            variants.append(full)
+    if spec.get("task_type") == "regression" or spec["metric"] == "mae":
+        if spec["metric"] != "mae":
+            variants.append(full | {"mae_objective": "l1"})
+        variants.append(full | {"mae_objective": "huber"})
+        if spec["metric"] != "rmsle":
+            variants.append(full | {"log_target": True})
+        if candidates.get("sqrt_target"):
+            variants.append(full | {"sqrt_target": True})
+        if spec["metric"] == "mae":
+            variants.append({"mae_shift": True})
+    if spec["metric"] == "pr_auc":
+        regularized = full | {"regularized_ap": True}
+        variants.extend([regularized, regularized | {"es_metric": "logloss"}])
+        if candidates.get("causal_history"):
+            variants.extend([full | {"history_since_positive": False},
+                             *(full | {"history_smoothing": m} for m in (5., 30.))])
+    return [{"model": backend} | variant for variant in variants]
+
+
+def choose_variant(spec, baseline, *, include_losses=True):
     if spec.get("audit_required"):
         models = spec["available_backends"]
         if not baseline or not models:
@@ -310,6 +344,8 @@ def choose_variant(spec, baseline):
         backend = baseline.get("backend", models[0])
         candidates = baseline.get("feature_candidates", {})
         variants = [{"auto_features": True}, {"rare_min_freq": 5}]
+        variants.extend({key: True} for key in ("interval_features", "event_calendar") if candidates.get(key))
+        variants.append({"fold_preprocess": True})
         if spec["metric"] == "pr_auc":
             variants.append({"es_metric": "logloss"})
         if candidates.get("hourly_extended"):
@@ -321,15 +357,15 @@ def choose_variant(spec, baseline):
                 {"auto_features": True, "causal_history": True},
                 {"auto_features": True, "event_activity": True, "causal_history": True},
             ])
-        if spec["metric"] == "mae":
-            variants.extend({"auto_features": True, "mae_objective": objective} for objective in ("quantile", "huber"))
-            variants.extend([{"auto_features": True, "log_target": True}, {"mae_shift": True}])
         if ("catboost" in models and (baseline.get("split") or {}).get("type") == "time"
                 and not spec.get("label_delay_unit")):
             if backend != "catboost":
                 variants.append({"model": "catboost"})
             variants.append({"model": "catboost", "catboost_ordered_ctr": True})
-        return [{"model": backend} | variant for variant in variants]
+        variants = [{"model": backend} | variant for variant in variants]
+        if include_losses:
+            variants.extend(option for option in _loss_variants(spec, baseline) if option not in variants)
+        return variants
     variants = []
     if baseline and (baseline.get("split") or {}).get("type") == "time":
         available = baseline.get("feature_candidates", {})
@@ -351,11 +387,13 @@ def choose_variant(spec, baseline):
 
 _SEARCH_FEATURES = ("auto_features", "causal_history", "event_activity", "hourly_extended",
                     "log_target", "mae_shift", "history_window", "history_smoothing", "mae_objective", "recency_days",
-                    "rare_min_freq", "catboost_ordered_ctr", "es_metric", "class_weight")
+                    "rare_min_freq", "catboost_ordered_ctr", "es_metric", "class_weight", "interval_features",
+                    "event_calendar", "fold_preprocess", "sqrt_target", "regularized_ap", "history_since_positive")
 
 
 def _trial_key(config):
-    cleaned = {key: value for key, value in config.items() if value is not None and value is not False and value != {}}
+    cleaned = {key: value for key, value in config.items()
+               if value is not None and value != {} and (value is not False or key == "history_since_positive")}
     if cleaned.get("seed") == 42:
         cleaned.pop("seed")
     return json.dumps(cleaned, sort_keys=True)
@@ -364,22 +402,12 @@ def _trial_key(config):
 _FINAL_RESERVE = 400.
 _CHECKPOINT_INTERVAL = 900.
 _MAX_STALE_TRIALS = 8
-_REGULARIZED = {
-    "lightgbm": [{"max_depth": depth, "num_leaves": 2**depth, "min_child_samples": leaf,
-                  "lambda_l2": l2, "feature_fraction": fraction}
-                 for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
-    "xgboost": [{"max_depth": depth, "min_child_weight": leaf, "lambda": l2, "colsample_bytree": fraction}
-                for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
-    "catboost": [{"depth": depth, "min_data_in_leaf": leaf, "l2_leaf_reg": l2, "rsm": fraction,
-                  "grow_policy": "Depthwise"}
-                 for depth, leaf, l2, fraction in ((3, 30, 8., .8), (5, 150, 20., .5))],
-}
 
 
 def _extended_search(directory, spec, deadline, winner, tested, estimates, retired, *, checkpoint=None):
     from math import sqrt
     from pipeline import experiment_history
-    from training import compare_results
+    from training import REGULARIZED_PARAMS, compare_results
 
     def rank():
         rows = [row for row in experiment_history(directory) if row.get("complete") and row.get("recipe") == "single"
@@ -389,7 +417,7 @@ def _extended_search(directory, spec, deadline, winner, tested, estimates, retir
     def model_config(row, model):
         raw = row["config"] if row else {key: winner[key] for key in _SEARCH_FEATURES if key in winner}
         return {key: raw[key] for key in (*_SEARCH_FEATURES, "params", "num_boost_round", "early_stopping_rounds")
-                if raw.get(key)} | {"model": model}
+                if key in raw and (raw[key] or key == "history_since_positive")} | {"model": model}
 
     def best_configs():
         rows = rank()
@@ -419,7 +447,7 @@ def _extended_search(directory, spec, deadline, winner, tested, estimates, retir
                             "early_stopping_rounds": 250}, 1.8
         for round_idx in range(2):
             for model, config in configs.items():
-                yield config | {"params": config.get("params", {}) | _REGULARIZED[model][round_idx]}, 1.15
+                yield config | {"params": config.get("params", {}) | REGULARIZED_PARAMS[model][round_idx]}, 1.15
         top = []
         for row in rank():
             model = row["config"].get("model")
@@ -569,7 +597,9 @@ def research(task_path, directory, deadline):
     log_phase("safety_model", safety_started, budget=quick * (2 if failed_trial else 1),
               reason="model_completed" if baseline else "no_completed_model")
     variant_started = time.monotonic()
-    variants = choose_variant(spec, baseline)
+    variants = choose_variant(spec, baseline, include_losses=False)
+    losses_scheduled = False
+    certified_features = set()
     winner = {}
     trials = [failed_trial] if failed_trial else []
     tested = {_trial_key(baseline_trial)} if baseline else set()
@@ -582,6 +612,9 @@ def research(task_path, directory, deadline):
     variant_trials = llm_trials = 0
     while time.monotonic() < search_deadline:
         from_llm = False
+        if not variants and not losses_scheduled:
+            losses_scheduled = True
+            variants = _loss_variants(spec, baseline, certified_features)
         if variants:
             config = variants.pop(0)
         else:
@@ -630,6 +663,8 @@ def research(task_path, directory, deadline):
         else:
             variant_trials += 1
         if report:
+            if report.get("quality_flags_pass") is True:
+                certified_features.update(key for key in _STAGE_B_FEATURES if config.get(key))
             trials.append({"config":config,"scores":report["fold_scores"]})
             if report["saved"]:
                 winner = config
@@ -670,7 +705,8 @@ def research(task_path, directory, deadline):
         def checkpoint():
             nonlocal blend_estimate
             history = experiment_history(directory)
-            if sum(bool(h.get("preds_file")) for h in history) < 2:
+            if sum(bool(h.get("preds_file")) and h.get("quality_flags_pass") is not False
+                   for h in history if h.get("recipe") != "ensemble") < 2:
                 return
             started = time.monotonic()
             blend = run_trial(directory, spec, fit_deadline, 120., recipe="ensemble", estimate=blend_estimate)
@@ -691,7 +727,8 @@ def research(task_path, directory, deadline):
     started = time.monotonic()
     blend_budget = max(0., deadline-started)
     blend = None
-    if sum(bool(h.get("preds_file")) for h in history) < 2:
+    if sum(bool(h.get("preds_file")) and h.get("quality_flags_pass") is not False
+           for h in history if h.get("recipe") != "ensemble") < 2:
         blend_reason = "insufficient_completed_members"
     elif not trial_fits(blend_estimate, deadline):
         blend_reason = "next_trial_does_not_fit"
@@ -722,6 +759,14 @@ def main():
             mailbox.mkdir()
             threading.Thread(target=serve_research_model, args=(mailbox, stop), daemon=True).start()
         env = {k:v for k,v in os.environ.items() if not k.upper().startswith("OPENAI_")}
+        if env.get("TYRELL_OOF_DIR"):
+            archive = Path(env["TYRELL_OOF_DIR"]).resolve()
+            try:
+                archive.mkdir(parents=True, exist_ok=True)
+                env["TYRELL_OOF_RUN_DIR"] = tempfile.mkdtemp(prefix=task.stem + "-", dir=archive)
+                log(f"OOF_ARCHIVE {env['TYRELL_OOF_RUN_DIR']}")
+            except OSError as error:
+                log(f"OOF_ARCHIVE unavailable: {error}")
         try:
             code = supervised_exit(cmd, deadline + shutdown, env=env)
         finally:

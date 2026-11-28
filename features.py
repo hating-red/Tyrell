@@ -6,6 +6,7 @@
 Полезность набора проверяется снаружи на тех же фолдах, что и остальные эксперименты.
 """
 
+import hashlib
 import logging
 
 import numpy as np
@@ -45,6 +46,126 @@ def _parse_dates(s):
         return None
     dates = to_utc_naive(s)
     return dates if dates.notna().sum() >= 0.9 * s.notna().sum() else None
+
+
+def event_calendar(times):
+    """Build calendar values from the current event's UTC clock."""
+    if times.dt.tz is not None:
+        times = times.dt.tz_convert("UTC")
+    hour = times.dt.hour
+    minute = times.dt.minute
+    weekday = times.dt.dayofweek
+    day_angle = 2 * np.pi * (hour + minute / 60) / 24
+    week_angle = 2 * np.pi * weekday / 7
+    return pd.DataFrame({
+        "__event_hour": hour, "__event_weekday": weekday,
+        "__event_weekend": weekday.ge(5).where(times.notna()).astype("float32"),
+        "__event_minute": minute, "__event_hour_sin": np.sin(day_angle), "__event_hour_cos": np.cos(day_angle),
+        "__event_weekday_sin": np.sin(week_angle), "__event_weekday_cos": np.cos(week_angle),
+    }, index=times.index, dtype="float32")
+
+
+_BOOL_STRINGS = {"true": 1., "yes": 1., "false": 0., "no": 0.}
+
+
+def preprocess_fold(fit, queries, clock=None, *, audit=False):
+    """Select conversions, missing flags and duplicate representatives on fit rows."""
+    import json
+    import sys
+    from data_tools import to_utc_naive
+    from leak_audit import AuditBudget, check_equal, sample_positions
+
+    live = clock in fit and pd.api.types.is_datetime64_any_dtype(fit[clock])
+    if live:
+        fit_clock, query_clock = to_utc_naive(fit[clock]), to_utc_naive(queries[clock])
+    drop, dates, train, apply = [], [], {}, {}
+    for col in fit:
+        if col == clock or col == "__missing_count":
+            drop.append(col)
+            continue
+        x, q = fit[col], queries[col]
+        name = col
+        if pd.api.types.is_datetime64_any_dtype(x):
+            is_date = True
+        elif _is_categorical(x) and x.notna().any():
+            text = x.astype("string").str.strip()
+            tokens = text.str.lower().map(_BOOL_STRINGS)
+            numbers = pd.to_numeric(text, errors="coerce")
+            if tokens.notna().sum() == x.notna().sum():
+                x, q = tokens, q.astype("string").str.strip().str.lower().map(_BOOL_STRINGS)
+                is_date = False
+            elif numbers.notna().sum() >= .95 * x.notna().sum():
+                x, q = numbers, pd.to_numeric(q.astype("string").str.strip(), errors="coerce")
+                is_date = False
+            else:
+                is_date = _parse_dates(x) is not None
+        else:
+            is_date = False
+        if is_date:
+            if not live:
+                drop.append(col)
+                continue
+            name = f"{col}__age_s"
+            if name in fit:
+                drop.append(col)
+                continue
+            dates.append((col, name))
+            left, right = to_utc_naive(x), to_utc_naive(q)
+            x = (fit_clock - left.where(left.lt(fit_clock))).dt.total_seconds()
+            q = (query_clock - right.where(right.lt(query_clock))).dt.total_seconds()
+        if pd.api.types.is_numeric_dtype(x) and not pd.api.types.is_bool_dtype(x):
+            x = x.replace([np.inf, -np.inf], np.nan)
+            q = pd.to_numeric(q, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        train[name], apply[name] = x, q
+
+    if audit and dates:
+        def verify(counts, check_time):
+            for data, event_times, converted, count in zip((fit, queries), (fit_clock, query_clock),
+                                                           (train, apply), counts):
+                sample = sample_positions(len(data), limit=count)
+                events = event_times.iloc[sample]
+                for col, name in dates:
+                    check_time()
+                    stamp = to_utc_naive(data[col].iloc[sample])
+                    age = (events - stamp).dt.total_seconds()
+                    expected = age.where(age.gt(0)).to_frame(name)
+                    check_equal(expected, converted[name].iloc[sample].to_frame(name))
+            return {"features": [name for _, name in dates], "rule": "date strictly before event"}
+
+        AuditBudget().sampled("preprocess_date_age", [len(fit), len(queries)], verify)
+
+    left, right = pd.DataFrame(train, index=fit.index), pd.DataFrame(apply, index=queries.index)
+    missing_fit, missing_queries = left.isna(), right.isna()
+    indicators = missing_fit.mean()
+    left["__missing_count"] = missing_fit.sum(axis=1).astype("float32")
+    right["__missing_count"] = missing_queries.sum(axis=1).astype("float32")
+    for col in indicators.index[indicators.between(.01, .95)]:
+        name = f"{col}__isna"
+        if name not in left:
+            left[name], right[name] = missing_fit[col].astype("float32"), missing_queries[col].astype("float32")
+
+    keep, duplicates = [], {}
+    for col, x in left.items():
+        if x.nunique(dropna=True) <= 1:
+            drop.append(col)
+            continue
+        if pd.api.types.is_numeric_dtype(x):
+            hashed = x.astype("float64")
+            hashed = hashed.mask(hashed.eq(0), 0.)
+        else:
+            hashed = x.astype("string")
+        digest = hashlib.blake2b(pd.util.hash_pandas_object(hashed, index=False).to_numpy().tobytes(),
+                                 digest_size=8).digest()
+        candidates = duplicates.setdefault(digest, [])
+        if any(np.array_equal(x.to_numpy(dtype=object, na_value=None),
+                              left[old].to_numpy(dtype=object, na_value=None)) for old in candidates):
+            drop.append(col)
+        else:
+            candidates.append(col)
+            keep.append(col)
+    print(f"PREPROC step=fit cols_in={fit.shape[1]} cols_out={len(keep)} dropped="
+          + json.dumps(drop, ensure_ascii=False), file=sys.stderr, flush=True)
+    return left[keep], right[keep]
 
 
 def important_numeric(X, y, task_type, limit=MAX_GROUP_NUMERIC, seed=42):
@@ -319,7 +440,8 @@ def activity_reference(source, query, clock, entities):
     return pd.DataFrame(outputs, index=query.index, dtype="float32")
 
 
-def causal_target_history(source, query, clock, available, labels, entities, *, window, smoothing, median=False):
+def causal_target_history(source, query, clock, available, labels, entities, *, window, smoothing, median=False,
+                          since_positive=True):
     """Apply strictly earlier, observable labels from a fold's own model-fit prefix."""
     from itertools import combinations
 
@@ -348,7 +470,8 @@ def causal_target_history(source, query, clock, available, labels, entities, *, 
         hist["count"] = g.cumcount() + 1
         if median:
             hist["median"] = g["y"].rolling(window, min_periods=1).median().droplevel(0).reindex(hist.index)
-        hist["last_positive"] = hist["available"].where(hist["y"].gt(0)).groupby(hist["key"], sort=False).ffill()
+        if since_positive:
+            hist["last_positive"] = hist["available"].where(hist["y"].gt(0)).groupby(hist["key"], sort=False).ffill()
         ask = ordered.assign(key=query_key[ordered["row"].to_numpy()])
         hits = pd.merge_asof(ask, hist, by="key", left_on="event", right_on="available",
                              direction="backward", allow_exact_matches=False)
@@ -362,12 +485,13 @@ def causal_target_history(source, query, clock, available, labels, entities, *, 
         outputs[tag + "_mean"] = (hits["sum"].fillna(0).to_numpy() + smoothing * prior) / (np.minimum(n, window) + smoothing)
         if median:
             outputs[tag + "_median"] = hits["median"].to_numpy()
-        outputs[tag + "_since_positive"] = (hits["event"] - hits["last_positive"]).dt.total_seconds().to_numpy()
+        if since_positive:
+            outputs[tag + "_since_positive"] = (hits["event"] - hits["last_positive"]).dt.total_seconds().to_numpy()
     return pd.DataFrame(outputs, index=query.index, dtype="float32")
 
 
 def history_reference(source, query, clock, availability, labels, entities, *, window, smoothing, median,
-                      corrupt_future=False):
+                      corrupt_future=False, since_positive=True):
     """Independently slice each entity's available prefix for every sampled query."""
     from itertools import combinations
     from leak_audit import replay_payload
@@ -399,10 +523,11 @@ def history_reference(source, query, clock, availability, labels, entities, *, w
             times, ys = stamps[rows], labels[rows]
             cut = np.searchsorted(times, ask[ids], side="left")
             values[ids, 0] = cut
-            positive = times[ys > 0]
-            last = np.searchsorted(positive, ask[ids], side="left")
-            hit = last > 0
-            values[ids[hit], 3] = (ask[ids[hit]] - positive[last[hit]-1]) / np.timedelta64(1, "s")
+            if since_positive:
+                positive = times[ys > 0]
+                last = np.searchsorted(positive, ask[ids], side="left")
+                hit = last > 0
+                values[ids[hit], 3] = (ask[ids[hit]] - positive[last[hit]-1]) / np.timedelta64(1, "s")
             for idx, stop in zip(ids, cut):
                 if stop:
                     start = max(0, stop-window)
@@ -417,9 +542,36 @@ def history_reference(source, query, clock, availability, labels, entities, *, w
                     if median:
                         values[idx, 2] = np.median(recent)
         tag = "__history_" + "_by_".join(keys)
-        columns = (("count", 0), ("mean", 1), ("median", 2), ("since_positive", 3))
-        outputs.update({tag + "_" + col: values[:, i] for col, i in columns if median or col != "median"})
+        columns = (("count", 0), ("mean", 1)) + ((("median", 2),) if median else ())
+        if since_positive:
+            columns += (("since_positive", 3),)
+        outputs.update({tag + "_" + col: values[:, i] for col, i in columns})
     return pd.DataFrame(outputs, index=query.index, dtype="float32")
+
+
+def since_positive_drift(query, history, clock, entities):
+    """Measure how frozen history ages across the live prediction horizon."""
+    from leak_audit import sample_positions
+
+    order = np.argsort(query[clock].to_numpy(), kind="stable")
+    selected = order[sample_positions(len(order))]
+    if len(selected) < 2:
+        return {}
+    tail = query.iloc[selected].reset_index(drop=True)
+    half = len(tail) // 2
+    result = {}
+    for entity in entities:
+        values = history[f"__history_{entity}_since_positive"].iloc[selected].reset_index(drop=True)
+        changes = values.groupby(tail[entity], observed=True).diff().dropna()
+        early, late = values.iloc[:half].dropna(), values.iloc[half:].dropna()
+        result[entity] = {
+            "sample_rows": len(tail), "known_early": len(early), "known_late": len(late),
+            "early_median_s": float(early.median()) if len(early) else None,
+            "late_median_s": float(late.median()) if len(late) else None,
+            "within_entity_pairs": len(changes),
+            "nondecreasing_share": float(changes.ge(0).mean()) if len(changes) else None,
+        }
+    return result
 
 
 def audit_event_kernel(builder, source, availability, queries, clock, group, *, labels=None, budget=None,

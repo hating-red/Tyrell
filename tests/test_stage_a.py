@@ -112,8 +112,9 @@ def test_catboost_temporal_order_and_high_cardinality_categories(monkeypatch):
     seen = []
 
     def checked_fit(Xtr, ytr, wtr, Xva, yva, Xte, *args, **kwargs):
-        assert Xtr["clock"].is_monotonic_increasing
+        assert "clock" not in Xtr
         assert kwargs["fit_times"].is_monotonic_increasing and kwargs["cat_cols"] == ["key"]
+        np.testing.assert_array_equal(ytr, kwargs["fit_times"].to_numpy() % 2)
         assert Xtr["key"].map(type).eq(str).all()
         seen.append(Xtr["key"].nunique())
         return backend(Xtr, ytr, wtr, Xva, yva, Xte, *args, **kwargs)

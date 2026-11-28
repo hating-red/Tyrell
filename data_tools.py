@@ -897,21 +897,69 @@ def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publicatio
     lookup = lookup.sort_values(["__available", "__interval_end"], kind="stable")
     latest = lookup.groupby("__entity", sort=False)["__interval_end"].cummax()
     lookup = lookup.loc[lookup["__interval_end"].eq(latest)].reset_index(drop=True)
-    if step == hour:
-        lookup.attrs["grid"] = grid
+    lookup.attrs["grid"] = grid
     if mode == "inferred":
         lookup.attrs["inferred_step"] = step
     return lookup
 
 
-def _hour_features(grid, entities, events):
+INTERVAL_FEATURE_SUFFIXES = ("__lag24h", "__lag168h", "__dev24h", "__dev168h", "__delta1_2h",
+                             "__max6h", "__min6h", "__std6h", "__lag1_step", "__lag2_step",
+                             "__mean3_step", "__mean7_step")
+
+
+def _interval_features(grid, entities, events, step):
+    """Use the entity's interval phase, revealed by its first available observation."""
+    latest = pd.Series(pd.NaT, index=events.index, dtype="datetime64[ns]")
+    if len(grid):
+        first = grid["__available"].groupby(level=0, sort=False).idxmin()
+        origins = first.map(lambda key: key[1])
+        visible = entities.map(grid["__available"].loc[first.tolist()].droplevel(1)).lt(events)
+        anchor = entities.map(origins)
+        elapsed = events - pd.Timedelta(nanoseconds=1) - anchor
+        latest = (anchor + (elapsed // step) * step).where(visible)
+    if step == pd.Timedelta(hours=1):
+        return _hour_features(grid, entities, events, latest_end=latest)
+    columns = grid.columns.difference(["__available", "__source_stamp"], sort=False)
+    outputs = {}
+    total = np.zeros((len(events), len(columns)))
+    count = np.zeros(total.shape, dtype=np.uint8)
+    for offset in range(7):
+        ends = latest - offset * step
+        block = grid.reindex(pd.MultiIndex.from_arrays([entities, ends])).reset_index(drop=True)
+        released = block["__available"].lt(events.reset_index(drop=True))
+        values = block[columns].where(released, axis=0).to_numpy(dtype=float)
+        finite = np.isfinite(values)
+        total += np.where(finite, values, 0.)
+        count += finite
+        if offset < 2:
+            outputs.update({f"{col}__lag{offset+1}_step": values[:, i] for i, col in enumerate(columns)})
+        if offset in (2, 6):
+            means = np.divide(total, count, out=np.full_like(total, np.nan), where=count > 0)
+            outputs.update({f"{col}__mean{offset+1}_step": means[:, i] for i, col in enumerate(columns)})
+    return pd.DataFrame(outputs, index=range(len(events)))
+
+
+def _uses_interval_phase(grid, step):
+    if step is None:
+        return False
+    hour = pd.Timedelta(hours=1)
+    ends = grid.index.get_level_values(1)
+    return step != hour or bool((ends != ends.floor("h")).any())
+
+
+def _hour_features(grid, entities, events, *, latest_end=None):
     """Exact completed-hour lags; a missing or unpublished bucket contributes no value."""
     outputs = {}
     total = count = None
-    floor = events.dt.floor("h")
-    latest_end = floor.where(floor.ne(events), floor - pd.Timedelta(hours=1))
-    delayed = (grid["__available"].to_numpy() != grid.index.get_level_values(1).to_numpy()).any()
-    for offset in range(168 if delayed else 6):
+    phased = latest_end is not None
+    if not phased:
+        floor = events.dt.floor("h")
+        latest_end = floor.where(floor.ne(events), floor - pd.Timedelta(hours=1))
+    delayed = phased or (grid["__available"].to_numpy() != grid.index.get_level_values(1).to_numpy()).any()
+    recent = []
+    offsets = range(168) if delayed else (*range(6), 23, 167)
+    for offset in offsets:
         end = latest_end - pd.Timedelta(hours=offset)
         block = grid.reindex(pd.MultiIndex.from_arrays([entities, end])).reset_index(drop=True)
         block = block.drop(columns="__source_stamp", errors="ignore")
@@ -921,19 +969,36 @@ def _hour_features(grid, entities, events):
             total = np.zeros_like(values)
             count = np.zeros(values.shape, dtype=np.uint16)
         finite = np.isfinite(values)
-        total += np.where(finite, values, 0)
-        count += finite
-        if offset < 3:
+        if delayed or offset < 6:
+            total += np.where(finite, values, 0)
+            count += finite
+        if offset < 6:
+            recent.append(np.where(finite, values, np.nan))
+        if offset in (0, 1, 2, 23, 167):
             outputs.update({f"{col}__lag{offset+1}h": values[:, j] for j, col in enumerate(block)})
-        if offset in (2, 5, 23, 167):
+        if offset in ((2, 5, 23, 167) if delayed else (2, 5)):
             means = np.divide(total, count, out=np.full_like(total, np.nan), where=count > 0)
             outputs.update({f"{col}__mean{offset+1}h": means[:, j] for j, col in enumerate(block)})
     if not delayed:
         outputs.update(_hour_rollups(grid, entities, latest_end))
-    for col in grid.columns.difference(["__available", "__source_stamp"], sort=False):
+    history = np.stack(recent)
+    finite = np.isfinite(history)
+    known = finite.any(axis=0)
+    n = finite.sum(axis=0)
+    means = np.divide(np.nansum(history, axis=0), n, out=np.zeros(n.shape), where=known)
+    variance = np.divide(np.nansum((history - means) ** 2, axis=0), n, out=np.full(n.shape, np.nan), where=known)
+    low = np.min(np.where(finite, history, np.inf), axis=0)
+    high = np.max(np.where(finite, history, -np.inf), axis=0)
+    for i, col in enumerate(grid.columns.difference(["__available", "__source_stamp"], sort=False)):
         outputs[f"{col}__delta1_3h"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__lag3h"]
         outputs[f"{col}__dev7d"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__mean168h"]
-    return pd.DataFrame(outputs)
+        outputs[f"{col}__delta1_2h"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__lag2h"]
+        for width in (24, 168):
+            outputs[f"{col}__dev{width}h"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__lag{width}h"]
+        outputs[f"{col}__min6h"] = np.where(known[:, i], low[:, i], np.nan)
+        outputs[f"{col}__max6h"] = np.where(known[:, i], high[:, i], np.nan)
+        outputs[f"{col}__std6h"] = np.sqrt(variance[:, i])
+    return pd.DataFrame(outputs, index=range(len(events)))
 
 
 def _hour_rollups(grid, entities, latest_end):
@@ -989,7 +1054,12 @@ def _join_chunk(events, lookup, left, event_col, audit=None):
             audit["invalid_event_time_rows"] = audit.get("invalid_event_time_rows", 0) + int(times.isna().sum())
         aligned = aligned.set_index("__pos")[payload].reindex(range(len(events)))
         if "grid" in lookup.attrs:
-            aligned = pd.concat([aligned, _hour_features(lookup.attrs["grid"], keys, times)], axis=1)
+            grid, step = lookup.attrs["grid"], lookup.attrs.get("inferred_step")
+            intervals = (_interval_features(grid, keys, times, step) if _uses_interval_phase(grid, step)
+                         else _hour_features(grid, keys, times))
+            if set(events).intersection(intervals):
+                raise ValueError("colliding interval feature names")
+            aligned = pd.concat([aligned, intervals], axis=1)
     else:
         aligned = lookup.reindex(keys)[payload]
         if audit is not None:
@@ -1069,37 +1139,63 @@ def _verify_lookup(events, expected, lookup, left, event_col, check_time):
     check_equal(expected[payload], replay[payload])
     if grid is not None:
         columns = grid.columns.difference(["__available", "__source_stamp"], sort=False)
-        latest = (times - pd.Timedelta(nanoseconds=1)).dt.floor("h").to_numpy()
-        values = np.full((168, len(times), len(columns)), np.nan)
-        corrupted = np.full_like(values, np.nan)
-        for offset in range(-2, 168):
+        hour = pd.Timedelta(hours=1)
+        cadence = step if step is not None else hour
+        hourly = cadence == hour
+        event_ns = times.to_numpy(dtype="datetime64[ns]")
+        if _uses_interval_phase(grid, step):
+            first = (grid[["__available"]].reset_index().sort_values("__available", kind="stable")
+                     .drop_duplicates("__entity").set_index("__entity"))
+            anchor = keys.map(first["__interval_end"])
+            usable = keys.map(first["__available"]).lt(times)
+            elapsed = times - anchor - pd.Timedelta(nanoseconds=1)
+            latest = (times - pd.Timedelta(nanoseconds=1) - (elapsed % cadence)).where(usable).to_numpy()
+        else:
+            latest = (times - pd.Timedelta(nanoseconds=1)).dt.floor("h").to_numpy()
+
+        widths = (3, 6, 24, 168) if hourly else (3, 7)
+        lags = (1, 2, 3, 24, 168) if hourly else (1, 2)
+        history = np.full((max(widths), len(times), len(columns)), np.nan, dtype=np.float32)
+        changed = np.empty_like(history)
+        for offset in range(-2, max(widths)):
             if offset % 24 == 0:
                 check_time()
-            index = pd.MultiIndex.from_arrays([keys, latest - np.timedelta64(offset, "h")])
-            rows = grid.reindex(index)
-            if step is not None and ((rows["__available"].to_numpy() < times.to_numpy()) &
-                                     ~((rows["__source_stamp"] + step).to_numpy() < times.to_numpy())).any():
+            ends = latest - offset * cadence.to_timedelta64()
+            rows = grid.reindex(pd.MultiIndex.from_arrays([keys, ends]))
+            release = rows["__available"].to_numpy()
+            if step is not None and ((release < event_ns) &
+                                     ~((rows["__source_stamp"] + step).to_numpy() < event_ns)).any():
                 raise LeakAuditError("inferred grid interval has not ended")
-            args = (rows[columns].to_numpy(dtype=float), rows["__available"].to_numpy(), times.to_numpy())
+            args = (rows[columns].to_numpy(dtype="float32"), release, event_ns)
             dirty = replay_payload(*args, corrupt_future=True)
             if offset >= 0:
-                values[offset] = replay_payload(*args, corrupt_future=False)
-                corrupted[offset] = dirty
-            elif np.isfinite(dirty).any():
-                raise LeakAuditError("unfinished grid hour was visible")
-        for replay in (values, corrupted):
+                history[offset] = replay_payload(*args, corrupt_future=False)
+                changed[offset] = dirty
+            elif (release < event_ns).any():
+                raise LeakAuditError("unfinished grid interval was visible")
+        suffix = "h" if hourly else "_step"
+        for sampled in (history, changed):
             for i, column in enumerate(columns):
-                history = replay[:, :, i]
-                check_columns = {f"{column}__lag{lag}h": history[lag-1] for lag in (1, 2, 3)}
-                for width in (3, 6, 24, 168):
-                    finite = np.isfinite(history[:width])
+                check_time()
+                values = sampled[:, :, i].astype(float)
+                reference = {f"{column}__lag{lag}{suffix}": values[lag - 1] for lag in lags}
+                for width in widths:
+                    finite = np.isfinite(values[:width])
                     count = finite.sum(axis=0)
-                    total = np.where(finite, history[:width], 0).sum(axis=0)
-                    check_columns[f"{column}__mean{width}h"] = np.divide(
+                    total = np.where(finite, values[:width], 0.).sum(axis=0)
+                    reference[f"{column}__mean{width}{suffix}"] = np.divide(
                         total, count, out=np.full(len(times), np.nan), where=count > 0)
-                check_columns[f"{column}__delta1_3h"] = history[0] - history[2]
-                check_columns[f"{column}__dev7d"] = history[0] - check_columns[f"{column}__mean168h"]
-                check_equal(expected[list(check_columns)], pd.DataFrame(check_columns))
+                if hourly:
+                    reference[f"{column}__delta1_3h"] = values[0] - values[2]
+                    reference[f"{column}__delta1_2h"] = values[0] - values[1]
+                    reference[f"{column}__dev7d"] = values[0] - reference[f"{column}__mean168h"]
+                    for lag in (24, 168):
+                        reference[f"{column}__dev{lag}h"] = values[0] - values[lag - 1]
+                    recent = np.ma.masked_invalid(values[:6])
+                    reference[f"{column}__min6h"] = recent.min(axis=0).filled(np.nan)
+                    reference[f"{column}__max6h"] = recent.max(axis=0).filled(np.nan)
+                    reference[f"{column}__std6h"] = recent.std(axis=0).filled(np.nan)
+                check_equal(expected[list(reference)], pd.DataFrame(reference))
     for idx, cutoff in replay_batches(times, check_time, blocks=2):
         retained = raw["__available"].lt(cutoff)
         past = raw.loc[retained]
@@ -1114,11 +1210,15 @@ def _verify_lookup(events, expected, lookup, left, event_col, check_time):
             corrupted_grid = grid.copy()
             corrupted_grid.loc[~usable, corrupted_grid.columns.difference(["__available", "__source_stamp"])] = -987654.
             corrupted.attrs["grid"] = corrupted_grid
+            if step is not None:
+                past.attrs["inferred_step"] = corrupted.attrs["inferred_step"] = step
         for source in (past, corrupted):
             check_time()
             actual = _join_chunk(events.iloc[idx].reset_index(drop=True), source, left, event_col)
             check_equal(expected.iloc[idx], actual[expected.columns])
     checks = ["per_row_asof", "truncated_source", "corrupted_source", "per_cutoff_corrupted_source"]
+    if grid is not None:
+        checks.append("independent_interval_lags_and_rollups")
     if step is not None:
         checks.append("source_timestamp_plus_inferred_step")
     return dict(features=list(expected), rule="release < event", cutoffs=int(times.nunique()), checks=checks)
