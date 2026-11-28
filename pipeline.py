@@ -54,6 +54,61 @@ def apply_feature_code(feature_code, X_train, X_test):
     return result.iloc[:len(X_train)].reset_index(drop=True), result.iloc[len(X_train):].reset_index(drop=True)
 
 
+def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=None):
+    """Prepare identical inputs for outer training and hyperparameter selection."""
+    if data is None:
+        data = load_data(task_dir, task_spec)
+    split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"))
+    temporal = (split or {}).get("type") == "time"
+    X_train, X_test = data["X_train"].reset_index(drop=True), data["X_test"].reset_index(drop=True)
+    if temporal:
+        clock = split["column"]
+        if feature_code:
+            raise ValueError("Temporal features must use the row-local transformation")
+        if not pd.api.types.is_numeric_dtype(X_train[clock]):
+            for frame in (X_train, X_test):
+                frame[clock] = parse_event_datetime(frame[clock])
+    if feature_code:
+        X_train, X_test = apply_feature_code(feature_code, X_train, X_test)
+    y_train = data["y_train"].reset_index(drop=True)
+    cfg = dict(config or {})
+    from leak_audit import LeakAuditError
+    audited = task_spec.get("audit_required", False)
+    if audited and temporal and any(cfg.get(key) for key in ("target_encoding", "entity_history", "ad_history")):
+        raise LeakAuditError("temporal configuration uses an uncertified legacy feature group")
+    hourly_extended = bool(cfg.pop("hourly_extended", False))
+    hourly_columns = [name for name in X_train if name.endswith(("__mean24h", "__mean168h", "__delta1_3h", "__dev7d"))]
+    if audited and not hourly_extended:
+        X_train, X_test = X_train.drop(columns=hourly_columns), X_test.drop(columns=hourly_columns)
+    auto_features = bool(cfg.pop("auto_features", False))
+    if auto_features:
+        from features import add_auto_features, important_numeric
+        if audited and not temporal:
+            raise LeakAuditError("automated transforms require a time split")
+        priority = None if temporal else important_numeric(X_train, y_train, task_spec["task_type"])
+        transformed = add_auto_features(X_train, X_test, priority, row_local=temporal)
+        if audited:
+            from leak_audit import AuditBudget, check_equal, sample_positions
+
+            def verify_calendar(counts, check_time):
+                a = sample_positions(len(X_train), limit=counts[0])
+                b = sample_positions(len(X_test), limit=counts[1])
+                replayed = add_auto_features(X_train.iloc[a], X_test.iloc[b], row_local=True)
+                check_equal(transformed[0].iloc[a], replayed[0])
+                check_equal(transformed[1].iloc[b], replayed[1])
+                return dict(features=[c for c in transformed[0] if c not in X_train], rule="current event values only")
+
+            AuditBudget().sampled("calendar", [len(X_train), len(X_test)], verify_calendar)
+        X_train, X_test = transformed
+
+    for key in ("n_folds", "fold_seed", "split", "n_jobs"):
+        cfg.pop(key, None)
+    fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": 8, "split": split, "audit_required": audited}
+    if task_spec.get("label_delay_unit"):
+        fixed["label_delay_unit"] = task_spec["label_delay_unit"]
+    return X_train, X_test, cfg | fixed
+
+
 def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="single", feature_code=None):
     from training import METRICS, auto_train, compare_results, train_and_predict
 
@@ -62,8 +117,6 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     task_type, metric = task_spec["task_type"], task_spec["metric"]
     if metric not in METRICS or task_type not in METRICS[metric].task_types:
         raise ValueError("Неизвестная метрика или метрика не соответствует типу задачи.")
-    split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"))
-    temporal = (split or {}).get("type") == "time"
     class_count = data["y_train"].nunique()
     if task_type in ("binary", "multiclass"):
         if class_count < 2 or (task_type == "binary" and class_count != 2):
@@ -79,42 +132,21 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     if history and history[0]["task_spec"] != task_spec:
         raise ValueError("Не меняйте тип задачи, target, ID или метрику между экспериментами.")
 
-    X_train, X_test = data["X_train"].reset_index(drop=True), data["X_test"].reset_index(drop=True)
-    if temporal:
-        clock = split["column"]
-        if feature_code:
-            raise ValueError("Temporal features must use the row-local transformation")
-        if not pd.api.types.is_numeric_dtype(X_train[clock]):
-            for frame in (X_train, X_test):
-                frame[clock] = parse_event_datetime(frame[clock])
-    if feature_code:
-        X_train, X_test = apply_feature_code(feature_code, X_train, X_test)
+    from leak_audit import LeakAuditError
+
+    config = dict(config or {})
+    auto_features = bool(config.get("auto_features"))
+    hourly_extended = bool(config.get("hourly_extended"))
+    hourly_columns = [name for name in data["X_train"] if name.endswith(("__mean24h", "__mean168h", "__delta1_3h", "__dev7d"))]
+    try:
+        X_train, X_test, cfg = prepare_features(task_dir, task_spec, config, data=data, feature_code=feature_code)
+    except LeakAuditError as exc:
+        return {"skipped": f"leak_audit_failed: {exc}"}
     y_train = data["y_train"].reset_index(drop=True)
-    cfg = dict(config or {})
-    audited = task_spec.get("audit_required", False)
-    if audited and temporal and any(cfg.get(key) for key in ("target_encoding", "entity_history", "ad_history")):
-        return {"skipped": "leak_audit_failed: temporal configuration uses an uncertified legacy feature group"}
-    hourly_extended = bool(cfg.pop("hourly_extended", False))
-    hourly_columns = [name for name in X_train if name.endswith(("__mean24h", "__mean168h", "__delta1_3h", "__dev7d"))]
-    if audited and not hourly_extended:
-        X_train, X_test = X_train.drop(columns=hourly_columns), X_test.drop(columns=hourly_columns)
-    auto_features = bool(cfg.pop("auto_features", False))
-    if auto_features:
-        from features import add_auto_features, important_numeric
-        priority = None if temporal else important_numeric(X_train, y_train, task_type)
-        if audited and not temporal:
-            return {"skipped": "leak_audit_failed: automated transforms require a time split"}
-        transformed = add_auto_features(X_train, X_test, priority, row_local=temporal)
-        if audited:
-            from leak_audit import AuditBudget, audit_log, check_equal, sample_positions
-            a, b = sample_positions(len(X_train)), sample_positions(len(X_test))
-            with AuditBudget().check("calendar"):
-                replayed = add_auto_features(X_train.iloc[a], X_test.iloc[b], row_local=True)
-                check_equal(transformed[0].iloc[a], replayed[0])
-                check_equal(transformed[1].iloc[b], replayed[1])
-            audit_log("pass", "calendar", features=[c for c in transformed[0] if c not in X_train],
-                      rule="current event values only", rows=len(a)+len(b))
-        X_train, X_test = transformed
+    fixed = {key: cfg.pop(key) for key in ("n_folds", "fold_seed", "n_jobs", "audit_required", "split")}
+    if task_spec.get("label_delay_unit"):
+        fixed["label_delay_unit"] = cfg.pop("label_delay_unit")
+    split = fixed["split"]
 
     # Фолды одинаковые во всех экспериментах, иначе скоры несравнимы: агент их не меняет.
     # Разбиение группами включается само, если test похож на новый период
@@ -143,18 +175,11 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         # Модель на всем train не меняет скор CV, поэтому включаем ее в сильном рецепте всегда
         cfg.setdefault("refit_full", True)
 
-    for key in ("n_folds", "fold_seed", "split", "n_jobs"):
-        cfg.pop(key, None)
     max_seeds = int(cfg.pop("max_seeds", None) or 3)
     cfg["params"] = dict(cfg.get("params") or {})
     for key in ("num_threads", "nthread", "thread_count", "n_jobs"):
         if key in cfg["params"]:
             cfg["params"][key] = 8
-    fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": 8, "split": split, "audit_required": audited}
-
-    if task_spec.get("label_delay_unit"):
-        fixed["label_delay_unit"] = task_spec["label_delay_unit"]
-
     if recipe == "auto":
         result = auto_train(
             X_train, y_train, X_test, task_type, metric, time_budget,
@@ -176,6 +201,22 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     if "auto_stop" in result:
         report["auto_stop"] = result["auto_stop"]
     return _record(task_dir, task_spec, data, history, result, report)
+
+
+def run_prefix_tuning(task_dir, task_spec, config, time_budget):
+    from training import tune_backend
+
+    started = time.monotonic()
+    data = load_data(task_dir, task_spec)
+    X_train, X_test, prepared = prepare_features(task_dir, task_spec | {"audit_required": True}, config, data=data)
+    if (prepared["split"] or {}).get("type") != "time":
+        raise ValueError("Prefix tuning requires a chronological split")
+    prepared.pop("max_seeds", None)
+    stats = {}
+    left = max(0., time_budget - (time.monotonic() - started))
+    tuned = tune_backend(prepared["model"], X_train, data["y_train"], X_test,
+                         task_spec["task_type"], task_spec["metric"], prepared, left, diagnostics=stats)
+    return {"tuned_params": tuned, "tune_diagnostics": stats}
 
 
 def _beats_fold_baselines(scores, baselines, greater):
@@ -373,8 +414,9 @@ def run_ensemble(task_dir, task_spec, max_members=8, *, time_budget=None):
 
     def diversity(member):
         config = member["config"]
-        return config.get("model"), tuple(key for key in ("auto_features", "event_activity", "causal_history", "hourly_extended")
-                                          if config.get(key))
+        features = tuple((key, config[key]) for key in ("auto_features", "event_activity", "causal_history",
+                         "hourly_extended", "history_window", "history_smoothing", "recency_days") if config.get(key))
+        return config.get("model"), (features, config.get("seed", 42))
 
     diverse_pool = list(range(min(original_count, 6)))
     if audited:
@@ -429,8 +471,8 @@ def run_ensemble(task_dir, task_spec, max_members=8, *, time_budget=None):
         strongest = None
         def diversified(members):
             signatures = [diversity(candidates[i]) for i in members]
-            backends, features = zip(*signatures)
-            return all(backends) and len(set(backends)) == len(members) and len(set(features)) > 1
+            backends, variants = zip(*signatures)
+            return all(backends) and len(set(backends)) >= 2 and len(set(signatures)) == len(members) and len(set(variants)) > 1
 
         if audited:
             sets = chain.from_iterable(combinations(diverse_pool, width) for width in (2, 3))
@@ -626,6 +668,8 @@ if __name__ == "__main__":
     try:
         if args["recipe"] == "ensemble":
             report = run_ensemble(Path.cwd(), args["task_spec"], time_budget=args["time_budget"])
+        elif args["recipe"] == "tune":
+            report = run_prefix_tuning(Path.cwd(), args["task_spec"], args["config"], args["time_budget"])
         else:
             report = run_experiment(Path.cwd(), **args)
     except LeakAuditError as exc:

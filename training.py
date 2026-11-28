@@ -1042,7 +1042,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
 
     budget = AuditBudget()
     if cfg["event_activity"] or cfg["causal_history"]:
-        query = pd.concat([Xp.iloc[sample_positions(len(Xp))], Xtp.iloc[sample_positions(len(Xtp))]], ignore_index=True)
+        train_sample = sample_positions(len(Xp))
+        query = pd.concat([Xp.iloc[train_sample], Xtp.iloc[sample_positions(len(Xtp))]], ignore_index=True)
         key_columns = [clock, *general_entities]
         query = query[key_columns]
     if cfg["event_activity"]:
@@ -1051,6 +1052,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         if cfg["audit_required"]:
             audit_event_kernel(lambda data, ask, _, __: event_activity(data, ask, clock, general_entities),
                                source, source[clock], query, clock, "event_activity", budget=budget,
+                               train_rows=len(train_sample),
                                reference=lambda data, ask, _, __: activity_reference(data, ask, clock, general_entities))
         Xp = pd.concat([Xp, event_activity(source, Xp, clock, general_entities)], axis=1)
         Xtp = pd.concat([Xtp, event_activity(source, Xtp, clock, general_entities)], axis=1)
@@ -1071,6 +1073,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
 
         audit_event_kernel(target_features, Xp.iloc[first_fit][key_columns], observed, query, clock,
                            "causal_history", labels=y_fit[first_fit], budget=budget, reference=reference,
+                           train_rows=len(train_sample),
                            corrupted_reference=lambda *args: reference(*args, corrupt_future=True))
     if cfg["audit_required"]:
         audit_log("pass", "model_input", features=list(Xp.columns), rule="declared row values and audited transforms")
@@ -1751,16 +1754,17 @@ _AUTO_TUNE_MIN_TRIALS = 8         # подбор параметров, толь�
 _AUTO_TUNE_MAX_TRIALS = 40        # и не дольше стольких обучений
 
 
-def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
-                  config: dict, time_budget: float) -> dict:
+def tune_backend(model, X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,
+                 config: dict, time_budget: float, *, diagnostics=None) -> dict:
     """Search before the first outer validation window and rescore winners on outer OOF."""
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     deadline = time.monotonic() + time_budget
     greater = get_metric(metric, task_type).greater_is_better
-    base = dict(config) | {"model": "lightgbm", "postprocess": False, "refit_full": False}
-
+    base = dict(config) | {"model": model, "postprocess": False, "refit_full": False}
+    if diagnostics is not None:
+        diagnostics.update(n_trials=0, completed=0, prefix_max=None)
 
     split = base.get("split")
     if "split" not in base:
@@ -1768,6 +1772,8 @@ def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type
         clock = detect_time_column(X, X_test)
         split = {"type": "time", "column": clock} if clock else None
     temporal = (split or {}).get("type") == "time"
+    if model != "lightgbm" and not temporal:
+        return {}
     if temporal:
         clock = _time_values(X[split["column"]]).reset_index(drop=True)
         targets = pd.Series(np.asarray(y))
@@ -1785,16 +1791,30 @@ def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type
             positions = positions[published.lt(first_validation).to_numpy()]
         X = X.iloc[positions].reset_index(drop=True)
         y = targets.iloc[positions].reset_index(drop=True)
+        if diagnostics is not None:
+            diagnostics.update(prefix_max=str(clock.iloc[positions].max()) if len(positions) else None,
+                               first_external_window=str(first_validation))
         if len(y) < 12 or X[split["column"]].nunique() < 4 or (task_type in CLASSIFICATION and y.nunique() < 2):
             return {}
         # Use a historical placeholder with the real as-of cutoff. Physical row order
         # within the training table must not set the outcome publication deadline.
         X_test = X.iloc[[-1]].copy()
-        X_test[split["column"]] = first_validation
+        column = split["column"]
+        tz = getattr(X_test[column].dtype, "tz", None)
+        X_test[column] = first_validation if tz is None else first_validation.tz_localize("UTC").tz_convert(tz)
         base.update(n_folds=3, split=split)
 
-    def objective(trial):
-        params = {
+    def suggest(trial):
+        if model == "catboost":
+            return {"learning_rate": trial.suggest_float("learning_rate", .025, .13, log=True),
+                    "depth": trial.suggest_int("depth", 4, 8),
+                    "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1., 24., log=True)}
+        if model == "xgboost":
+            return {"eta": trial.suggest_float("eta", .025, .13, log=True),
+                    "max_depth": trial.suggest_int("max_depth", 3, 8),
+                    "min_child_weight": trial.suggest_int("min_child_weight", 2, 32, log=True),
+                    "lambda": trial.suggest_float("lambda", .25, 24., log=True)}
+        return {
             "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
             "num_leaves": trial.suggest_int("num_leaves", 15, 255, log=True),
             "min_child_samples": trial.suggest_int("min_child_samples", 5, 200, log=True),
@@ -1802,12 +1822,20 @@ def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type
             "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
             "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 30.0, log=True),
         }
+
+    fixed_params = {"bagging_freq": 1} if model == "lightgbm" else {}
+
+    def objective(trial):
         left = deadline - time.monotonic()
-        if left < 10:
+        estimate = trial.study.user_attrs.get("trial_seconds", 10.)
+        if left < 1.3 * estimate:
             trial.study.stop()
             raise optuna.TrialPruned()
-        res = train_and_predict(X, y, X_test, task_type, metric, base | {"params": params | {"bagging_freq": 1}},
-                                time_budget=left)
+        started = time.monotonic()
+        params = suggest(trial)
+        res = train_and_predict(X, y, X_test, task_type, metric, base | {"params": params | fixed_params},
+                                time_budget=min(left, max(20., time_budget / 3)) if model != "lightgbm" else left)
+        trial.study.set_user_attr("trial_seconds", max(1., time.monotonic() - started))
         # Фолды, урезанные по времени, дают несравнимый скор
         if res["config"]["n_folds_done"] < res["config"]["n_folds"]:
             raise optuna.TrialPruned()
@@ -1815,19 +1843,26 @@ def tune_lightgbm(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type
 
     study = optuna.create_study(direction="maximize" if greater else "minimize",
                                 sampler=optuna.samplers.TPESampler(seed=42))
-    study.enqueue_trial({"learning_rate": 0.05, "num_leaves": 63, "min_child_samples": 20,
-                         "feature_fraction": 0.8, "bagging_fraction": 0.8, "lambda_l2": 1.0})
+    if model == "lightgbm":
+        study.enqueue_trial({"learning_rate": 0.05, "num_leaves": 63, "min_child_samples": 20,
+                             "feature_fraction": 0.8, "bagging_fraction": 0.8, "lambda_l2": 1.0})
     t0 = time.monotonic()
     study.optimize(objective, timeout=max(0.0, deadline - time.monotonic()),
-                   n_trials=12 if temporal else None, catch=(Exception,))
+                   n_trials=12 if temporal else None, catch=(ValueError, RuntimeError, TimeoutError))
     done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if diagnostics is not None:
+        diagnostics.update(n_trials=len(study.trials), completed=len(done))
     if not done:
         logger.warning("Подбор параметров: ни одна попытка не завершилась")
         return {}
-    logger.info("Подбор параметров LightGBM: %d попыток за %.0f с, лучший %s=%.5f, параметры %s",
-                len(done), time.monotonic() - t0, metric, study.best_value,
+    logger.info("Подбор параметров %s: %d попыток за %.0f с, лучший %s=%.5f, параметры %s",
+                model, len(done), time.monotonic() - t0, metric, study.best_value,
                 {k: round(v, 4) if isinstance(v, float) else v for k, v in study.best_params.items()})
-    return dict(study.best_params) | {"bagging_freq": 1}
+    return dict(study.best_params) | fixed_params
+
+
+def tune_lightgbm(X, y, X_test, task_type, metric, config, time_budget):
+    return tune_backend("lightgbm", X, y, X_test, task_type, metric, config, time_budget)
 
 
 def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: str, metric: str,

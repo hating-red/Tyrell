@@ -443,11 +443,6 @@ def target_constraints(text, target, y, task_type):
     return spec
 
 
-# These tables are documented static dimensions. Other schemas can declare the
-# relationship through foreign keys. Hourly sources additionally need an interval clock.
-_DIMENSION_KEYS = {"ads": "ad_id", "campaigns": "campaign_id",
-                   "users": "user_id", "districts": "district_id"}
-_HOURLY_TABLES = {"weather", "traffic", "air_quality", "power_grid", "public_transport"}
 _START_NAMES = {"hour_start", "hour_start_time", "hour_start_ts", "hour_start_at", "interval_start",
                 "interval_start_time", "period_start", "bucket_start"}
 _END_NAMES = {"hour_end", "hour_end_time", "hour_end_ts", "hour_end_at", "interval_end",
@@ -458,6 +453,10 @@ _AUX_MEMORY_LIMIT = 192 * 1024**2
 
 
 _GENERIC_HOUR_COLUMNS = {"timestamp", "datetime", "hour", "hour_ts", "hour_timestamp", "ts", "hourly_timestamp"}
+_VERSION_CLOCKS = ("updated_at", "modified_at", "valid_from", "created_at", "updated_time", "creation_time")
+_PUBLICATION_CLOCKS = ("available_at", "published_at", "released_at", "publication_time", "publish_time", "ingested_at")
+_VERSION_FIELDS = {"version", "revision", "version_id", "revision_id", "revised_at",
+                   "valid_to", "is_current", "snapshot_date", "snapshot_at"}
 
 
 def _dictionary_clocks(conn, tables, train, test, deadline, log):
@@ -466,11 +465,12 @@ def _dictionary_clocks(conn, tables, train, test, deadline, log):
     from postgres_loader import _identifier, _relation, _set_timeout
 
     candidates = [t for t in tables.values() if t not in (train, test) and t.name.lower() != "data_dictionary"
-                  and any(c.lower() in _GENERIC_HOUR_COLUMNS for c in t.columns)]
+                  and any(c.lower() in _GENERIC_HOUR_COLUMNS or _temporal_field(t, c) for c in t.columns)]
     if not candidates:
         return {}
     names = sorted({f"{t.schema}.{t.name}" for t in candidates} | {t.name for t in candidates})
-    clock_names = sorted({c for t in candidates for c in t.columns if c.lower() in _GENERIC_HOUR_COLUMNS})
+    clock_names = sorted({c for t in candidates for c in t.columns
+                          if c.lower() in _GENERIC_HOUR_COLUMNS or _temporal_field(t, c)})
     descriptions = {}
     for table in tables.values():
         if table.name.lower() != "data_dictionary":
@@ -538,15 +538,15 @@ def _hour_clock(table, task_text, descriptions=None):
     ambiguous_clocks = set()
     for column in table.columns:
         name = column.lower()
-        if name not in _START_NAMES | _END_NAMES | _GENERIC_HOUR_COLUMNS:
+        if name in _VERSION_CLOCKS or name in _PUBLICATION_CLOCKS:
+            continue
+        if name not in _START_NAMES | _END_NAMES | _GENERIC_HOUR_COLUMNS and not _temporal_field(table, column):
             continue
         if name in _START_NAMES:
             # An arbitrary interval can be longer than an hour on a private schema.
-            if ("hour" in name or table.name.lower() in _HOURLY_TABLES or
-                    "hourly" in table.name.lower() or
-                    re.search(r"\bhour(?:ly)?\b|часов", table.comments.get(column) or "", re.I)):
+            if "hour" in name:
                 clocks[column] = "start"
-            continue
+                continue
         if name in _END_NAMES:
             clocks[column] = "end"
             continue
@@ -583,13 +583,12 @@ def _hour_clock(table, task_text, descriptions=None):
             return matches[0], mode
         if matches:
             break
-    generic = [c for c in table.columns if c.lower() in _GENERIC_HOUR_COLUMNS]
-    if len(generic) == 1 and generic[0] not in ambiguous_clocks and (
-            table.name.lower() in _HOURLY_TABLES or "hour" in generic[0].lower()):
-        return generic[0], "start"
-    composite_time = [c for c in table.primary_key if "timestamp" in table.column_types.get(c, "")]
-    if len(table.primary_key) == 2 and len(composite_time) == 1 and composite_time[0] not in ambiguous_clocks:
-        return composite_time[0], "start"
+    timestamps = [c for c in table.columns
+                  if ("timestamp" in table.column_types.get(c, "") or table.column_types.get(c) == "date"
+                      or c.lower() in _START_NAMES | _GENERIC_HOUR_COLUMNS)
+                  and c.lower() not in _PUBLICATION_CLOCKS]
+    if len(timestamps) == 1 and timestamps[0].lower() not in _VERSION_CLOCKS and timestamps[0] not in ambiguous_clocks:
+        return timestamps[0], "inferred"
     return None, None
 
 
@@ -599,8 +598,7 @@ def _publication_clock(table, task_text):
     if names.keys() & {"version", "revision", "version_id", "revision_id", "revised_at", "updated_at",
                        "modified_at", "valid_from", "valid_to", "is_current", "snapshot_date", "snapshot_at"}:
         raise ValueError("не подтверждена история публикации и исправлений измерений")
-    publication = [names[k] for k in ("available_at", "published_at", "released_at", "publication_time",
-                                      "publish_time", "ingested_at") if k in names]
+    publication = [names[k] for k in _PUBLICATION_CLOCKS if k in names]
     if not publication:
         return None
     if len(publication) == 1:
@@ -635,7 +633,7 @@ def _bridge_routes(table, parents):
         if not declared and not links and table.schema == parent.schema:
             candidates = [c for c in fields if c in table.columns and c.lower().endswith(("_id", "_key", "_code"))]
             key = (table.primary_key[0] if len(table.primary_key) == 1 else None) or (
-                candidates[0] if len(candidates) == 1 else _DIMENSION_KEYS.get(table.name.lower()))
+                candidates[0] if len(candidates) == 1 else None)
             if key and key in table.columns:
                 links.add((key, key))
             hour_col, _ = _hour_clock(table, "")
@@ -671,11 +669,12 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
         raise ValueError("task.md does not establish safe availability for the source")
     hour_col, mode = _hour_clock(table, task_text, descriptions)
     names = {c.lower() for c in table.columns}
-    hourly = bool(hour_col or name in _HOURLY_TABLES or "hourly" in name or
-                  names & (_START_NAMES | _END_NAMES | _GENERIC_HOUR_COLUMNS))
-    if hourly and not hour_col:
-        raise ValueError("не подтверждены начало/конец часа")
-    if not hourly and re.search(r"(?:^|_)events?(?:_|$)", name):
+    dated_columns = [c for c in table.columns if _temporal_field(table, c) or c.lower() in _GENERIC_HOUR_COLUMNS]
+    hourly = hour_col is not None
+    if not hourly and (names & (_START_NAMES | _END_NAMES | set(_PUBLICATION_CLOCKS)) or
+                       (len(dated_columns) < 2 and names & _GENERIC_HOUR_COLUMNS)):
+        raise ValueError("не подтверждены границы интервала или однозначная временная колонка")
+    if (not hourly or mode == "inferred") and re.search(r"(?:^|_)events?(?:_|$)", name):
         raise ValueError("таблица событий требует отдельной связи и правила доступности, статический JOIN недопустим")
     publication = _publication_clock(table, task_text) if hourly else None
     typed_clocks = [c for c in common if "timestamp" in train.column_types.get(c, "")
@@ -692,8 +691,11 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
     if not relations and train.schema == test.schema == table.schema:
         keys = [c for c in table.columns if c in common and c != identifier
                 and (c.lower().endswith(("_id", "_key", "_code")) or c in table.primary_key) and c != hour_col]
+        if not keys and mode == "inferred":
+            keys = [c for c in table.columns if c in common and c not in {identifier, hour_col, event_clock}
+                    and c not in train_only and not _temporal_field(table, c)]
         key = table.primary_key[0] if len(table.primary_key) == 1 and table.primary_key[0] in common else None
-        key = key or (keys[0] if len(keys) == 1 else _DIMENSION_KEYS.get(name))
+        key = key or (keys[0] if len(keys) == 1 else None)
         if key and key in common and key in table.columns:
             relations.add((key, key))
     if not relations and bridges:
@@ -707,13 +709,18 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
         raise ValueError("ключ совпадает с идентификатором события или результатом")
     # Versioned entity snapshots use only strictly past profiles.
     if not hourly:
-        timeline = next((c for name in ("updated_at", "modified_at", "valid_from", "created_at",
-                                        "updated_time", "creation_time") for c in table.columns if c.lower() == name), None)
+        timeline = next((c for name in _VERSION_CLOCKS for c in table.columns if c.lower() == name), None)
         event_col = event_clock
+        if names & ({"valid_to"} if timeline else _VERSION_FIELDS):
+            raise ValueError("не подтверждён интервал действительности версии")
+        if timeline and event_col not in common:
+            raise ValueError("не подтверждено время события для версии справочника")
         if timeline and event_col in common:
             hour_col, mode = timeline, "profile"
         else:
             event_col = None
+            if len(dated_columns) >= 2:
+                mode = "static_dates"
     blocked = {x.lower() for x in train_only} | {identifier.lower(), "label", "outcome", "prediction", "predicted",
                   "submission", "clicks", "ctr", "conversions", "impressions", "engagement", "future", "next",
                   "cumulative", "total", "target"}
@@ -722,7 +729,7 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
     for c in table.columns:
         low = c.lower()
         if (c == right or c == hour_col or c == publication or low in _START_NAMES | _END_NAMES or
-                _temporal_field(table, c) or f"{table.name}.{c}" in restrictions or
+                c in dated_columns or f"{table.name}.{c}" in restrictions or
                 any(re.search(rf"(?:^|_){re.escape(term)}(?:_|$)", low) for term in blocked)
                 or table.column_types.get(c, "").lower() in unsupported_types):
             continue
@@ -764,7 +771,58 @@ def to_utc_naive(series):
 parse_event_datetime = to_utc_naive
 
 
-def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication=None, *, coalesce=False):
+def _infer_interval(entities, stamps, before, *, diagnostics=None):
+    """Establish cadence from distinct historical timestamps within each entity."""
+    if before is None or pd.isna(before):
+        raise ValueError("неопределимый шаг: нет времени первого события")
+    past = pd.DataFrame({"key": entities, "stamp": stamps})
+    past = past.loc[past["stamp"].lt(before)]
+    unique = past.drop_duplicates()
+    if diagnostics is not None:
+        diagnostics["duplicate_timestamps"] = len(past) - len(unique)
+    past = unique.sort_values(["key", "stamp"])
+    gaps = past.groupby("key", sort=False)["stamp"].diff().dropna()
+    if len(gaps) < 2:
+        raise ValueError("неопределимый шаг: нужно не менее двух исторических интервалов")
+    step = gaps.median()
+    share = gaps.eq(step).mean()
+    if step <= pd.Timedelta(0) or share < .8 or not (gaps >= step).all() or (gaps % step != pd.Timedelta(0)).any():
+        raise ValueError(f"irregular_step share={share:.3f} median={step} (нерегулярный шаг)")
+    return step
+
+
+def _reference_mode(table, auxiliary, right, clock, mode, before, publication, values):
+    if mode == "static_dates":
+        if auxiliary[right].duplicated().any():
+            raise ValueError("non_unique_key_with_multiple_dates")
+        return None, "static", "one_row_per_key_multiple_dates", values
+    if mode != "inferred":
+        return clock, mode, "documented_clock" if clock else "keyed_dimension", values
+    stamps = to_utc_naive(auxiliary[clock])
+    historical = auxiliary.loc[stamps.lt(before), [right]].assign(stamp=stamps[stamps.lt(before)])
+    counts = historical.drop_duplicates().groupby(right, dropna=True).size()
+    if counts.median() >= 3:
+        return clock, mode, "regular_step", values
+    names = {c.lower() for c in table.columns}
+    # Explicit measurement hints cannot be treated as timeless profile attributes.
+    if (publication or clock.lower() in _START_NAMES | _GENERIC_HOUR_COLUMNS | {"day", "date"}
+            or re.search(r"^(?:measurement|measured|observation|observed|recorded|sampled)_", clock, re.I)):
+        raise ValueError("undetermined_step (неопределимый шаг): median historical timestamps per key < 3")
+    values = [c for c in values if not re.search(r"(?:^|_)(?:count|sum|last|score)(?:_|$)", c, re.I)]
+    if not values:
+        raise ValueError("нет доступных признаков справочника")
+    if not auxiliary[right].duplicated().any():
+        return clock, "dated_static", "one_row_per_key", values
+    # A version is safe only when the column denotes when that version was created.
+    if re.search(r"^(?:created|registered|registration|signup|signed_up|creation)_", clock, re.I):
+        return clock, "dated_profile", "version_creation_clock", values
+    if names.intersection(_VERSION_FIELDS):
+        raise ValueError("ambiguous_version_clock")
+    raise ValueError("undetermined_step: ambiguous timestamps with fewer than three historical observations per key")
+
+
+def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication=None, *, coalesce=False,
+                    cadence_before=None, diagnostics=None):
     """Validate keys after normalisation, before any train/test rows are touched."""
     auxiliary = auxiliary.reset_index(drop=True)
     lookup = auxiliary[values].add_prefix(prefix).copy()
@@ -781,14 +839,24 @@ def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publicatio
                 lookup.loc[unique.index[unique.gt(1)], column] = None
         return lookup.drop_duplicates("__entity", keep="last").set_index("__entity")
     stamps = to_utc_naive(auxiliary.loc[lookup.index, hour_col])
-    if mode == "profile":
+    if mode in {"profile", "dated_static", "dated_profile"}:
         lookup["__available"] = stamps
         lookup = lookup.dropna(subset=["__available"]).sort_values("__available", kind="stable")
-        lookup[prefix + "profile_count"] = lookup.groupby("__entity", sort=False).cumcount() + 1
+        if mode == "profile":
+            lookup[prefix + "profile_count"] = lookup.groupby("__entity", sort=False).cumcount() + 1
+        elif mode == "dated_profile":
+            repeats = lookup.duplicated(["__entity", "__available"], keep=False)
+            for column in payload:
+                conflicts = lookup.loc[repeats].groupby(["__entity", "__available"])[column].transform("nunique", dropna=False)
+                lookup.loc[conflicts.index[conflicts.gt(1)], column] = None
         return lookup.drop_duplicates(["__entity", "__available"], keep="last")
-    if mode not in {"start", "end"}:
+    if mode not in {"start", "end", "inferred"}:
         raise ValueError("Unknown interval semantics")
-    lookup["__interval_end"] = stamps + pd.Timedelta(hours=1) if mode == "start" else stamps
+    hour = pd.Timedelta(hours=1)
+    step = _infer_interval(lookup["__entity"], stamps, cadence_before, diagnostics=diagnostics) if mode == "inferred" else hour
+    if mode == "inferred":
+        lookup["__source_stamp"] = stamps
+    lookup["__interval_end"] = stamps + step if mode in {"start", "inferred"} else stamps
     lookup["__available"] = lookup["__interval_end"]
     if publication:
         release = to_utc_naive(auxiliary.loc[lookup.index, publication])
@@ -812,11 +880,16 @@ def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publicatio
             numeric[c] = values.astype("float32")
     grid = pd.DataFrame(numeric, index=lookup.index)
     grid["__available"] = lookup["__available"]
+    if mode == "inferred":
+        grid["__source_stamp"] = lookup["__source_stamp"]
     grid.index = pd.MultiIndex.from_frame(lookup[keys])
     lookup = lookup.sort_values(["__available", "__interval_end"], kind="stable")
     latest = lookup.groupby("__entity", sort=False)["__interval_end"].cummax()
     lookup = lookup.loc[lookup["__interval_end"].eq(latest)].reset_index(drop=True)
-    lookup.attrs["grid"] = grid
+    if step == hour:
+        lookup.attrs["grid"] = grid
+    if mode == "inferred":
+        lookup.attrs["inferred_step"] = step
     return lookup
 
 
@@ -830,6 +903,7 @@ def _hour_features(grid, entities, events):
     for offset in range(168 if delayed else 6):
         end = latest_end - pd.Timedelta(hours=offset)
         block = grid.reindex(pd.MultiIndex.from_arrays([entities, end])).reset_index(drop=True)
+        block = block.drop(columns="__source_stamp", errors="ignore")
         available = block.pop("__available").lt(events.reset_index(drop=True))
         values = block.where(available, axis=0).to_numpy(dtype="float64")
         if total is None:
@@ -845,14 +919,14 @@ def _hour_features(grid, entities, events):
             outputs.update({f"{col}__mean{offset+1}h": means[:, j] for j, col in enumerate(block)})
     if not delayed:
         outputs.update(_hour_rollups(grid, entities, latest_end))
-    for col in grid.columns.drop("__available"):
+    for col in grid.columns.difference(["__available", "__source_stamp"], sort=False):
         outputs[f"{col}__delta1_3h"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__lag3h"]
         outputs[f"{col}__dev7d"] = outputs[f"{col}__lag1h"] - outputs[f"{col}__mean168h"]
     return pd.DataFrame(outputs)
 
 
 def _hour_rollups(grid, entities, latest_end):
-    cols = grid.columns.drop("__available")
+    cols = grid.columns.difference(["__available", "__source_stamp"], sort=False)
     windows = {24: np.full((len(entities), len(cols)), np.nan), 168: np.full((len(entities), len(cols)), np.nan)}
     for key, positions in pd.Series(np.arange(len(entities))).groupby(entities.reset_index(drop=True)):
         try:
@@ -877,7 +951,7 @@ def _hour_rollups(grid, entities, latest_end):
 
 
 def _join_chunk(events, lookup, left, event_col, audit=None):
-    payload = [c for c in lookup if c not in ("__entity", "__available", "__interval_end")]
+    payload = [c for c in lookup if c not in ("__entity", "__available", "__interval_end", "__source_stamp")]
     if set(events).intersection(payload):
         raise ValueError("совпадающие имена признаков")
     keys = events[left].astype("string")
@@ -920,85 +994,123 @@ def _join_chunk(events, lookup, left, event_col, audit=None):
 
 
 def _audit_lookup(samples, lookup, left, event_col, budget, source_name):
-    from leak_audit import audit_log, check_equal, replay_payload
+    from leak_audit import sample_positions
 
-    events, expected = (pd.concat(part, ignore_index=True) for part in zip(*samples))
+    def verify(counts, check_time):
+        parts = []
+        for (events, features), count in zip(samples, counts):
+            ids = sample_positions(len(events), limit=count)
+            parts.append((events.iloc[ids], features.iloc[ids]))
+        events, expected = (pd.concat(part, ignore_index=True) for part in zip(*parts))
+        return _verify_lookup(events, expected, lookup, left, event_col, check_time)
+
+    budget.sampled(source_name, [len(events) for events, _ in samples], verify)
+
+
+def _verify_lookup(events, expected, lookup, left, event_col, check_time):
+    from leak_audit import LeakAuditError, check_equal, replay_batches, replay_payload
     if not event_col:
-        audit_log("pass", source_name, features=list(expected), rule="static payload; ambiguous versions masked")
-        return
-    with budget.check(source_name) as check_time:
-        times = to_utc_naive(events[event_col])
-        keys = events[left].astype("string")
-        raw = pd.DataFrame(lookup)
-        grid = lookup.attrs.get("grid")
-        payload = [col for col in raw if not col.startswith("__")]
-        # Independent per-event truncation via strict lower bounds on each entity's releases.
-        positions = np.full(len(events), -1, dtype=int)
-        future = np.full(len(events), -1, dtype=int)
-        by_key = raw.groupby("__entity", sort=False).indices
-        for key, idx in pd.Series(np.arange(len(events))).groupby(keys, sort=False):
-            src = by_key.get(key)
-            if src is None:
-                continue
-            ids = idx.to_numpy()
-            stamp = times.iloc[ids].to_numpy()
-            at = np.searchsorted(raw.iloc[src]["__available"].to_numpy(), stamp, side="left")
-            before = (at > 0) & pd.notna(stamp)
-            after = (at < len(src)) & pd.notna(stamp)
-            positions[ids[before]] = src[at[before] - 1]
-            future[ids[after]] = src[at[after]]
-        raw = raw.reset_index(drop=True)
-        visible_rows = raw.reindex(positions).reset_index(drop=True)
-        check_equal(expected[payload], visible_rows[payload])
-        # Give every query its own key and noisy suffix. A backward lookup only
-        # needs the records immediately to either side of the release boundary.
-        withheld = raw.reindex(future).reset_index(drop=True)
-        for column in payload:
-            values = pd.to_numeric(withheld[column], errors="coerce")
-            with_numeric = pd.api.types.is_numeric_dtype(visible_rows[column])
-            withheld[column] = (values.fillna(0.) + 987654.321 if with_numeric else "audit future payload")
-        synthetic = pd.Series(np.arange(len(events)), dtype="string")
-        visible_rows["__entity"] = synthetic
-        withheld["__entity"] = synthetic
-        changed = pd.concat([visible_rows, withheld], ignore_index=True).dropna(subset=["__available"])
-        changed = changed.sort_values("__available", kind="stable")
-        query = pd.DataFrame({left: synthetic, event_col: times})
-        replay = _join_chunk(query, changed, left, event_col)
-        check_equal(expected[payload], replay[payload])
+        return {"features": list(expected), "rule": "static payload; ambiguous versions masked"}
+    times = to_utc_naive(events[event_col])
+    keys = events[left].astype("string")
+    raw = pd.DataFrame(lookup)
+    grid = lookup.attrs.get("grid")
+    payload = [col for col in raw if not col.startswith("__")]
+    # Independent per-event truncation via strict lower bounds on each entity's releases.
+    positions = np.full(len(events), -1, dtype=int)
+    future = np.full(len(events), -1, dtype=int)
+    by_key = raw.groupby("__entity", sort=False).indices
+    for key, idx in pd.Series(np.arange(len(events))).groupby(keys, sort=False):
+        src = by_key.get(key)
+        if src is None:
+            continue
+        ids = idx.to_numpy()
+        stamp = times.iloc[ids].to_numpy()
+        at = np.searchsorted(raw.iloc[src]["__available"].to_numpy(), stamp, side="left")
+        before = (at > 0) & pd.notna(stamp)
+        after = (at < len(src)) & pd.notna(stamp)
+        positions[ids[before]] = src[at[before] - 1]
+        future[ids[after]] = src[at[after]]
+    raw = raw.reset_index(drop=True)
+    visible_rows = raw.reindex(positions).reset_index(drop=True)
+    step = lookup.attrs.get("inferred_step")
+    if step is not None:
+        matched = positions >= 0
+        actual_ends = visible_rows["__source_stamp"] + step
+        if not actual_ends[matched].lt(times.reset_index(drop=True)[matched]).all():
+            raise LeakAuditError("inferred interval has not ended: source timestamp + step >= event")
+    check_equal(expected[payload], visible_rows[payload])
+    # Give every query its own key and noisy suffix. A backward lookup only
+    # needs the records immediately to either side of the release boundary.
+    withheld = raw.reindex(future).reset_index(drop=True)
+    for column in payload:
+        values = pd.to_numeric(withheld[column], errors="coerce")
+        with_numeric = pd.api.types.is_numeric_dtype(visible_rows[column])
+        withheld[column] = (values.fillna(0.) + 987654.321 if with_numeric else "audit future payload")
+    synthetic = pd.Series(np.arange(len(events)), dtype="string")
+    visible_rows["__entity"] = synthetic
+    withheld["__entity"] = synthetic
+    changed = pd.concat([visible_rows, withheld], ignore_index=True).dropna(subset=["__available"])
+    changed = changed.sort_values("__available", kind="stable")
+    audit_key = "__audit_entity"
+    query = pd.DataFrame({audit_key: synthetic, event_col: times})
+    replay = _join_chunk(query, changed, audit_key, event_col)
+    check_equal(expected[payload], replay[payload])
+    if grid is not None:
+        columns = grid.columns.difference(["__available", "__source_stamp"], sort=False)
+        latest = (times - pd.Timedelta(nanoseconds=1)).dt.floor("h").to_numpy()
+        values = np.full((168, len(times), len(columns)), np.nan)
+        corrupted = np.full_like(values, np.nan)
+        for offset in range(-2, 168):
+            if offset % 24 == 0:
+                check_time()
+            index = pd.MultiIndex.from_arrays([keys, latest - np.timedelta64(offset, "h")])
+            rows = grid.reindex(index)
+            if step is not None and ((rows["__available"].to_numpy() < times.to_numpy()) &
+                                     ~((rows["__source_stamp"] + step).to_numpy() < times.to_numpy())).any():
+                raise LeakAuditError("inferred grid interval has not ended")
+            args = (rows[columns].to_numpy(dtype=float), rows["__available"].to_numpy(), times.to_numpy())
+            dirty = replay_payload(*args, corrupt_future=True)
+            if offset >= 0:
+                values[offset] = replay_payload(*args, corrupt_future=False)
+                corrupted[offset] = dirty
+            elif np.isfinite(dirty).any():
+                raise LeakAuditError("unfinished grid hour was visible")
+        for replay in (values, corrupted):
+            for i, column in enumerate(columns):
+                history = replay[:, :, i]
+                check_columns = {f"{column}__lag{lag}h": history[lag-1] for lag in (1, 2, 3)}
+                for width in (3, 6, 24, 168):
+                    finite = np.isfinite(history[:width])
+                    count = finite.sum(axis=0)
+                    total = np.where(finite, history[:width], 0).sum(axis=0)
+                    check_columns[f"{column}__mean{width}h"] = np.divide(
+                        total, count, out=np.full(len(times), np.nan), where=count > 0)
+                check_columns[f"{column}__delta1_3h"] = history[0] - history[2]
+                check_columns[f"{column}__dev7d"] = history[0] - check_columns[f"{column}__mean168h"]
+                check_equal(expected[list(check_columns)], pd.DataFrame(check_columns))
+    for idx, cutoff in replay_batches(times, check_time, blocks=2):
+        retained = raw["__available"].lt(cutoff)
+        past = raw.loc[retained]
+        corrupted = raw.copy()
+        # Write noise to the payload of every unavailable record, including equality.
+        for col in payload:
+            corrupted[col] = corrupted[col].astype(object)
+            corrupted.loc[~retained, col] = -987654.321
         if grid is not None:
-            columns = grid.columns.drop("__available")
-            latest = (times - pd.Timedelta(nanoseconds=1)).dt.floor("h").to_numpy()
-            values = np.full((168, len(times), len(columns)), np.nan)
-            corrupted = np.full_like(values, np.nan)
-            for offset in range(-2, 168):
-                if offset % 24 == 0:
-                    check_time()
-                index = pd.MultiIndex.from_arrays([keys, latest - np.timedelta64(offset, "h")])
-                rows = grid.reindex(index)
-                args = (rows[columns].to_numpy(dtype=float), rows["__available"].to_numpy(), times.to_numpy())
-                dirty = replay_payload(*args, corrupt_future=True)
-                if offset >= 0:
-                    values[offset] = replay_payload(*args, corrupt_future=False)
-                    corrupted[offset] = dirty
-                elif np.isfinite(dirty).any():
-                    from leak_audit import LeakAuditError
-                    raise LeakAuditError("unfinished grid hour was visible")
-            for replay in (values, corrupted):
-                for i, column in enumerate(columns):
-                    history = replay[:, :, i]
-                    check_columns = {f"{column}__lag{lag}h": history[lag-1] for lag in (1, 2, 3)}
-                    for width in (3, 6, 24, 168):
-                        finite = np.isfinite(history[:width])
-                        count = finite.sum(axis=0)
-                        total = np.where(finite, history[:width], 0).sum(axis=0)
-                        check_columns[f"{column}__mean{width}h"] = np.divide(
-                            total, count, out=np.full(len(times), np.nan), where=count > 0)
-                    check_columns[f"{column}__delta1_3h"] = history[0] - history[2]
-                    check_columns[f"{column}__dev7d"] = history[0] - check_columns[f"{column}__mean168h"]
-                    check_equal(expected[list(check_columns)], pd.DataFrame(check_columns))
-    audit_log("pass", source_name, features=list(expected), rows=len(events),
-              rule="release < event", cutoffs=int(times.nunique()),
-              checks=["per_row_asof", "truncated_source", "per_cutoff_corrupted_source"])
+            usable = grid["__available"].lt(cutoff)
+            past.attrs["grid"] = grid.loc[usable]
+            corrupted_grid = grid.copy()
+            corrupted_grid.loc[~usable, corrupted_grid.columns.difference(["__available", "__source_stamp"])] = -987654.
+            corrupted.attrs["grid"] = corrupted_grid
+        for source in (past, corrupted):
+            check_time()
+            actual = _join_chunk(events.iloc[idx].reset_index(drop=True), source, left, event_col)
+            check_equal(expected.iloc[idx], actual[expected.columns])
+    checks = ["per_row_asof", "truncated_source", "corrupted_source", "per_cutoff_corrupted_source"]
+    if step is not None:
+        checks.append("source_timestamp_plus_inferred_step")
+    return dict(features=list(expected), rule="release < event", cutoffs=int(times.nunique()), checks=checks)
 
 
 def _read_lookup(conn, table, cols, deadline, *, hourly=False):
@@ -1054,6 +1166,7 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
     clock_descriptions = _dictionary_clocks(conn, tables, train, test, deadline, log)
     passes = [(table, False) for table in tables.values()]
     parents = []
+    earliest = {}
     for table, indirect in passes:
         if deadline is not None and time.monotonic() >= deadline:
             if table not in (train, test):
@@ -1080,7 +1193,8 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
             detail["candidate_columns"] = values.copy()
             detail.update(left_key=left, right_key=right, source_clock=hour_col, event_clock=event_col,
                           availability=f"{mode}, available < event" if hour_col else "static_dimension")
-            publication = _publication_clock(table, task_text) if mode in ("start", "end") else None
+            interval = mode in ("start", "end", "inferred")
+            publication = _publication_clock(table, task_text) if interval else None
             if publication:
                 detail.update(publication_clock=publication, publication_evidence="documented_first_immutable_publication",
                               availability=f"hour_{mode}, max(interval_end, publication) < event")
@@ -1093,25 +1207,34 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                 detail["bridge_column"] = via
             cols = [right] + ([hour_col] if hour_col else []) + ([publication] if publication else []) + values
             with conn.transaction():
-                auxiliary = _read_lookup(conn, table, cols, deadline, hourly=mode in ("start", "end"))
-            if (mode == "start" and hour_col.lower() in _GENERIC_HOUR_COLUMNS and
-                    hour_col not in table.primary_key and table.name.lower() not in _HOURLY_TABLES and
-                    not descriptions.get(hour_col) and not table.comments.get(hour_col) and not publication and
-                    not auxiliary[right].duplicated().any()):
-                # One dated profile per entity supplies no evidence of hourly measurements.
-                mode = "profile"
-                detail["availability"] = "profile, available < event"
+                auxiliary = _read_lookup(conn, table, cols, deadline, hourly=interval)
+            if mode == "inferred" and event_col not in earliest:
+                first = [to_utc_naive(chunk[event_col]).min()
+                         for name in ("train.csv", "test.csv")
+                         for chunk in pd.read_csv(output_dir / name, usecols=[event_col], dtype=str,
+                                                  encoding="utf-8-sig", chunksize=_EVENT_CHUNK_ROWS)]
+                earliest[event_col] = pd.Series(first, dtype="datetime64[ns]").min()
+            hour_col, mode, reason, values = _reference_mode(
+                table, auxiliary, right, hour_col, mode, earliest.get(event_col), publication, values)
+            if not hour_col:
+                event_col = None
+            interval = mode in ("start", "end", "inferred")
             duplicate_rows = int(auxiliary[right].duplicated().sum())
             if on_audit is not None:
                 detail["lookup_rows"] = len(auxiliary)
                 detail["distinct_lookup_keys"] = int(auxiliary[right].astype("string").nunique())
-            lookup = _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication, coalesce=True)
+            lookup = _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication, coalesce=True,
+                                     cadence_before=earliest.get(event_col), diagnostics=detail)
+            if mode == "inferred":
+                detail["interval_step"] = str(lookup.attrs["inferred_step"])
+                detail["clock_evidence"] = "within_entity_median_before_first_event"
             payload = [c for c in lookup if not c.startswith("__")]
             del auxiliary
             splits = {}
             samples = []
             with tempfile.TemporaryDirectory(dir=output_dir) as staging:
                 for name in ("train.csv", "test.csv"):
+                    split_samples = []
                     stats = {"rows": 0, "matched_rows": 0, "missing_key_rows": 0}
                     if on_audit is not None:
                         stats["feature_nonmissing"] = dict.fromkeys(payload, 0)
@@ -1130,8 +1253,10 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                             if chosen is not None and len(events):
                                 ids = chosen[(chosen >= events.index[0]) & (chosen <= events.index[-1])]
                                 if len(ids):
-                                    samples.append((events.loc[ids], joined.loc[ids, joined.columns.difference(events.columns, sort=False)]))
+                                    split_samples.append((events.loc[ids], joined.loc[ids, joined.columns.difference(events.columns, sort=False)]))
                             joined.to_csv(dest, index=False, mode="a", header=(i == 0), encoding="utf-8")
+                    if split_samples:
+                        samples.append(tuple(pd.concat(parts) for parts in zip(*split_samples)))
                 if replay and samples:
                     _audit_lookup(samples, lookup, left, event_col, replay, detail["table"])
                 # Preserve the original inode until both compatible exports are installed.
@@ -1148,17 +1273,22 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                     original.replace(train_path)
                     raise
             detail.update(status="applied", output_columns=payload, **splits)
-            if mode not in ("start", "end") and not indirect:
+            if not interval and not indirect and not event_col:
                 parents.append((table, values))
             rule = (f", {hour_col}: start+1h < {event_col}" if mode == "start" else
                     f", {mode} clock {hour_col} -> {event_col}" if hour_col else ", one profile per key")
-            extra = f", additional profile rows={duplicate_rows}" if mode not in ("start", "end") else ""
+            if mode == "inferred":
+                rule = f", {hour_col} + {detail['interval_step']} < {event_col}"
+            extra = f", additional profile rows={duplicate_rows}" if not interval else ""
             counts = ", ".join(f"{split}={stats['matched_rows']}/{stats['rows']}" for split, stats in splits.items())
-            selection = ("latest version strictly before event" if mode == "profile"
+            selection = ("latest version strictly before event" if mode in ("profile", "dated_profile", "dated_static")
                          else "deterministic key/payload order; conflicting values masked")
-            profile = f", selection={selection}" if mode not in ("start", "end") else ""
+            profile = f", selection={selection}" if not interval else ""
+            display_mode = {"dated_static": "static", "dated_profile": "profile"}.get(mode, mode or "static")
+            diagnostics = (f" step={detail['interval_step']} duplicate_timestamps={detail['duplicate_timestamps']}"
+                           if mode == "inferred" else "")
             log(f"JOIN {table.schema}.{table.name}: {left} -> {right}{rule}{extra}{profile}, {counts}, "
-                f"rows_and_ids_preserved=True, source_features={values!r}")
+                f"rows_and_ids_preserved=True, source_features={values!r}, mode={display_mode} reason={reason}{diagnostics}")
         except _NoEventRelation as exc:
             if not indirect:
                 passes.append((table, True))
@@ -1167,7 +1297,9 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
             log(f"JOIN {table.schema}.{table.name} пропущен: {exc}")
         except (ValueError, TimeoutError) as exc:
             detail["reason"] = str(exc)
-            log(f"JOIN {table.schema}.{table.name} пропущен: {exc}")
+            duplicates = (f" duplicate_timestamps={detail['duplicate_timestamps']}"
+                          if "duplicate_timestamps" in detail else "")
+            log(f"JOIN {table.schema}.{table.name} skipped reason={exc}{duplicates}")
         except Exception as exc:
             # SQL errors may contain row contents or connection parameters.
             detail["reason"] = type(exc).__name__

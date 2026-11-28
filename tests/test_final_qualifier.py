@@ -67,9 +67,9 @@ def test_duplicate_threshold_includes_split_column():
 @pytest.mark.parametrize("name", ["weather", "traffic", "air_quality", "power_grid", "public_transport"])
 def test_public_hourly_clock_uses_completed_measurements(name):
     table = Table("public", name, ("district_id", "timestamp", "reading"))
-    clock, mode = _hour_clock(table, "База данных: hack_final_task2")
+    clock, mode = _hour_clock(table, f"{name}.timestamp is the start of the hour")
     assert (clock, mode) == ("timestamp", "start")
-    assert _hour_clock(table, "Private task") == ("timestamp", "start")
+    assert _hour_clock(table, "Private task") == ("timestamp", "inferred")
     source = pd.DataFrame({"district_id": ["A", "A", "B"],
                            "timestamp": ["2025-01-01 09:00", "2025-01-01 10:00", "2025-01-01 09:00"],
                            "reading": [9, 10, 90]})
@@ -122,7 +122,7 @@ def test_private_composite_clock_maps_between_postgres_timestamp_types():
                    column_types={"bucket_clock": "timestamp without time zone"},
                    primary_key=("line_key", "bucket_clock"))
     assert _plan_relation(lookup, train, test, "job_id", {"minutes"}, "") == (
-        "line_key", "line_key", "opened", "bucket_clock", "start", ["density"],
+        "line_key", "line_key", "opened", "bucket_clock", "inferred", ["density"],
     )
 
 
@@ -134,7 +134,8 @@ def test_hourly_source_uses_documented_district_bridge():
                          primary_key=("area_key", "timestamp"),
                          foreign_keys=(ForeignKey(("area_key",), ("public", "districts"), ("power_zone_id",)),))
     bridges = _bridge_routes(observations, [(districts, ["power_zone_id"])])
-    assert _plan_relation(observations, train, test, "event_id", {"label"}, "", bridges=bridges) == (
+    assert _plan_relation(observations, train, test, "event_id", {"label"},
+                          "power_grid.timestamp is the start of the hour", bridges=bridges) == (
         "districts__power_zone_id", "area_key", "timestamp", "timestamp", "start", ["load"],
     )
 
@@ -359,3 +360,117 @@ def test_trial_fit_includes_thirty_percent_safety_margin(monkeypatch):
     monkeypatch.setattr(solution.time, "monotonic", lambda: 1000.)
     assert not solution.trial_fits(100., 1130.)
     assert solution.trial_fits(100., 1140.)
+
+
+@pytest.mark.parametrize("model", ["catboost", "xgboost"])
+def test_optuna_tuning_sees_only_prefix(model, monkeypatch):
+    import training
+
+    clock = pd.date_range("2025", periods=120, freq="h")
+    X = pd.DataFrame({"ts": clock, "feature": np.arange(len(clock))})
+    y = pd.Series(np.arange(len(clock), dtype=float))
+    seen = []
+
+    def train(inner, labels, probe, task_type, metric, config, time_budget):
+        seen.append(config["params"])
+        assert inner["ts"].max() == clock[19]
+        assert labels.max() == 19
+        assert probe["ts"].iloc[0] == clock[20]
+        assert config["model"] == model and config["n_folds"] == 3
+        return {"config": {"n_folds_done": 3, "n_folds": 3}, "score": 1.}
+
+    monkeypatch.setattr(training, "train_and_predict", train)
+    params = training.tune_backend(model, X, y, X.iloc[[-1]], "regression", "mae",
+                                   {"split": {"type": "time", "column": "ts"}}, 30.)
+    assert seen and params in seen
+
+
+def test_tune_recipe_and_outer_experiment_use_identical_features(tmp_path, monkeypatch, capsys):
+    import training
+
+    backend = next((name for name in ("catboost", "xgboost", "lightgbm") if training.backend_available(name)), None)
+    if backend is None:
+        pytest.skip("no available backend")
+    clock = pd.date_range("2025", periods=420, freq="h")
+    frame = pd.DataFrame({"ts": clock, "x": np.sin(np.arange(len(clock)) / 4),
+                          "measurements__x__mean24h": np.arange(len(clock)) / 8})
+    spec = {"task_type": "regression", "metric": "mae", "audit_required": True, "time_column": "ts"}
+    config = {"model": backend, "auto_features": True, "hourly_extended": True, "n_folds": 99,
+              "num_boost_round": 12, "early_stopping_rounds": 4}
+    data = {"X_train": frame.iloc[:360], "X_test": frame.iloc[360:], "y_train": 3 + frame.x.iloc[:360]}
+    monkeypatch.setattr(pipeline, "load_data", lambda *a: data)
+    monkeypatch.setattr(pipeline, "experiment_history", lambda *a: [])
+    monkeypatch.setattr(pipeline, "_record", lambda *a: a[-1])
+    real_train = training.train_and_predict
+    columns = []
+
+    def collect(train, y, test, *args, **kwargs):
+        columns.append(tuple(train.columns))
+        cfg = args[2] if len(args) > 2 else kwargs["config"]
+        assert not {"auto_features", "hourly_extended"}.intersection(cfg)
+        return real_train(train, y, test, *args, **kwargs)
+
+    monkeypatch.setattr(training, "train_and_predict", collect)
+    pipeline.run_experiment(tmp_path, spec, config=config, time_budget=15.)
+    tuned = pipeline.run_prefix_tuning(tmp_path, spec, config, 32.)
+    assert tuned["tuned_params"] and tuned["tune_diagnostics"]["completed"]
+    assert tuned["tune_diagnostics"]["prefix_max"] == str(clock[59])
+    assert len(columns) > 1 and len(set(columns)) == 1
+    assert "ts__hour" in columns[0] and "measurements__x__mean24h" in columns[0]
+    assert capsys.readouterr().err.count('LEAK_AUDIT status=pass {"group": "calendar"') == 2
+
+
+def test_extended_search_uses_seeded_tail_until_budget_runs_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(pipeline, "experiment_history", lambda _: [])
+    now = [0.]
+    monkeypatch.setattr(solution.time, "monotonic", lambda: now[0])
+    collected = []
+
+    def train(directory, spec, deadline, budget, config, recipe="single", *, estimate):
+        collected.append((recipe, config))
+        now[0] += 8 if recipe == "tune" else 24
+        if recipe == "tune":
+            return {"tuned_params": {"depth": 5}}
+        return {"complete": True, "fit_time": 24.}
+
+    monkeypatch.setattr(solution, "run_trial", train)
+    results = []
+    for _ in range(2):
+        now[0] = 0
+        collected.clear()
+        retired = {"catboost": "queue_exhausted"}
+        assert solution._extended_search(tmp_path, {}, 160., {"recency_days": 30}, set(),
+                                         {"catboost": 20.}, retired) == (5, 5)
+        assert retired["catboost"] == "next_trial_does_not_fit"
+        results.append(list(collected))
+    assert results[0] == results[1]
+    assert results[0][0][0] == "tune"
+    assert results[0][1][1]["params"] == {"depth": 5}
+    assert all(config["recency_days"] == 30 for _, config in results[0])
+
+def test_ensemble_considers_triple_with_two_backends(tmp_path, monkeypatch):
+    import training
+
+    spec = {"task_type": "regression", "metric": "mae", "audit_required": True,
+            "available_backends": ["catboost", "xgboost"]}
+    history = []
+    for i, (model, seed) in enumerate((("catboost", 42), ("catboost", 101), ("xgboost", 42))):
+        artifact = tmp_path / f"experiment{i}.npz"
+        np.savez(artifact, test=[2.], oof=np.full(5, 2.), fold_ids=np.arange(5))
+        history.append({"config": {"model": model, "seed": seed}, "recipe": "single", "score": 2.,
+                        "score_std": 0., "fold_scores": [2.] * 5, "fold_baselines": [{"score": 3.}] * 5,
+                        "greater_is_better": False, "n_folds_done": 5, "fit_time": 1., "class_order": None,
+                        "preds_file": str(artifact), "saved": i == 0})
+
+    def blend(members, y, metric):
+        score = 1. if len(members) == 3 else 1.5
+        return {"score": score, "fold_scores": [score] * 5, "config": {}, "predictions": [score]}
+
+    monkeypatch.setattr(pipeline, "experiment_history", lambda _: history)
+    monkeypatch.setattr(pipeline, "load_data", lambda *_: {"y_train": pd.Series(np.zeros(5))})
+    monkeypatch.setattr(pipeline, "_record", lambda *args: args[-1])
+    monkeypatch.setattr(training, "blend_results", blend)
+    monkeypatch.setattr(training, "optimize_blend_weights", lambda *args: {"score": 2., "fold_scores": [2.] * 5})
+    result = pipeline.run_ensemble(tmp_path, spec)
+    assert result["config"]["blend_type"] == "equal_triple"
+    assert len(result["members"]) == 3

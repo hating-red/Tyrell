@@ -162,3 +162,129 @@ def test_explicit_source_restriction_and_llm_whitelist():
                      {"model": "catboost", "mae_shift": True}):
         model = SimpleNamespace(ask=lambda *_: proposal)
         assert hypothesis(model, "", spec, [], [], None) is None
+
+
+@pytest.mark.parametrize(("frequency", "column", "sql_type", "primary_key", "event", "stamps"), [
+    ("h", "measured_at", "timestamp without time zone", (), "2025-01-01 10:30",
+     pd.date_range("2025-01-01 06:00", periods=5, freq="h")),
+    ("D", "day", "date", (), "2025-01-05 10:30", pd.date_range("2025-01-01", periods=5, freq="D")),
+    ("D", "day", "date", ("zone", "day"), "2025-01-05 10:30", pd.date_range("2025-01-01", periods=5, freq="D")),
+])
+def test_inferred_step_renamed_table(frequency, column, sql_type, primary_key, event, stamps):
+    fields = ("event_id", "zone", "call_time")
+    train = Table("public", "archive", (*fields, "target"))
+    test = Table("public", "new_jobs", fields)
+    gauge = Table("public", "observations", ("zone", column, "reading"),
+                  column_types={column: sql_type}, primary_key=primary_key)
+    assert _plan_relation(gauge, train, test, "event_id", {"target"}, "") == (
+        "zone", "zone", "call_time", column, "inferred", ["reading"])
+    source = pd.DataFrame({"zone": "a", column: stamps, "reading": range(5)})
+    query = pd.DataFrame({"zone": "a", "call_time": [event, stamps[-1] + pd.Timedelta(1, unit=frequency),
+                                                   stamps[-1] + pd.Timedelta(1, unit=frequency) + pd.Timedelta(microseconds=1)]})
+    lookup = _prepare_lookup(source, "zone", column, "inferred", ["reading"], "obs__",
+                             cadence_before=pd.Timestamp(event))
+    assert lookup.attrs["inferred_step"] == pd.Timedelta(1, unit=frequency)
+    joined = _join_chunk(query, lookup, "zone", "call_time")
+    assert joined["obs__reading"].tolist() == [3, 3, 4]
+    assert ("obs__reading__lag1h" in joined) == (frequency == "h")
+    _audit_lookup([(query, joined.drop(columns=query.columns))], lookup, "zone", "call_time",
+                  AuditBudget(), "observations")
+
+
+def test_irregular_and_undetermined_cadence_is_rejected():
+    from data_tools import _infer_interval
+
+    clock = pd.Series(pd.DatetimeIndex(["2025-01-01", "2025-01-02", "2025-01-04"]))
+    keys = pd.Series(["a", "a", "a"])
+    with pytest.raises(ValueError, match="irregular_step share="):
+        _infer_interval(keys, clock, pd.Timestamp("2025-01-06"))
+    with pytest.raises(ValueError, match="неопределимый шаг"):
+        _infer_interval(keys, clock, pd.Timestamp("2025-01-03"))
+
+
+def test_inferred_cadence_accepts_missing_hour_and_counts_duplicate_timestamp():
+    from data_tools import _infer_interval
+
+    times = pd.date_range("2025-01-01", periods=20, freq="h").delete(9)
+    stamps = pd.Series(times.insert(4, times[4]))
+    diagnostics = {}
+    step = _infer_interval(pd.Series("a", index=stamps.index), stamps, pd.Timestamp("2025-01-02"), diagnostics=diagnostics)
+    assert step == pd.Timedelta(hours=1)
+    assert diagnostics["duplicate_timestamps"] == 1
+
+
+def test_inferred_audit_rejects_artificially_early_release():
+    times = pd.date_range("2025-01-01", periods=4, freq="D")
+    source = pd.DataFrame({"zone": "a", "day": times, "reading": 1})
+    query = pd.DataFrame({"zone": ["a"], "ts": ["2025-01-04 10:30"]})
+    lookup = _prepare_lookup(source, "zone", "day", "inferred", ["reading"], "g__", cadence_before=times[-1])
+    lookup["__available"] -= pd.Timedelta(hours=23)
+    joined = _join_chunk(query, lookup, "zone", "ts")
+    with pytest.raises(LeakAuditError, match="source timestamp"):
+        _audit_lookup([(query, joined[["g__reading"]])], lookup, "zone", "ts", AuditBudget(), "tampered")
+
+
+def test_inferred_join_logs_duplicate_timestamps_and_irregular_reason(tmp_path, monkeypatch, capsys):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import data_tools
+
+    fields = ("event_id", "zone_id", "ts")
+    train = Table("public", "archive", (*fields, "target"))
+    test = Table("public", "new_jobs", fields)
+    regular = Table("public", "measurements", ("zone_id", "measured_at", "reading"),
+                    column_types={"measured_at": "timestamp without time zone"})
+    irregular = Table("public", "drift_measurements", regular.columns, column_types=regular.column_types)
+    times = pd.date_range("2025-01-01", periods=20, freq="h").delete(9)
+    source = pd.DataFrame({"zone_id": "a", "measured_at": times, "reading": range(len(times))})
+    noisy = source.copy()
+    noisy.loc[2, "measured_at"] += pd.Timedelta(minutes=11)
+    monkeypatch.setattr(data_tools, "_dictionary_clocks", lambda *a: {})
+    monkeypatch.setattr(data_tools, "_read_lookup", lambda conn, table, *a, **kw:
+                        pd.concat([source, source.iloc[[0]]]) if table is regular else noisy)
+    for split in ("train", "test"):
+        pd.DataFrame({"event_id": [split], "zone_id": ["a"], "ts": ["2025-01-02"]}).to_csv(
+            tmp_path / f"{split}.csv", index=False)
+    conn = SimpleNamespace(transaction=nullcontext)
+    tables = {(table.schema, table.name): table for table in (train, test, regular, irregular)}
+    data_tools.enrich_postgres(conn, tables, train, test, "event_id", "target", "", tmp_path,
+                               replay=AuditBudget(), event_counts={"train": 1, "test": 1})
+    logs = capsys.readouterr().out
+    assert "mode=inferred reason=regular_step step=0 days 01:00:00 duplicate_timestamps=1" in logs
+    assert "public.drift_measurements skipped reason=irregular_step share=" in logs
+    result = pd.read_csv(tmp_path / "test.csv")
+    assert result["measurements__reading"].tolist() == [18]
+    assert "drift_measurements__reading" not in result
+
+
+def test_adaptive_audit_retries_each_group_with_its_own_budget(monkeypatch, capsys):
+    import leak_audit
+
+    now = [0.]
+    monkeypatch.setattr(leak_audit.time, "monotonic", lambda: now[0])
+    budget = AuditBudget()
+    calls = []
+
+    def verify(counts, check):
+        calls.append(counts)
+        now[0] += 34 if counts[0] == 2000 else 15 if counts[0] == 500 else 1
+        check()
+        return {"features": ["x"]}
+
+    for group in ("first", "second"):
+        budget.sampled(group, [2500, 2200], verify)
+    assert calls == [(2000, 2000), (500, 500), (200, 200)] * 2
+    stderr = capsys.readouterr().err
+    assert stderr.count('"sample_sizes": [200, 200]') == 2
+    assert "status=fail" not in stderr
+
+def test_ambiguous_repeated_measurement_without_history_is_rejected():
+    from data_tools import _reference_mode
+
+    gauge = Table("public", "gauge", ("zone", "tick_at", "reading"),
+                  column_types={"tick_at": "timestamp without time zone"})
+    source = pd.DataFrame({"zone": ["a", "a"], "tick_at": ["2025-01-01", "2025-01-02"],
+                           "reading": [1, 2]})
+    with pytest.raises(ValueError, match="undetermined_step"):
+        _reference_mode(gauge, source, "zone", "tick_at", "inferred", pd.Timestamp("2025-01-05"),
+                        None, ["reading"])
