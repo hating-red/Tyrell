@@ -2,11 +2,10 @@ import os
 import subprocess
 import sys
 
-import pandas as pd
 import pytest
 
 from postgres_loader import _local_sample
-from test_final_agent import CASES, ROOT, write_fixture
+from test_final_agent import CASES, ROOT, assert_format, write_fixture
 
 
 def link_input(path, source):
@@ -42,12 +41,10 @@ def test_linked_task_keeps_output_and_id_order_in_working_directory(tmp_path):
     link_input(task, source / "task.md")
     original = (work / "sample_submission.csv").read_bytes()
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("PG", "TYRELL_", "OPENAI_"))}
-    env.update(TYRELL_TIME_LIMIT="24", TYRELL_MAX_LLM_CALLS="0", PYTHONIOENCODING="utf-8")
+    env.update(TYRELL_TIME_LIMIT="24", TYRELL_LLM="mock", PYTHONIOENCODING="utf-8")
     run = subprocess.run([sys.executable, str(ROOT / "solution.py"), "task.md"], cwd=work,
                          env=env, capture_output=True, text=True, encoding="utf-8", timeout=36)
     assert run.returncode == 0, run.stderr
-    result = pd.read_csv(work / "submission.csv", dtype={"event_id": str})
-    assert result["event_id"].tolist() == expected["event_id"].tolist()
-    assert result["engaged"].nunique() > 1
+    assert_format(work / "submission.csv", expected, "ads")
     assert (work / "sample_submission.csv").read_bytes() == original
     assert not (source / "submission.csv").exists()

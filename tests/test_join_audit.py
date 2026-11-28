@@ -42,7 +42,9 @@ def test_join_audit_counts_key_matches_even_when_payload_is_null():
     assert applied["test"]["feature_nonmissing"]["districts__area"] == 0
     assert applied["lookup_rows"] == applied["distinct_lookup_keys"] == 2
     assert skipped["status"] == "skipped" and skipped["output_columns"] == []
-    assert dup["status"] == "skipped" and dup["distinct_lookup_keys"] == 1
+    assert dup["status"] == "applied" and dup["distinct_lookup_keys"] == 1
+    assert dup["test"]["matched_rows"] == 1
+    assert dup["test"]["feature_nonmissing"] == {"untrusted__other": 0}
 
 
 def test_hourly_audit_checks_actual_availability_and_latency():

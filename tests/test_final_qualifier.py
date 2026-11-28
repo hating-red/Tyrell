@@ -137,6 +137,8 @@ def test_llm_retries_without_thinking_parameter(tmp_path, monkeypatch):
             pass
 
     monkeypatch.setattr(openai, "OpenAI", Client)
+    monkeypatch.setenv("TYRELL_LLM", "live")
+    monkeypatch.setenv("TYRELL_LLM_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("OPENAI_BASE_URL", "http://example.invalid")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_MODEL", "test-model")
@@ -149,7 +151,7 @@ def test_llm_retries_without_thinking_parameter(tmp_path, monkeypatch):
     finally:
         stop.set()
         broker.join(timeout=3)
-    assert len(calls) == 2 and all(call["max_tokens"] == 4096 for call in calls)
+    assert len(calls) == 2 and all(call["max_tokens"] == 400 for call in calls)
     assert calls[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
     assert "extra_body" not in calls[1]
 

@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from data_tools import (_join_chunk, _plan_relation, _prepare_lookup, detect_split,
+from data_tools import (_join_chunk, _plan_relation, _prepare_lookup, _reference_mode, detect_split,
                         enrich_postgres, guess_task_spec, load_data)
 from features import add_auto_features
 from postgres_loader import ForeignKey, Table
@@ -49,13 +49,17 @@ class SafeJoins(unittest.TestCase):
         self.assertTrue(pd.isna(joined["geo__area"].iloc[5]))
         for bad in ["a", None, " "]:
             aux.loc[1, "key"] = bad
-            with self.assertRaises(ValueError):
-                _prepare_lookup(aux, "key", None, None, ["area"], "geo__")
+            lookup = _prepare_lookup(aux, "key", None, None, ["area"], "geo__")
+            self.assertEqual(lookup.index.tolist(), ["a"])
+            if bad == "a":
+                self.assertTrue(pd.isna(lookup.loc["a", "geo__area"]))
+            else:
+                self.assertEqual(lookup.loc["a", "geo__area"], 5)
 
     def test_generic_timestamp_requires_semantics_and_group(self):
         weather = Table("s", "weather", ("district_id", "timestamp", "temp"))
-        with self.assertRaisesRegex(ValueError, "часа"):
-            _plan_relation(weather, self.train, self.test, "eid", {"delay"}, "")
+        inferred = _plan_relation(weather, self.train, self.test, "eid", {"delay"}, "")
+        self.assertEqual(inferred[:5], ("district_id", "district_id", "call_time", "timestamp", "inferred"))
         plan = _plan_relation(weather, self.train, self.test, "eid", {"delay"},
                               "weather.timestamp marks the start of the hour.")
         self.assertEqual(plan[:5], ("district_id", "district_id", "call_time", "timestamp", "start"))
@@ -80,23 +84,28 @@ class SafeJoins(unittest.TestCase):
         districts = Table("s", "districts", ("district_id", "area", "mean_delay"))
         tables = {(t.schema, t.name): t for t in (self.train, self.test, weather, districts)}
         aux = pd.DataFrame({"district_id": ["a", "b"], "area": [6, 7]})
+        unknown_cadence = pd.DataFrame({"district_id": ["a"], "temp": [18], "timestamp": ["2025-06-01 11:00"]})
         conn = Mock()
         conn.transaction.side_effect = nullcontext
         messages = []
+        def lookup_source(_conn, table, *_args, **_kwargs):
+            return aux if table is districts else unknown_cadence
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
             self.events.assign(delay=1).to_csv(path / "train.csv", index=False)
             self.events.to_csv(path / "test.csv", index=False)
-            with patch("data_tools._read_lookup", return_value=aux) as fetch:
+            with patch("data_tools._read_lookup", side_effect=lookup_source) as fetch:
                 enrich_postgres(conn, tables, self.train, self.test, "eid", "delay", "",
                                 path, log=messages.append)
-            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(fetch.call_count, 2)
             for name in ("train.csv", "test.csv"):
                 df = pd.read_csv(path / name, dtype=str, keep_default_na=False)
                 self.assertEqual(df.eid.tolist(), self.events.eid.tolist())
                 self.assertIn("districts__area", df)
                 self.assertNotIn("districts__mean_delay", df)
-            self.assertTrue(any("weather" in line and "часа" in line for line in messages))
+                self.assertNotIn("weather__temp", df)
+            self.assertTrue(any("weather" in line and "undetermined_step" in line for line in messages))
 
 
     def test_late_chunks_and_missing_train_id(self):
@@ -144,9 +153,13 @@ class SafeJoins(unittest.TestCase):
         plan = _plan_relation(lookup, self.train, self.test, "eid", {"delay"}, "")
         self.assertEqual(plan, ("district_id", "district_id", None, None, None, ["zone"]))
         interval = Table("s", "regional", ("district_id", "period_start", "power"))
-        with self.assertRaisesRegex(ValueError, "часа"):
-            _plan_relation(interval, self.train, self.test, "eid", {"delay"}, "")
-        interval.comments["period_start"] = "Start of hourly interval"
+        plan = _plan_relation(interval, self.train, self.test, "eid", {"delay"}, "")
+        self.assertEqual(plan[4], "inferred")
+        lookup_data = pd.DataFrame({"district_id": ["a"], "period_start": ["2025-06-01 11:00"], "power": [5]})
+        with self.assertRaisesRegex(ValueError, "undetermined_step"):
+            _reference_mode(interval, lookup_data, "district_id", "period_start", plan[4],
+                            pd.Timestamp("2025-06-01 13:00"), None, ["power"])
+        interval.comments["period_start"] = "Start of the hour"
         self.assertEqual(_plan_relation(interval, self.train, self.test, "eid", {"delay"}, "")[4], "start")
 
     def test_private_csv_without_dictionary(self):
@@ -212,13 +225,15 @@ class SafeJoins(unittest.TestCase):
         self.assertEqual(detect_split(past, future), {"type": "time", "column": "batch_mark"})
         self.assertIsNone(detect_split(past, past))
 
-    def test_asof_with_unknown_or_inconsistent_offset(self):
+    def test_asof_normalizes_offsets_and_keeps_strict_boundary(self):
         aux = pd.DataFrame({"district_id": ["a"], "hour": ["2025-06-01 12:00+03:00"], "temp": [7]})
         lookup = _prepare_lookup(aux, "district_id", "hour", "end", ["temp"], "s__")
-        with self.assertRaisesRegex(ValueError, "пояса"):
-            _join_chunk(self.events, lookup, "district_id", "call_time")
-        zoned = self.events.assign(call_time="2025-06-01 10:00Z")
-        self.assertEqual(_join_chunk(zoned, lookup, "district_id", "call_time").iloc[0]["s__temp"], 7)
+        clocks = ["2025-06-01 10:00Z", "2025-06-01 09:00", "2025-06-01 12:00+03:00",
+                  "2025-06-01 10:01+01:00", None, "2025-06-01 10:00Z"]
+        zoned = self.events.assign(call_time=clocks, district_id="a")
+        joined = _join_chunk(zoned, lookup, "district_id", "call_time")
+        self.assertEqual(joined["s__temp"].dropna().tolist(), [7, 7, 7])
+        self.assertEqual(joined["s__temp"].notna().tolist(), [True, False, False, True, False, True])
 
     def test_row_local_features_and_clock_detection(self):
         X = self.events[["district_id", "call_time"]].reset_index(drop=True)

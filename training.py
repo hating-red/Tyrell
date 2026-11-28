@@ -21,6 +21,7 @@ from time_budget import available_cpus, limit_openmp
 limit_openmp()
 
 from data_tools import label_available_at as _label_available_at
+from leak_audit import LeakAuditError
 
 import numpy as np
 import pandas as pd
@@ -1512,6 +1513,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                             Xall, y_train_scale[tr_idx], training_weights(tr_idx), Xmonitor, y_train_scale[monitor_idx],
                             Xfuture, task_type, metric_obj, n_classes, refit_cfg, fold_deadline, **extra,
                         )
+                    except LeakAuditError:
+                        raise
                     except (RuntimeError, ValueError, TimeoutError):
                         logger.exception("Outer fit refit failed; retaining the inner-fit predictions")
                     else:
@@ -1555,13 +1558,17 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                 y_fit[va_idx], np.clip(pva, y_fit[tr_idx].min(), y_fit[tr_idx].max()), metric_obj))
         else:
             fold_scores.append(fold_scores_raw[-1])
-        if metric_obj.name in ("pr_auc", "mae"):
-            constant = float(y_fit[tr_idx].mean() if metric_obj.name == "pr_auc" else np.median(y_fit[tr_idx]))
+        if task_type == "regression":
+            fit_target = y_fit[tr_idx]
+            constant = float(np.median(fit_target) if metric_obj.name in ("mae", "mape") else fit_target.mean())
             guess = np.full(len(va_idx), constant)
-            baseline = (float(average_precision_score(y_fit[va_idx], guess)) if metric_obj.name == "pr_auc"
-                        else float(np.abs(y_fit[va_idx] - guess).mean()))
-            fold_baselines.append({"fold": i + 1, "constant": constant, "score": baseline,
-                                   "train_rows": len(tr_idx), "validation_rows": len(va_idx)})
+        else:
+            rates = np.bincount(y_fit[tr_idx], minlength=n_classes) / len(tr_idx)
+            constant = float(rates[1]) if n_classes == 2 else rates.tolist()
+            guess = np.broadcast_to(rates, (len(va_idx), n_classes))
+        baseline = _score_fold(y_fit[va_idx], guess, metric_obj)
+        fold_baselines.append({"fold": i + 1, "constant": constant, "score": baseline,
+                               "train_rows": len(tr_idx), "validation_rows": len(va_idx)})
         oof[va_idx] = pva
         if not temporal:
             test_sum += pte
@@ -1602,6 +1609,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
                               "time": time.monotonic() - t_refit}
                 logger.info("Модель на всем train: %d раундов, %.1f с%s", rounds, refit_info["time"],
                             "" if not stopped else ", остановлена по времени, не используется")
+            except LeakAuditError:
+                raise
             except Exception as e:  # noqa: BLE001 - без нее остается среднее фолдов
                 logger.exception("Full-history refit failed")
                 if temporal:
@@ -1644,8 +1653,10 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     if task_type == "regression":
         predictions = _finalize_regression(test_pred, y_fit[refit_idx], clip)
         if temporal and metric_obj.name == "mae" and cfg["mae_shift"] and len(done_folds) == len(folds):
-            adjusted, shifted_scores, shifts = causal_mae_shift(oof, y_fit, folds, labeled_times, available_at, test_cutoff)
-            if sum(a < b for a, b in zip(shifted_scores, fold_scores)) > len(fold_scores) / 2 and np.mean(shifted_scores) < np.mean(fold_scores):
+            adjusted, shifted_scores, shifts = causal_mae_shift(oof, y_fit, folds, labeled_times, available_at,
+                                                               test_cutoff, clip=clip)
+            fold_info = {"greater_is_better": False, "config": {"fold_baselines": fold_baselines}}
+            if _quality_pair(fold_info | {"fold_scores": fold_scores}, fold_info | {"fold_scores": shifted_scores}):
                 oof, fold_scores = adjusted, shifted_scores
                 predictions = _finalize_regression(predictions + shifts[-1], y_fit[refit_idx], clip)
                 postprocess_info = {"type": "causal_mae_shift", "shifts": shifts}
@@ -1738,16 +1749,18 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     }
 
 
-def causal_mae_shift(oof, y, folds, times, available, test_cutoff):
+def causal_mae_shift(oof, y, folds, times, available, test_cutoff, *, clip=False):
     """Fit each shift to residuals from previously observable validation labels."""
     ready = available if available is not None else times
     adjusted = oof.copy()
     scores, shifts, seen = [], [], []
-    for _, val in folds:
+    for fit, val in folds:
         eligible = np.asarray(seen, dtype=int)
         eligible = eligible[ready.iloc[eligible].lt(times.iloc[val].min()).to_numpy()]
         shift = float(np.median(y[eligible] - oof[eligible])) if len(eligible) else 0.
         adjusted[val] += shift
+        if clip:
+            adjusted[val] = np.clip(adjusted[val], y[fit].min(), y[fit].max())
         shifts.append(shift)
         scores.append(float(np.abs(y[val] - adjusted[val]).mean()))
         seen.extend(val.tolist())
@@ -2464,7 +2477,7 @@ def compare_results(a: dict, b: dict) -> dict:
     """Попарное сравнение b с a по одинаковым фолдам.
 
     diffs положительны, когда b лучше. accept=True, только если b лучше на большинстве фолдов
-    и средняя разница больше половины std разниц.
+    и средняя разница больше стандартной ошибки парных разниц.
     """
     if ("fold_ids" in a or "fold_ids" in b) and not np.array_equal(a.get("fold_ids"), b.get("fold_ids")):
         raise ValueError("Cannot compare results from different validation rows")
@@ -2482,7 +2495,7 @@ def compare_results(a: dict, b: dict) -> dict:
     n_better = int((diffs > 0).sum())
     diff_mean = float(diffs.mean())
     diff_std = float(diffs.std(ddof=1)) if len(diffs) > 1 else 0.0
-    accept = n_better > len(diffs) / 2 and diff_mean > 0.5 * diff_std and diff_mean > 0
+    accept = len(diffs) > 0 and n_better > len(diffs) / 2 and diff_mean > diff_std / np.sqrt(len(diffs))
     return {"accept": bool(accept), "diff_mean": diff_mean, "diff_std": diff_std,
             "n_better": n_better, "n_folds": len(diffs), "diffs": diffs.round(6).tolist()}
 
@@ -2701,6 +2714,8 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         logger.info("auto_train: %s, бюджет %.0f с, осталось %.0f с", name, budget, remaining())
         try:
             res = train_and_predict(X, y, X_test, task_type, metric, cfg, time_budget=budget)
+        except LeakAuditError:
+            raise
         except Exception:
             incomplete.append(name)
             logger.exception("auto_train: модель %s упала, продолжаю без нее", name)
@@ -2714,9 +2729,11 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         return True
 
     def blend(previous: dict | None) -> dict | None:
-        if base.get("audit_required") and members:
-            best = max(members.values(), key=lambda result: result["score"] if result["greater_is_better"] else -result["score"])
-            return dict(best)
+        strongest = max(members.values(), key=lambda result: result["score"] if result["greater_is_better"] else -result["score"])
+        if base.get("audit_required"):
+            return dict(strongest)
+        if previous is None or _is_better(strongest["score"], previous["score"], strongest["greater_is_better"]):
+            previous = dict(strongest)
         if len(members) < 2:
             return previous
         if remaining() < 1.2 * blend_estimate():
@@ -2728,6 +2745,7 @@ def auto_train(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_type: s
         except Exception:
             logger.exception("auto_train: бленд упал, оставляю прошлый результат")
             return previous
+        res = dict(res)
         blend_time[0] = time.monotonic() - t0
         res["config"] = res["config"] | {"members": list(members)}
         if previous is not None and not _is_better(res["score"], previous["score"],

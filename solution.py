@@ -2,7 +2,9 @@
 import time
 PROCESS_STARTED = time.monotonic()
 
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -54,7 +56,8 @@ def run_trial(directory, spec, deadline, budget, config=None, recipe="single", *
     request = {"task_spec": spec, "config": config or {}, "recipe": recipe, "time_budget": budget}
     from pipeline import output_directory
     request.update(output_dir=output_directory.get(), receipt_dir=receipt_directory.get())
-    environment = {k: v for k, v in os.environ.items() if not k.upper().startswith("OPENAI_")}
+    environment = {k: v for k, v in os.environ.items()
+                   if not k.upper().startswith("OPENAI_") and k.upper() != "PGPASSWORD"}
     script = Path(__file__).resolve().with_name("pipeline.py")
     try:
         with tempfile.TemporaryFile() as stream:
@@ -103,28 +106,158 @@ def parse_model_object(content):
     raise ValueError("The model did not return a JSON object")
 
 
+_LLM_ROLES = {
+    "analyst": (25, 800), "feature_engineer": (35, 1500), "planner": (20, 400), "critic": (20, 600),
+}
+_LLM_INPUT_LIMIT = 12_000
+_LLM_REQUEST_OVERHEAD = 128
+_LLM_ROLE_GUIDANCE = {
+    "feature_engineer": "Prioritize audited feature changes.",
+    "planner": "Prioritize the next experiment within the remaining time.",
+    "critic": "Use the existing evidence to avoid weak or redundant experiments.",
+}
+
+
+class TokenLedger:
+    """A task budget partitioned into independently enforced role budgets."""
+    def __init__(self, budget=40_000):
+        self.budget = max(0, int(budget))
+        self.limits = {role: self.budget * percent // 100 for role, (percent, _) in _LLM_ROLES.items()}
+        self.usage = {role: {"in": 0, "out": 0, "calls": 0} for role in self.limits}
+
+    def remaining(self, role):
+        spent = {key: result["in"] + result["out"] for key, result in self.usage.items()}
+        return self.budget - sum(spent.values()), self.limits[role] - spent[role]
+
+    def allows(self, role, estimated_input, max_output):
+        return min(self.remaining(role)) >= estimated_input + max_output
+
+    def charge(self, role, prompt_tokens, completion_tokens):
+        record = self.usage[role]
+        record["in"] += prompt_tokens
+        record["out"] += completion_tokens
+        record["calls"] += 1
+        task, remaining = self.remaining(role)
+        log(f"LLM role={role} in={prompt_tokens} out={completion_tokens} left_task={task} left_role={remaining}")
+
+
+def _llm_schema(kind, payload):
+    if kind == "hypothesis":
+        fields = {flag: {"type": "boolean"} for flag in sorted(_CV_FLAGS)}
+        fields["model"] = {"type": "string", "enum": payload.get("spec", {}).get("available_backends", _BACKENDS)}
+        required = ["model"]
+    else:
+        evidence = payload.get("schema", {})
+        fields = {
+            "target_column": {"type": "string", "enum": evidence.get("possible_targets", ())[:20]},
+            "id_column": {"type": "string", "enum": evidence.get("possible_id_columns", ())[:20]},
+            "metric": {"type": "string", "enum": payload.get("metrics", ())[:30]},
+            "task_type": {"type": "string", "enum": ("binary", "multiclass", "regression")},
+            "probabilities": {"type": "boolean"},
+        }
+        required = ["target_column", "id_column", "metric", "task_type"]
+    return {"type": "object", "properties": fields, "required": required, "additionalProperties": False}
+
+
+def _validate_llm_object(value, schema):
+    if not isinstance(value, dict) or not set(schema["required"]) <= value.keys() or not value.keys() <= schema["properties"].keys():
+        raise ValueError("Invalid LLM object fields")
+    for key, item in value.items():
+        field = schema["properties"][key]
+        expected = bool if field["type"] == "boolean" else str
+        if type(item) is not expected or ("enum" in field and item not in field["enum"]):
+            raise ValueError("Invalid LLM object value")
+    return value
+
+
+def _llm_tools(schema):
+    return [{"type": "function", "function": {"name": _CV_TOOL, "description": "Propose a CV experiment.",
+                                               "parameters": schema}}]
+
+
+def _llm_request_text(messages, tools):
+    return json.dumps([messages, tools], ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_llm_messages(kind, prompt, payload, schema, role, *, max_bytes=None):
+    """Whitelist a schema summary and bounded experiment metadata, never source rows."""
+    evidence = payload.get("schema", {})
+    columns = [str(value)[:100] for value in payload.get("features", ())[:60]]
+    spec = {key: payload.get("spec", {})[key] for key in ("task_type", "metric", "available_backends")
+            if key in payload.get("spec", {})}
+    trials = []
+    for trial in payload.get("trials", ())[-10:]:
+        cfg = trial.get("config", {})
+        row = {"config": {key: value for key, value in cfg.items() if key in _CV_FLAGS | {"model"}
+                          and isinstance(value, (str, bool))}}
+        if isinstance(trial.get("scores"), (list, tuple)):
+            row["scores"] = [value for value in trial["scores"][:10] if isinstance(value, (int, float))
+                             and math.isfinite(value)]
+        trials.append(row)
+    summary = {"features": columns, "feature_count": len(payload.get("features", ())), "spec": spec,
+               "schema": {key: [str(v)[:100] for v in evidence.get(key, ())[:20]]
+                          for key in ("possible_targets", "possible_id_columns", "sample_columns")},
+               "metrics": list(payload.get("metrics", ()))[:30], "trials": trials}
+    task = str(payload.get("task", ""))
+    system = prompt[:1500] + " " + _LLM_ROLE_GUIDANCE.get(role, "")
+    if kind == "spec":
+        system += " Return one JSON object matching this schema: " + json.dumps(schema, ensure_ascii=False)
+    else:
+        system += " Return one JSON object or call the declared CV tool."
+    text = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+    # Size task prose separately so trimming can never produce invalid JSON.
+    remaining = max(0, _LLM_INPUT_LIMIT - len(system) - len(text) - 80)
+    task = task[:remaining]
+    tools = _llm_tools(schema) if kind == "hypothesis" else []
+    while True:
+        content = json.dumps({"task": task, **summary}, ensure_ascii=False, separators=(",", ":"))
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": content}]
+        excess = len(system) + len(content) - _LLM_INPUT_LIMIT
+        if max_bytes is not None:
+            request_size = len(_llm_request_text(messages, tools).encode("utf-8"))
+            excess = max(excess, request_size - max_bytes)
+        if excess <= 0:
+            return messages
+        if not task:
+            return None
+        task = task[:max(0, len(task) - max(1, excess // 2))]
+
+
 class ResearchModel:
-    """Only structured task descriptions and validated model configurations cross this boundary."""
+    """Research client with a single metered transport in the trusted broker."""
     def __init__(self, mailbox=None):
-        self.remaining = {"spec": 2, "hypothesis": 8}
+        self.remaining = {"spec": 1, "hypothesis": 8}
         self.mailbox = mailbox
-        self.enabled = mailbox is not None or all(os.environ.get(k) for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"))
+        self.mode = os.environ.get("TYRELL_LLM", "live").strip().lower()
+        self.enabled = self.mode == "live" and (mailbox is not None or all(
+            os.environ.get(k) for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL")))
+        try:
+            budget = int(os.environ.get("TYRELL_LLM_TOKENS", "40000"))
+        except ValueError:
+            budget = 40_000
+        self.ledger = TokenLedger(budget)
         self.extra_supported = True
-        self.tools_supported = True
         self.last_tool = None
         self.last_reason = None
+
+    def _disable(self, reason):
+        self.enabled = False
+        self.last_reason = reason
+        log(f"LLM status=disabled reason={reason}")
+
+    def report_usage(self):
+        log("LLM_USAGE " + json.dumps({"mode": self.mode, "budget": self.ledger.budget,
+                                       "roles": self.ledger.usage}, separators=(",", ":")))
 
     def ask(self, kind, prompt, payload, deadline):
         self.last_tool = None
         self.last_reason = None
-        if not self.enabled:
+        if not self.enabled or self.remaining[kind] <= 0:
             return None
+        count = self.remaining[kind]
+        self.remaining[kind] -= 1
         if self.mailbox is not None:
-            if self.remaining[kind] <= 0:
-                return None
-            self.remaining[kind] -= 1
-            name = f"{kind}-{self.remaining[kind]}"
-            request = self.mailbox / (name + ".request")
+            request = self.mailbox / f"{kind}-{count}.request"
             reply = request.with_suffix(".reply")
             staged = request.with_suffix(".tmp")
             staged.write_text(json.dumps([kind, prompt, payload, deadline], default=str), encoding="utf-8")
@@ -135,77 +268,127 @@ class ResearchModel:
                     return result
                 time.sleep(.1)
             return None
-        try:
-            from openai import BadRequestError, OpenAI
-        except ImportError:
-            log_error()
-            self.enabled = False
+        role = "analyst" if kind == "spec" else ("planner", "feature_engineer", "critic")[(8 - count) % 3]
+        schema = _llm_schema(kind, payload)
+        max_bytes = self.ledger.limits[role] - _LLM_ROLES[role][1] - _LLM_REQUEST_OVERHEAD
+        messages = _bounded_llm_messages(kind, prompt, payload, schema, role, max_bytes=max_bytes)
+        if not messages:
+            self.last_reason = "token_budget"
+            log(f"LLM role={role} status=skipped reason=token_budget")
             return None
-        while self.remaining[kind] and deadline - time.monotonic() > 5:
-            self.remaining[kind] -= 1
-            extra = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}} if self.extra_supported else {}
-            using_tool = kind == "hypothesis" and self.tools_supported
-            if using_tool:
-                properties = {name: {"type": "boolean"} for name in sorted(_CV_FLAGS)}
-                properties["model"] = {"type": "string", "enum": payload.get("spec", {}).get("available_backends", _BACKENDS)}
-                extra.update(tools=[{"type": "function", "function": {
-                    "name": _CV_TOOL, "description": "Run one model configuration on the existing CV folds.",
-                    "parameters": {"type": "object", "properties": properties, "required": ["model"],
-                                   "additionalProperties": False},
-                }}], tool_choice={"type": "function", "function": {"name": _CV_TOOL}})
-            raw = ""
+        return self.llm_call(role, messages, schema, deadline=deadline, using_tool=kind == "hypothesis")
+
+    def llm_call(self, role, messages, schema, *, deadline, using_tool=False):
+        self.last_tool = None
+        self.last_reason = None
+        if self.mode != "live" or not self.enabled:
+            return None
+        model = os.environ["OPENAI_MODEL"]
+        key = hashlib.sha256(json.dumps([model, role, messages], ensure_ascii=False,
+                                        sort_keys=True).encode("utf-8")).hexdigest()
+        root = Path(os.environ.get("TYRELL_LLM_CACHE", str(Path.home() / ".tyrell" / "llm-cache")))
+        path = root / (key + ".json")
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            result = _validate_llm_object(cached["result"], schema)
+            self.last_tool = _CV_TOOL if using_tool and cached.get("used_tool") else None
+            log(f"LLM role={role} status=cache_hit")
+            return result
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+        from openai import APIStatusError, OpenAI
+
+        max_output = _LLM_ROLES[role][1]
+        tools = _llm_tools(schema) if using_tool else []
+        serialized = _llm_request_text(messages, tools)
+        if sum(len(message["content"]) for message in messages) > _LLM_INPUT_LIMIT:
+            self.last_reason = "input_limit"
+            return None
+        estimated_input = math.ceil(len(serialized) / 3.5) + 24
+        reserved_input = max(estimated_input, len(serialized.encode("utf-8")) + _LLM_REQUEST_OVERHEAD)
+        for attempt in range(2):
+            if deadline - time.monotonic() <= 5:
+                self.last_reason = "deadline"
+                return None
+            if not self.ledger.allows(role, reserved_input, max_output):
+                self.last_reason = "token_budget"
+                log(f"LLM role={role} status=skipped reason=token_budget")
+                return None
+            options = {}
+            if self.extra_supported:
+                options["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            if tools:
+                options.update(tools=tools, tool_choice={"type": "function", "function": {"name": _CV_TOOL}})
             try:
                 with OpenAI(base_url=os.environ["OPENAI_BASE_URL"], api_key=os.environ["OPENAI_API_KEY"],
                             timeout=min(90, deadline-time.monotonic()), max_retries=0) as client:
-                    log(f"LLM_REQUEST kind={kind} thinking_flag={self.extra_supported} tool_requested={using_tool}")
                     response = client.chat.completions.create(
-                        model=os.environ["OPENAI_MODEL"], max_tokens=4096, **extra,
-                        messages=[{"role":"system","content":prompt+" Return only a JSON object."},
-                                  {"role":"user","content":json.dumps(payload,ensure_ascii=False,default=str)}])
-                choice = response.choices[0]
-                message = choice.message
-                finish = getattr(choice, "finish_reason", None)
-                calls = getattr(message, "tool_calls", None) or []
-                log(f"LLM_RESPONSE kind={kind} tool_calls={len(calls)} finish_reason={finish}")
-                raw = message.content or ""
-                self.last_reason = "invalid_tool_arguments" if calls else (
-                    "text_only" if raw else f"empty_content_{finish}")
-                if using_tool and len(calls) == 1 and calls[0].function.name == _CV_TOOL:
-                    raw = calls[0].function.arguments
-                    result = parse_model_object(raw)
-                    self.last_tool = _CV_TOOL
-                    return result
-                if calls:
-                    raise ValueError("Unexpected tool call")
-                return parse_model_object(raw)
-            except BadRequestError:
-                log(f"LLM_ERROR kind={kind} retry_without_thinking={self.extra_supported}")
-                log_error()
-                if self.extra_supported:
+                        model=model, max_tokens=max_output, messages=messages, **options)
+            except APIStatusError as error:
+                status = error.status_code
+                body = getattr(error, "body", None)
+                detail = (str(error) + " " + str(body)).lower()
+                quota_errors = ("insufficient_quota", "quota_exceeded", "rate_limit", "context_length_exceeded",
+                                "token_limit", "maximum context length", "tokens per minute")
+                if status == 429 or any(code in detail for code in quota_errors):
+                    self.ledger.charge(role, reserved_input, 0)
+                    self._disable("rate_or_token_limit")
+                    return None
+                if status == 400 and self.extra_supported and attempt == 0:
+                    # A rejected request has no completion. Charge its reserved input
+                    # before checking the budget again for the sole compatibility retry.
+                    self.ledger.charge(role, reserved_input, 0)
                     self.extra_supported = False
                     continue
-                if using_tool:
-                    self.tools_supported = False
-                    continue
-                self.enabled = False
-                self.last_reason = "request_rejected"
-                return None
-            except (ValueError, IndexError):
-                log(f"LLM_ERROR kind={kind} invalid_response=True")
-                log("LLM_RAW " + json.dumps(redact(str(raw))[:500], ensure_ascii=False))
-                log_error()
+                self.ledger.charge(role, reserved_input, 0)
+                self._disable(f"http_{status}")
                 return None
             except Exception:
-                log(f"LLM_ERROR kind={kind} unavailable=True")
-                log_error()
-                self.enabled = False
-                self.last_reason = "sdk_error"
+                self.ledger.charge(role, reserved_input, max_output)
+                self._disable("sdk_error")
                 return None
+
+            usage = getattr(response, "usage", None)
+            actual_in = getattr(usage, "prompt_tokens", None)
+            actual_out = getattr(usage, "completion_tokens", None)
+            self.ledger.charge(role, actual_in if type(actual_in) is int and actual_in >= 0 else reserved_input,
+                               actual_out if type(actual_out) is int and actual_out >= 0 else max_output)
+            if min(self.ledger.remaining(role)) < 0:
+                self._disable("reported_usage_exceeded_budget")
+                return None
+            try:
+                message = response.choices[0].message
+                calls = getattr(message, "tool_calls", None) or []
+                if calls:
+                    if not using_tool or len(calls) != 1 or calls[0].function.name != _CV_TOOL:
+                        raise ValueError("Unexpected LLM tool")
+                    value = json.loads(calls[0].function.arguments)
+                else:
+                    value = json.loads(message.content)
+                result = _validate_llm_object(value, schema)
+            except (ValueError, IndexError, TypeError, AttributeError):
+                self.last_reason = "invalid_json_or_schema"
+                log(f"LLM role={role} status=fallback reason=invalid_json_or_schema")
+                return None
+            self.last_tool = _CV_TOOL if calls else None
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, delete=False) as write:
+                    staged = Path(write.name)
+                    json.dump({"result": result, "used_tool": bool(calls)}, write, ensure_ascii=False)
+                try:
+                    staged.replace(path)
+                finally:
+                    staged.unlink(missing_ok=True)
+            except OSError:
+                log(f"LLM role={role} status=cache_unavailable")
+            return result
         return None
 
 
-def serve_research_model(directory, stop):
-    model = ResearchModel()
+def serve_research_model(directory, stop, model=None):
+    model = model or ResearchModel()
     while not stop.wait(.1):
         for request in directory.glob("*.request"):
             try:
@@ -277,7 +460,7 @@ def hypothesis(model, task, spec, columns, trials, deadline):
                        "Choose a model from available_backends. Optional boolean flags: auto_features, "
                        "event_activity, causal_history, hourly_extended, log_target, mae_shift. The last two are for MAE only. "
                        "Use prior results and avoid any configuration already tried.",
-                       {"task":task[:6000],"spec":spec,"features":columns[:150],"trials":trials}, deadline)
+                       {"task":task[:6000],"spec":spec,"features":columns[:60],"trials":trials[-10:]}, deadline)
     flags = _CV_FLAGS
     if (config and set(config) <= flags | {"model"} and config.get("model") in spec.get("available_backends", _BACKENDS)
             and all(type(config[k]) is bool for k in flags & config.keys())):
@@ -289,8 +472,8 @@ def hypothesis(model, task, spec, columns, trials, deadline):
 def run_agent(task_path, directory, deadline):
     from pipeline import output_directory, schema_fallback, check_result
     from postgres_loader import _local_sample
+    output = output_directory.set(str(task_path.parent))
     try:
-        output_directory.set(str(task_path.parent))
         task = task_path.read_text(encoding="utf-8-sig")
         template = _local_sample(task_path, task)
         if template:
@@ -301,6 +484,8 @@ def run_agent(task_path, directory, deadline):
         log_error()
         if not published_result(task_path.parent / "submission.csv"):
             raise
+    finally:
+        output_directory.reset(output)
 
 
 _STAGE_B_FEATURES = ("interval_features", "event_calendar", "fold_preprocess")
@@ -597,6 +782,23 @@ def research(task_path, directory, deadline):
         failed_trial = {"config": baseline_trial, "status": "baseline failed"}
     log_phase("safety_model", safety_started, budget=quick * (2 if failed_trial else 1),
               reason="model_completed" if baseline else "no_completed_model")
+    blend_estimate = min(90., quick)
+    last_checkpoint = safety_started
+
+    def checkpoint():
+        nonlocal blend_estimate, last_checkpoint
+        history = experiment_history(directory)
+        if sum(bool(h.get("preds_file")) and h.get("quality_flags_pass") is not False
+               for h in history if h.get("recipe") != "ensemble") < 2:
+            return
+        started = time.monotonic()
+        blend = run_trial(directory, spec, fit_deadline, 120., recipe="ensemble", estimate=blend_estimate)
+        last_checkpoint = time.monotonic()
+        if blend:
+            blend_estimate = max(2., blend["elapsed_seconds"])
+        log_phase("ensemble", started, budget=120., reason="blend_evaluated" if blend else "no_result",
+                  checkpoint=True, saved=bool(blend and blend["saved"]))
+
     variant_started = time.monotonic()
     variants = choose_variant(spec, baseline, include_losses=False)
     losses_scheduled = False
@@ -636,6 +838,9 @@ def research(task_path, directory, deadline):
             from_llm = True
             if not config:
                 log("LLM_HYPOTHESIS status=no_valid_config")
+                if model.last_reason == "invalid_json_or_schema":
+                    llm_reason = model.last_reason
+                    break
                 unusable += 1
                 if unusable >= 2:
                     llm_reason = model.last_reason or "no_valid_tool_configuration"
@@ -672,6 +877,8 @@ def research(task_path, directory, deadline):
                 winner = config
         else:
             trials.append({"config":config, "status":"skipped or failed"})
+        if search_enabled and time.monotonic() - last_checkpoint >= _CHECKPOINT_INTERVAL:
+            checkpoint()
         if unusable >= 2:
             llm_reason = "consecutive_incomplete_trials"
             break
@@ -702,21 +909,7 @@ def research(task_path, directory, deadline):
                   queue=(report or {}).get("auto_stop"))
         if report and report["saved"]:
             winner = candidate
-    blend_estimate = min(90., quick)
     if search_enabled and baseline and baseline["complete"]:
-        def checkpoint():
-            nonlocal blend_estimate
-            history = experiment_history(directory)
-            if sum(bool(h.get("preds_file")) and h.get("quality_flags_pass") is not False
-                   for h in history if h.get("recipe") != "ensemble") < 2:
-                return
-            started = time.monotonic()
-            blend = run_trial(directory, spec, fit_deadline, 120., recipe="ensemble", estimate=blend_estimate)
-            if blend:
-                blend_estimate = max(2., blend["elapsed_seconds"])
-            log_phase("ensemble", started, budget=120., reason="blend_evaluated" if blend else "no_result",
-                      checkpoint=True, saved=bool(blend and blend["saved"]))
-
         checkpoint()
         started = time.monotonic()
         search = search_remaining_budget(directory, spec, deadline, baseline, winner, tested,
@@ -757,10 +950,13 @@ def main():
     with publication_run() as proofs, tempfile.TemporaryDirectory(prefix="tyrell-data-") as directory:
         cmd = worker_command(Path(__file__).resolve(), deadline, [str(task), directory, proofs])
         stop = threading.Event()
-        if ResearchModel().enabled:
+        llm = ResearchModel()
+        broker = None
+        if llm.enabled:
             mailbox = Path(directory) / "research"
             mailbox.mkdir()
-            threading.Thread(target=serve_research_model, args=(mailbox, stop), daemon=True).start()
+            broker = threading.Thread(target=serve_research_model, args=(mailbox, stop, llm), daemon=True)
+            broker.start()
         env = {k:v for k,v in os.environ.items() if not k.upper().startswith("OPENAI_")}
         if env.get("TYRELL_OOF_DIR"):
             archive = Path(env["TYRELL_OOF_DIR"]).resolve()
@@ -774,9 +970,12 @@ def main():
             code = supervised_exit(cmd, deadline + shutdown, env=env)
         finally:
             stop.set()
+            if broker:
+                broker.join(timeout=1.)
+            llm.report_usage()
         output = task.parent / "submission.csv"
         receipt = published_result(output)
-        from pipeline import experiment_history, output_directory, schema_fallback, verify_template_output
+        from pipeline import experiment_history, schema_fallback, verify_template_output
         from postgres_loader import _local_sample
         task_text = task.read_text(encoding="utf-8-sig")
         sample = _local_sample(task, task_text) or Path(directory) / "sample_submission.csv"
@@ -789,7 +988,6 @@ def main():
             log("No validated predictions published by this run")
             return code or 1
         if receipt["state"] == "MODEL_SUCCESS":
-            output_directory.set(str(task.parent))
             saved = [item for item in experiment_history(directory) if item["saved"]]
             if saved:
                 winner = saved[-1]
@@ -797,8 +995,10 @@ def main():
                     log(f"AP_WINNER recipe={winner['recipe']} config={winner['config']}")
                 for score, baseline in zip(winner["fold_scores"], winner.get("fold_baselines", [])):
                     better = score > baseline["score"] if winner["greater_is_better"] else score < baseline["score"]
+                    constant = baseline["constant"]
+                    constant = f"{constant:.6f}" if isinstance(constant, (int, float)) else json.dumps(constant, separators=(",", ":"))
                     log(f"CV_AUDIT metric={winner['metric']} fold={baseline['fold']} model={score:.6f} "
-                        f"baseline={baseline['score']:.6f} constant={baseline['constant']:.6f} "
+                        f"baseline={baseline['score']:.6f} constant={constant} "
                         f"train_rows={baseline['train_rows']} validation_rows={baseline['validation_rows']} "
                         f"model_beats_baseline={better}")
         print(f"SUBMISSION_STATE={receipt['state']} score={receipt.get('score')}", flush=True)

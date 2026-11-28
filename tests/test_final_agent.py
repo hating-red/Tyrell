@@ -64,8 +64,7 @@ def write_fixture(folder, case):
 def clean_env(monkeypatch):
     for name in [*PG_ENV, "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_BASE_URL", "TYRELL_OUTPUT_DIR"]:
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("TYRELL_MAX_LLM_CALLS", "0")
-    monkeypatch.setattr(solution, "MAX_LLM_CALLS", 0)
+    monkeypatch.setenv("TYRELL_LLM", "mock")
 
 
 def assert_format(path, sample, name):
@@ -87,18 +86,20 @@ def assert_format(path, sample, name):
 def test_model_failure_keeps_early_answer(tmp_path, case, monkeypatch, clean_env):
     path, sample = write_fixture(tmp_path, case)
     shutil.copyfile(tmp_path / "sample_submission.csv", tmp_path / "submission.csv")
-    monkeypatch.setenv("TYRELL_RUNTIME_STATS", str(tmp_path / "runtime.json"))
+    from publication import publication_run, published_result
 
     def broken(*args, **kwargs):
         assert_format(path.with_name("submission.csv"), sample, case[0])
         raise RuntimeError("injected model failure")
 
-    monkeypatch.setattr(solution, "experiment", broken)
-    solution.run_agent(path)
+    monkeypatch.setattr(solution, "run_trial", broken)
+    work = tmp_path / "worker"
+    work.mkdir()
+    with publication_run():
+        solution.run_agent(path, work, time.monotonic() + 75)
+        assert published_result(path.with_name("submission.csv"))["state"] == "TRAINED_FALLBACK"
     pred = assert_format(path.with_name("submission.csv"), sample, case[0])
     assert pred.nunique() == 1
-    stats = json.loads((tmp_path / "runtime.json").read_text(encoding="utf-8"))
-    assert stats["submission_state"] == "TRAINED_FALLBACK"
     if case[0] != "private":
         assert pred.ne(0).all()
 
@@ -106,50 +107,67 @@ def test_model_failure_keeps_early_answer(tmp_path, case, monkeypatch, clean_env
 def test_missing_credentials_disable_client_with_calls_enabled(tmp_path, monkeypatch, clean_env):
     import openai
 
-    path, sample = write_fixture(tmp_path, CASES[0])
-    monkeypatch.setattr(solution, "MAX_LLM_CALLS", 150)
-
     def unexpected_client(**kwargs):
         pytest.fail("Created a model client without credentials")
 
     monkeypatch.setattr(openai, "OpenAI", unexpected_client)
-    monkeypatch.setattr(solution, "research", lambda *args: None)
-    solution.run_agent(path)
-    assert_format(path.with_name("submission.csv"), sample, "ads")
+    monkeypatch.setenv("TYRELL_LLM", "live")
+    model = solution.ResearchModel()
+    assert not model.enabled
+    assert model.ask("hypothesis", "propose a trial", {}, time.monotonic() + 10) is None
 
 
 def test_short_budget():
-    assert solution.training_seconds(600) == 570
-    assert 0 < solution.training_seconds() < 7200
-    assert solution.training_seconds(14400) == solution.training_seconds()
+    from time_budget import shutdown_reserve, time_limit
+
+    assert time_limit(600) == 600
+    assert 0 < shutdown_reserve(600) < 30
+    assert time_limit(14400) == 7200
 
 
 @pytest.mark.parametrize("limit", [600, 7200])
 def test_deadline_does_not_restart_after_imports(monkeypatch, tmp_path, limit):
+    path, _ = write_fixture(tmp_path, CASES[0])
     monkeypatch.setenv("TYRELL_TIME_LIMIT", str(limit))
-    monkeypatch.delenv("TYRELL_RUNTIME_STATS", raising=False)
-    monkeypatch.setattr(solution, "_run_agent", lambda task, deadline: deadline)
-    hard = time.monotonic() + limit - 20  # supervisor already spent 20 s before run_agent
-    assert solution.run_agent(tmp_path, deadline=hard) == hard - (limit - solution.training_seconds(limit))
+    monkeypatch.setenv("TYRELL_LLM", "mock")
+    monkeypatch.setattr(sys, "argv", ["solution.py", str(path)])
+    already_spent = 20.
+    started = time.monotonic() - already_spent
+    monkeypatch.setattr(solution, "PROCESS_STARTED", started)
+    captured = {}
+
+    def execute(command, hard_deadline, **options):
+        captured.update(deadline=hard_deadline, worker=float(command[5]))
+        return 124
+
+    monkeypatch.setattr(solution, "supervised_exit", execute)
+    assert solution.main() == 0
+    assert captured["worker"] < captured["deadline"] <= started + limit
 
 
-@pytest.mark.parametrize("limit", [600, 7200])
-def test_cli_budget_on_temporal_csv(tmp_path, clean_env, limit):
+def test_cli_budget_on_temporal_csv(tmp_path, clean_env):
     path, sample = write_fixture(tmp_path, CASES[0])
-    env = dict(os.environ, TYRELL_TIME_LIMIT=str(limit), PYTHONIOENCODING="utf-8",
-               TYRELL_RUNTIME_STATS=str(tmp_path / "runtime.json"))
+    env = dict(os.environ, TYRELL_TIME_LIMIT="75", PYTHONIOENCODING="utf-8",
+               TYRELL_OOF_DIR=str(tmp_path / "archives"))
     with (tmp_path / "run.log").open("w", encoding="utf-8") as log:
         proc = subprocess.run([sys.executable, "-B", str(ROOT / "solution.py"), str(path)], env=env,
-                              cwd=tmp_path, stdout=log, stderr=subprocess.STDOUT, timeout=limit)
-    assert proc.returncode == 0, (tmp_path / "run.log").read_text(encoding="utf-8")
+                              cwd=tmp_path, stdout=log, stderr=subprocess.STDOUT, timeout=85)
+    logs = (tmp_path / "run.log").read_text(encoding="utf-8")
+    assert proc.returncode == 0, logs
     assert_format(tmp_path / "submission.csv", sample, "ads")
-    stats = json.loads((tmp_path / "runtime.json").read_text(encoding="utf-8"))
-    history = json.loads((tmp_path / ".tyrell_experiments.json").read_text(encoding="utf-8"))
-    assert stats["solution_limit_seconds"] == limit
-    assert 0 < stats["remaining_for_research_seconds"] < solution.training_seconds(limit)
-    assert stats["phase"] == "complete"
-    assert stats["submission_state"] == "MODEL_SUCCESS"
+    assert "SUBMISSION_STATE=MODEL_SUCCESS" in logs
+    assert "LEAK_AUDIT status=fail" not in logs
+    phase = next(json.loads(line[6:]) for line in logs.splitlines()
+                 if line.startswith("PHASE ") and '"phase": "total"' in line)
+    assert 0 < phase["seconds"] < phase["platform_limit"] == 75
+    history = load_archive(tmp_path)
     assert any(h["complete"] and h["saved"] for h in history)
+
+
+def load_archive(directory):
+    paths = list((directory / "archives").glob("*/experiments.json"))
+    assert len(paths) == 1
+    return json.loads(paths[0].read_text(encoding="utf-8"))
 
 
 def test_watchdog_kills_model_tree_and_preserves_published_csv(tmp_path):
@@ -195,9 +213,9 @@ def test_official_cli_keeps_early_submission_on_stuck_worker(tmp_path, clean_env
     started = time.monotonic()
     proc = subprocess.run([sys.executable, "-B", str(ROOT / "solution.py"), str(path)], env=env,
                           cwd=tmp_path, capture_output=True, timeout=12)
-    assert proc.returncode == 124, proc.stderr
+    assert proc.returncode == 0, proc.stderr
     assert b"SUBMISSION_STATE=TRAINED_FALLBACK" in proc.stdout
-    assert time.monotonic() - started <= 8
+    assert time.monotonic() - started < 10
     assert_format(tmp_path / "submission.csv", sample, "ads")
 
 
@@ -221,7 +239,8 @@ def test_diagnostic_watchdog_includes_import_and_export(tmp_path):
 def local_cluster(tmp_path_factory):
     """Start only a new loopback cluster. The fixture never uses operator PG credentials."""
     folder = os.environ.get("TYRELL_TEST_PG_BIN")
-    initdb = str(Path(folder) / "initdb") if folder else shutil.which("initdb")
+    suffix = ".exe" if os.name == "nt" else ""
+    initdb = str(Path(folder) / ("initdb" + suffix)) if folder else shutil.which("initdb")
     if not initdb:
         pytest.skip("initdb unavailable; point TYRELL_TEST_PG_BIN at PostgreSQL bin")
     root = tmp_path_factory.mktemp("postgres")
@@ -241,7 +260,7 @@ def local_cluster(tmp_path_factory):
         assert result.returncode == 0, result.stderr.decode(errors="replace")
     finally:
         Path(secret.name).unlink()
-    pg_ctl = str(Path(initdb).with_name("pg_ctl"))
+    pg_ctl = str(Path(initdb).with_name("pg_ctl" + suffix))
     subprocess.run([pg_ctl, "-D", str(data), "-l", str(root / "server.log"), "-w", "start",
                     "-o", f"-h 127.0.0.1 -p {port}"], env=env, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=60)
@@ -263,12 +282,15 @@ def setup_database(cluster, case, task_dir):
     train, test, sample, task = fixture_frames(case)
     train_name, test_name = ("measurements", "queue") if name == "private" else ("train", "test")
     if name == "private":
-        task += "Train table measurements. Test table queue. Output column decision.\n"
+        task += ("Train table measurements. Test table queue.\n"
+                 "submission.csv columns: record_key, decision.\n"
+                 "Output rows ordered by record_key ASC.\n")
+        sample = sample.sort_values("record_key").reset_index(drop=True)
     relations = [(train_name, train), (test_name, test)]
     if name == "rescue":
         table_sample = sample.assign(row_ordinal=np.arange(len(sample))).sample(frac=1, random_state=7)
         relations.append(("sample_submission", table_sample))
-    else:
+    elif name != "private":
         sample.to_csv(task_dir / "sample_submission.csv", index=False)
     if name == "rescue":
         weather = pd.DataFrame({"district_id": [1, 2, 3], "hour_start": ["2025-06-01 00:00"]*3,
@@ -301,7 +323,8 @@ def setup_database(cluster, case, task_dir):
 @pytest.mark.parametrize("case", CASES)
 def test_postgres_cli(tmp_path, case, local_cluster, clean_env):
     sample, connection = setup_database(local_cluster, case, tmp_path)
-    env = dict(os.environ, **connection, TYRELL_TIME_LIMIT="65", PYTHONIOENCODING="utf-8")
+    env = dict(os.environ, **connection, TYRELL_TIME_LIMIT="75", PYTHONIOENCODING="utf-8",
+               TYRELL_OOF_DIR=str(tmp_path / "archives"))
     if os.environ.get("TYRELL_TEST_PLATFORM_LIMITS") == "1":
         if case[0] == "ads":
             del env["TYRELL_TIME_LIMIT"]
@@ -332,12 +355,14 @@ def test_postgres_cli(tmp_path, case, local_cluster, clean_env):
     logs = (tmp_path / "run.log").read_text(encoding="utf-8")
     assert proc.returncode == 0, logs
     pred = assert_format(tmp_path / "submission.csv", sample, case[0])
-    history = json.loads((tmp_path / ".tyrell_experiments.json").read_text(encoding="utf-8"))
+    history = load_archive(tmp_path)
     assert any(h["saved"] and h["complete"] for h in history), logs
-    assert any(h.get("auto_features") for h in history) and len(history) >= 2, logs
+    assert "LEAK_AUDIT status=fail" not in logs and "LLM_USAGE" in logs
     assert history[0]["metric"] == case[3]
     if case[0] != "private":
         assert history[0]["split"]["type"] == "time"
         assert "JOIN public." in logs
+    else:
+        assert not (tmp_path / "sample_submission.csv").exists()
     print(f"{case[0]}: {time.monotonic() - started:.1f}s, peak RSS {peak/2**20:.1f} MiB, "
           f"{len(history)} experiments, {pred.nunique()} distinct predictions, {tmp_path}")

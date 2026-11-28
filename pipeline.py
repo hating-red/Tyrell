@@ -18,7 +18,8 @@ limit_openmp()
 import numpy as np
 import pandas as pd
 
-from data_tools import INTERVAL_FEATURE_SUFFIXES, detect_split, load_data, parse_event_datetime, label_available_at
+from data_tools import (INTERVAL_FEATURE_SUFFIXES, REFERENCE_DATE_SUFFIX, detect_split, load_data,
+                        parse_event_datetime, label_available_at)
 from publication import MODEL_SUCCESS, TRAINED_FALLBACK, SCHEMA_FALLBACK, csv_digest, prepare_publication, receipt_directory
 from submission import make_submission, validate_submission
 
@@ -69,10 +70,14 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
     audited = task_spec.get("audit_required", False)
     if audited and feature_code:
         raise LeakAuditError("custom transforms are not certified for audited folds")
-    split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"),
+    train, test = data["X_train"], data["X_test"]
+    reference_dates = [name for name in train if name.endswith(REFERENCE_DATE_SUFFIX)]
+    split_train = train.drop(columns=reference_dates) if reference_dates else train
+    split_test = test.drop(columns=reference_dates) if reference_dates else test
+    split = detect_split(split_train, split_test, time_column=task_spec.get("time_column"),
                          group_column=task_spec.get("group_column"))
     temporal = (split or {}).get("type") == "time"
-    X_train, X_test = data["X_train"].reset_index(drop=True), data["X_test"].reset_index(drop=True)
+    X_train, X_test = train.reset_index(drop=True), test.reset_index(drop=True)
     if temporal:
         clock = split["column"]
         if feature_code:
@@ -89,7 +94,8 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
     interval_features = bool(cfg.pop("interval_features", False))
     dropped = [name for name in X_train if
                (audited and not hourly_extended and name.endswith(_HOURLY_SUFFIXES)) or
-               (not interval_features and name.endswith(INTERVAL_FEATURE_SUFFIXES))]
+               (not interval_features and name.endswith(INTERVAL_FEATURE_SUFFIXES)) or
+               (name in reference_dates and not (temporal and cfg.get("fold_preprocess")))]
     if dropped:
         X_train, X_test = X_train.drop(columns=dropped), X_test.drop(columns=dropped)
     auto_features = bool(cfg.pop("auto_features", False))
@@ -216,6 +222,11 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
     }
     if "auto_stop" in result:
         report["auto_stop"] = result["auto_stop"]
+    if cfg.get("profile_categories"):
+        report["category_probes"] = result.get("category_probes")
+    for key in ("model_inputs", "fold_diagnostics"):
+        if key in result:
+            report[key] = result[key]
     return _record(task_dir, task_spec, data, history, result, report)
 
 
@@ -260,7 +271,8 @@ def _archive_metadata(result):
     return {"effective_model": cfg.get("model"), "effective_params": cfg.get("params"),
             "effective_seed": cfg.get("seed"), "effective_class_weight": cfg.get("class_weight"),
             "best_iterations": result.get("best_iterations", []), "fold_baselines": cfg.get("fold_baselines", []),
-            "fold_windows": cfg.get("fold_windows", []), "target_bounds": result.get("target_bounds"),
+            "fold_windows": cfg.get("fold_windows", []), "early_stopping_windows": cfg.get("early_stopping_windows", []),
+            "target_bounds": result.get("target_bounds"),
             "fold_target_bounds": result.get("fold_target_bounds"), "integer_target": result.get("integer_target"),
             "fold_integer_target": result.get("fold_integer_target"), "postprocess": result.get("postprocess")}
 
@@ -314,27 +326,24 @@ def _record(task_dir, task_spec, data, history, result, report):
                 {"fold_scores": previous["fold_scores"], "greater_is_better": previous["greater_is_better"]},
                 {"fold_scores": result["fold_scores"], "greater_is_better": result["greater_is_better"]},
             )
-        better = (complete and not previous["complete"]) or (same_folds and comparison["accept"])
-        if same_folds and baselines and previous.get("fold_baselines"):
-            incumbent_wins = _beats_fold_baselines(previous["fold_scores"], previous["fold_baselines"], greater)
-            candidate_wins = _beats_fold_baselines(result["fold_scores"], baselines, greater)
-            if incumbent_wins != candidate_wins:
-                # Clearing every baseline is a release criterion. A new ensemble still
-                # has to improve the incumbent's mean and a majority of its folds.
-                blend_improves = (comparison["n_better"] > n_folds / 2 and comparison["diff_mean"] > 0)
-                better = candidate_wins and complete and (report.get("recipe") != "ensemble" or blend_improves)
-        if report.get("config", {}).get("ad_history"):
-            better = bool(better and same_folds and comparison["n_better"] > n_folds / 2)
-        if report.get("recipe") == "ensemble":
-            candidate = {"fold_signature": signature, "fold_scores": result["fold_scores"],
-                         "greater_is_better": greater, "fold_baselines": baselines}
-            better = complete and same_folds and _passes_quality_gate(previous, candidate, compare_results)
-            if (complete and same_folds and (report.get("refit") or {}).get("same_incumbent")
-                    and np.array_equal(previous["fold_scores"], result["fold_scores"])):
-                better = True
-        if task_spec.get("audit_required") and any(report.get("config", {}).get(key)
-                                                  for key in ("event_activity", "causal_history", "auto_features", "hourly_extended")):
-            better = bool(better and comparison and comparison["n_better"] > n_folds / 2)
+        candidate = {"fold_signature": signature, "fold_scores": result["fold_scores"],
+                     "greater_is_better": greater, "fold_baselines": baselines}
+        if task_spec.get("audit_required") or report.get("recipe") == "ensemble":
+            better = complete and (not previous["complete"] or
+                                   _passes_quality_gate(previous, candidate, compare_results))
+        else:
+            better = (complete and not previous["complete"]) or (same_folds and comparison["accept"])
+            if same_folds and baselines and previous.get("fold_baselines"):
+                old_wins = _beats_fold_baselines(previous["fold_scores"], previous["fold_baselines"], greater)
+                new_wins = _beats_fold_baselines(result["fold_scores"], baselines, greater)
+                if old_wins != new_wins:
+                    better = new_wins and complete
+            if report.get("config", {}).get("ad_history"):
+                better = bool(better and same_folds and comparison["n_better"] > n_folds / 2)
+        if (report.get("recipe") == "ensemble" and complete and same_folds
+                and (report.get("refit") or {}).get("same_incumbent")
+                and np.array_equal(previous["fold_scores"], result["fold_scores"])):
+            better = True
         if task_spec.get("audit_required") and report.get("recipe") != "ensemble":
             from training import DEFAULT_CONFIG
 
@@ -355,11 +364,13 @@ def _record(task_dir, task_spec, data, history, result, report):
                 candidate = {"fold_signature": signature, "fold_scores": result["fold_scores"],
                              "greater_is_better": greater, "fold_baselines": baselines}
                 quality_pass = bool(complete and control and _passes_quality_gate(control, candidate, compare_results))
-                better = quality_pass and _passes_quality_gate(previous, candidate, compare_results)
+                better = quality_pass and (not previous["complete"] or
+                                           _passes_quality_gate(previous, candidate, compare_results))
                 gains = (compare_results(control, candidate)["diffs"] if control and
                          signature == control.get("fold_signature") else None)
                 quality_audit = {"flags": {key: config[key] for key in trial_flags},
-                                 "paired_fold_gains": gains, "accepted": quality_pass}
+                                 "paired_fold_gains": gains, "accepted": quality_pass, "reason": ("passed" if quality_pass else
+                                     "missing_paired_control" if control is None else "paired_gate")}
                 print("QUALITY_FLAGS " + json.dumps(quality_audit), file=sys.stderr, flush=True)
     preds_file = (_archive_oof(task_dir, result, str(len(history)))
                   if complete and "fold_ids" in result else None)

@@ -57,11 +57,11 @@ def test_pipeline_journal_preserves_folds_and_applied_features(tmp_path, monkeyp
     monkeypatch.delenv("TYRELL_OUTPUT_DIR", raising=False)
     spec = {"target_column": "target", "id_columns": ["event_id"], "time_column": "date",
             "task_type": "binary", "probabilities": True, "metric": "pr_auc", "positive_class": 1}
-    config = {"params": {"n_estimators": 6}}
+    config = {"params": {"n_estimators": 6}, "profile_categories": True}
     control = run_experiment(tmp_path, spec, config, time_budget=25)
     candidate = run_experiment(tmp_path, spec, config | {flag: True, "refit_full": True}, time_budget=25)
     assert candidate["complete"] and candidate["config"][flag]
-    assert candidate["cv_audit"]["membership_signature"] == control["cv_audit"]["membership_signature"]
+    assert candidate["fold_windows"] == control["fold_windows"]
     assert candidate["fold_signature"] == control["fold_signature"]
     assert "site_id" in control["feature_candidates"][flag]
     assert candidate["model_inputs"][added]["model_dtype"] == ("category" if flag == "categorical_ids" else "float64")
@@ -69,8 +69,8 @@ def test_pipeline_journal_preserves_folds_and_applied_features(tmp_path, monkeyp
     probes = control["category_probes"]["columns"]["site_id"]
     assert len(probes) == 5 and all(p["ap"] > p["baseline"] for p in probes)
     for probe, window, monitor in zip(probes, control["fold_windows"], control["early_stopping_windows"]):
-        fit = data.site_id[data.date <= pd.Timestamp(monitor["fit_max"])]
-        rows = data.loc[data.date >= pd.Timestamp(window["validation_min"]), "site_id"].iloc[:window["validation_rows"]]
+        fit = data.site_id[data.date <= pd.to_datetime(monitor["fit_max"], utc=True)]
+        rows = data.loc[data.date >= pd.to_datetime(window["validation_min"], utc=True), "site_id"].iloc[:window["validation_rows"]]
         delta = fit.value_counts(normalize=True).sub(rows.value_counts(normalize=True), fill_value=0.)
         assert probe["frequency_total_variation"] == pytest.approx(delta.abs().sum() / 2)
         assert probe["unseen_nonmissing_share"] == pytest.approx((~rows.isin(fit)).mean())

@@ -1,53 +1,46 @@
-from types import SimpleNamespace
-
 import pytest
 
-import paired_research
+import pipeline
 import solution
+import training
+from test_final_agent import CASES, assert_format, write_fixture
 
 
-@pytest.mark.parametrize(("outcomes", "expected"), [
-    (["saved"], ["lightgbm"]),
-    (["crash", "saved"], ["lightgbm", "xgboost"]),
-    (["timeout", "not_saved", "saved"], ["lightgbm", "xgboost", "catboost"]),
-    (["exception", "crash", "crash"], ["lightgbm", "xgboost", "catboost"]),
+@pytest.mark.parametrize(("completed_on", "expected"), [
+    ("lightgbm", ["lightgbm"]),
+    ("catboost", ["lightgbm", "catboost"]),
+    ("xgboost", ["lightgbm", "catboost", "xgboost"]),
+    (None, ["lightgbm", "catboost", "xgboost"]),
 ])
-def test_retry_only_unpublished_initial_model(tmp_path, monkeypatch, outcomes, expected):
-    clock = [1000.]
-    deadline = clock[0] + 570
-    calls, controls, searches = [], [], []
-    accepted = {"saved": True, "fit_time": 1.}
-    monkeypatch.setattr(solution, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(solution, "TOTAL_SECONDS", 570.)
-    monkeypatch.delenv("TYRELL_PAIR_ARM", raising=False)
-    monkeypatch.delenv("TYRELL_DIAGNOSTIC_ABLATIONS", raising=False)
+def test_only_an_unsuccessful_safety_model_tries_the_next_backend(tmp_path, monkeypatch, completed_on, expected):
+    task, sample = write_fixture(tmp_path, CASES[0])
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.delenv("PGDATABASE", raising=False)
+    monkeypatch.setenv("TYRELL_LLM", "mock")
+    monkeypatch.setattr(solution.time, "monotonic", lambda: 1000.)
+    monkeypatch.setattr(training, "backend_available", lambda name, **_: name in solution._BACKENDS)
+    monkeypatch.setattr(pipeline, "experiment_history", lambda _: [])
+    monkeypatch.setattr(solution, "_loss_variants", lambda *args: [])
+    calls, controls = [], []
 
-    def run(task_dir, spec, budget, recipe="single", config=None, *, deadline):
-        if recipe == "auto":
-            return None, {"exit_code": 86}
-        backend = (config or {}).get("model", "lightgbm")
-        assert 1 <= budget <= deadline - clock[0]
-        assert deadline <= 1540.  # preserve the final reserve
-        outcome = outcomes[len(calls)]
-        calls.append(backend)
-        if outcome == "timeout":
-            clock[0] = deadline
-            return None, {"error": "worker timeout"}
-        if outcome == "exception":
-            raise OSError("worker could not start")
-        if outcome == "not_saved":
-            return {"saved": False}, {}
-        if outcome == "crash":
-            return None, {"exit_code": 86}
-        return accepted, {}
+    def variants(spec, baseline, **kwargs):
+        controls.append(baseline)
+        return []
 
-    monkeypatch.setattr(solution, "experiment", run)
-    monkeypatch.setattr(solution, "choose_variant", lambda path, spec, base, deadline: controls.append(base))
-    monkeypatch.setattr(solution, "checkpoint_history", lambda path: [])
-    monkeypatch.setattr(solution, "search_remaining_budget", lambda *args: searches.append("extra"))
-    monkeypatch.setattr(paired_research, "run_paired_search", lambda *args: searches.append("paired"))
-    solution.research(tmp_path, {}, "", {}, None, deadline)
+    def run(directory, spec, deadline, budget, config=None, recipe="single", **kwargs):
+        assert deadline <= 1200
+        if recipe == "single":
+            assert_format(worker / "submission.csv", sample, "ads")
+            backend = config["model"]
+            calls.append(backend)
+            if backend == completed_on:
+                return {"saved": True, "complete": True, "fit_time": 2., "fold_scores": [.4] * 5}
+        return None
 
+    monkeypatch.setattr(solution, "choose_variant", variants)
+    monkeypatch.setattr(solution, "run_trial", run)
+    solution.research(task, worker, 1200.)
     assert calls == expected
-    assert controls == [accepted if expected == ["lightgbm"] else None]
-    assert searches == ["paired", "extra"]
+    assert len(controls) == 1
+    assert (controls[0] or {}).get("backend") == completed_on

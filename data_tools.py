@@ -8,6 +8,7 @@ import pandas as pd
 
 
 FILES = ("train.csv", "test.csv", "sample_submission.csv")
+REFERENCE_DATE_SUFFIX = "__reference_date"
 
 
 def _read_files(task_dir):
@@ -435,14 +436,17 @@ def target_constraints(text, target, y, task_type):
     numeric = pd.to_numeric(observed, errors="coerce").dropna()
     spec = {"nonnegative": bool(re.search(r"non[- ]?negative|неотрицательн", text, re.I)
                                 or (len(numeric) and numeric.min() >= 0))}
-    unit = re.search(r"label delay unit\s*:\s*`?(minutes?|hours?)", text, re.I)
+    units = {unit.lower().rstrip("s") + "s"
+             for unit in re.findall(r"label delay unit\s*:\s*`?(minutes?|hours?)", text, re.I)}
     duration = re.search(r"(?:минут\w*|час(?:а|ов)?|minutes?|hours?)\s+(?:от|до|между|until|from|between|to)\b"
                          r"|(?:time|duration|delay)\s+(?:elapsed|until|between|from|to)\b", text, re.I)
     delay_unit = None
     if len(numeric) != len(observed) or not len(numeric) or not np.isfinite(numeric).all() or numeric.min() < 0:
         return spec
-    if unit and (duration or re.search(r"label.*(?:available|observed).*after|метк.*(?:доступн|известн).*после", text, re.I)):
-        delay_unit = "hours" if unit[1].lower().startswith("hour") else "minutes"
+    if len(units) > 1:
+        return spec
+    if units:
+        delay_unit = next(iter(units))
     elif duration:
         part = text[max(0, duration.start()-40):duration.end()+100] + " " + target
         if re.search(r"минут|minute", part, re.I):
@@ -665,6 +669,14 @@ def _temporal_field(table, col):
             or name.endswith(("_date", "_at", "_timestamp", "_time")))
 
 
+def _known_reference_date(table, column):
+    dtype = table.column_types.get(column, "")
+    comment = table.comments.get(column, "")
+    return ((dtype == "date" or "timestamp" in dtype)
+            and not re.search(r"\b(?:not|after|unknown|might)\b|\bне\s|после", comment, re.I)
+            and bool(re.search(r"\bknown (?:strictly )?before (?:the )?event\b|известн\w* до события", comment, re.I)))
+
+
 def _plan_relation(table, train, test, identifier, train_only, task_text, descriptions=None, bridges=None):
     from leak_audit import restricted_inputs
     common = set(train.columns).intersection(test.columns)
@@ -739,8 +751,11 @@ def _plan_relation(table, train, test, identifier, train_only, task_text, descri
     values = []
     for c in table.columns:
         low = c.lower()
+        safe_date = (not hourly and mode in (None, "static_dates") and event_clock in common
+                     and low not in _PUBLICATION_CLOCKS and low not in _VERSION_FIELDS
+                     and _known_reference_date(table, c))
         if (c == right or c == hour_col or c == publication or low in _START_NAMES | _END_NAMES or
-                c in dated_columns or f"{table.name}.{c}" in restrictions or
+                (c in dated_columns and not safe_date) or f"{table.name}.{c}" in restrictions or
                 any(re.search(rf"(?:^|_){re.escape(term)}(?:_|$)", low) for term in blocked)
                 or table.column_types.get(c, "").lower() in unsupported_types):
             continue
@@ -850,6 +865,8 @@ def _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publicatio
                 lookup.loc[unique.index[unique.gt(1)], column] = None
         return lookup.drop_duplicates("__entity", keep="last").set_index("__entity")
     stamps = to_utc_naive(auxiliary.loc[lookup.index, hour_col])
+    if stamps.notna().sum() == 0:
+        raise ValueError("Недоступна граница времени справочника")
     if mode in {"profile", "dated_static", "dated_profile"}:
         lookup["__available"] = stamps
         lookup = lookup.dropna(subset=["__available"]).sort_values("__available", kind="stable")
@@ -1336,6 +1353,10 @@ def enrich_postgres(conn, tables, train, test, id_column, target_column, task_te
                 detail["distinct_lookup_keys"] = int(auxiliary[right].astype("string").nunique())
             lookup = _prepare_lookup(auxiliary, right, hour_col, mode, values, prefix, publication, coalesce=True,
                                      cadence_before=earliest.get(event_col), diagnostics=detail)
+            reference_dates = {prefix + c: prefix + c + REFERENCE_DATE_SUFFIX
+                               for c in values if not hour_col and _known_reference_date(table, c)}
+            if reference_dates:
+                lookup = lookup.rename(columns=reference_dates)
             if mode == "inferred":
                 detail["interval_step"] = str(lookup.attrs["inferred_step"])
                 detail["clock_evidence"] = "within_entity_median_before_first_event"

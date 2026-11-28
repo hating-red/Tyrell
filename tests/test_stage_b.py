@@ -1,3 +1,6 @@
+from contextlib import nullcontext
+from unittest.mock import Mock
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -5,9 +8,10 @@ import pytest
 import pipeline
 import solution
 import training
-from data_tools import _join_chunk, _prepare_lookup, _verify_lookup, guess_task_spec
+from data_tools import _join_chunk, _prepare_lookup, _verify_lookup, enrich_postgres, guess_task_spec
 from features import event_calendar, preprocess_fold, since_positive_drift, causal_target_history
 from leak_audit import LeakAuditError
+from postgres_loader import Table
 
 
 @pytest.mark.parametrize("shift", [0, 15])
@@ -85,6 +89,40 @@ def test_preprocessing_uses_only_fit_and_dates_strictly_before_event(capsys):
     np.testing.assert_allclose(q["source_date__age_s"], [np.nan, 1., np.nan])
     log = capsys.readouterr().err
     assert 'LEAK_AUDIT status=pass {"group": "preprocess_date_age"' in log and "PREPROC step=fit" in log
+
+
+def test_annotated_lookup_dates_reach_only_the_fold_age_transform(tmp_path, monkeypatch):
+    train_table = Table("s", "train", ("id", "region_key", "event_time", "response"))
+    test_table = Table("s", "test", ("id", "region_key", "event_time"))
+    reference = Table("s", "registry", ("region_key", "opened_date", "closed_date", "zone"),
+                      column_types={"opened_date": "date", "closed_date": "date"},
+                      comments={"opened_date": "Known before the event.", "closed_date": "Known after the event."})
+    stamps = pd.date_range("2025-02-01", periods=7, freq="D")
+    events = pd.DataFrame({"id": range(7), "region_key": ["A"] * 4 + ["B"] * 3, "event_time": stamps})
+    events.iloc[:4].assign(response=range(4)).to_csv(tmp_path / "train.csv", index=False)
+    events.iloc[4:].to_csv(tmp_path / "test.csv", index=False)
+    events.iloc[4:][["id"]].assign(response=0).to_csv(tmp_path / "sample_submission.csv", index=False)
+    names = []
+
+    def read_lookup(conn, table, columns, deadline, **kwargs):
+        names.extend(columns)
+        return pd.DataFrame({"region_key": ["A", "B"], "opened_date": ["2025-01-31", "2025-02-06"],
+                             "zone": [1, 2]})
+
+    conn = Mock()
+    conn.transaction.side_effect = nullcontext
+    monkeypatch.setattr("data_tools._read_lookup", read_lookup)
+    enrich_postgres(conn, {("s", "registry"): reference}, train_table, test_table, "id", "response", "", tmp_path)
+    assert "opened_date" in names and "closed_date" not in names
+    spec = {"id_columns": ["id"], "target_column": "response", "metric": "mae", "task_type": "regression",
+            "audit_required": True, "time_column": "event_time"}
+    base, _, _ = pipeline.prepare_features(tmp_path, spec, {"auto_features": True})
+    assert not any(name.startswith("registry__opened_date") for name in base)
+    fit, held, _ = pipeline.prepare_features(tmp_path, spec, {"auto_features": True, "fold_preprocess": True})
+    assert [name for name in fit if name.startswith("registry__opened_date")] == ["registry__opened_date__reference_date"]
+    _, transformed = preprocess_fold(fit, held, "event_time", audit=True)
+    assert [name for name in transformed if name.startswith("registry__opened_date")] == ["registry__opened_date__age_s"]
+    np.testing.assert_allclose(transformed["registry__opened_date__age_s"], [np.nan, np.nan, 86400.])
 
 
 def test_sqrt_predicts_and_scores_in_original_units(monkeypatch):

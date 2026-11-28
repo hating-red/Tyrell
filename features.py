@@ -72,7 +72,7 @@ def preprocess_fold(fit, queries, clock=None, *, audit=False):
     """Select conversions, missing flags and duplicate representatives on fit rows."""
     import json
     import sys
-    from data_tools import to_utc_naive
+    from data_tools import REFERENCE_DATE_SUFFIX, to_utc_naive
     from leak_audit import AuditBudget, check_equal, sample_positions
 
     live = clock in fit and pd.api.types.is_datetime64_any_dtype(fit[clock])
@@ -85,7 +85,7 @@ def preprocess_fold(fit, queries, clock=None, *, audit=False):
             continue
         x, q = fit[col], queries[col]
         name = col
-        if pd.api.types.is_datetime64_any_dtype(x):
+        if col.endswith(REFERENCE_DATE_SUFFIX) or pd.api.types.is_datetime64_any_dtype(x):
             is_date = True
         elif _is_categorical(x) and x.notna().any():
             text = x.astype("string").str.strip()
@@ -105,7 +105,7 @@ def preprocess_fold(fit, queries, clock=None, *, audit=False):
             if not live:
                 drop.append(col)
                 continue
-            name = f"{col}__age_s"
+            name = f"{col.removesuffix(REFERENCE_DATE_SUFFIX)}__age_s"
             if name in fit:
                 drop.append(col)
                 continue
@@ -208,13 +208,14 @@ def important_numeric(X, y, task_type, limit=MAX_GROUP_NUMERIC, seed=42):
 
 def add_auto_features(X_train, X_test, numeric_priority=None, *, row_local=False, fit_on_train_only=True):
     """Fit mappings on training rows and apply them independently to both frames."""
-    from data_tools import _EVENT_CLOCKS, parse_event_datetime, to_utc_naive
+    from data_tools import REFERENCE_DATE_SUFFIX, _EVENT_CLOCKS, parse_event_datetime, to_utc_naive
 
     if not row_local and not fit_on_train_only:
         raise ValueError("Non-temporal automated features require fit-only statistics")
     added_train, added_test = {}, {}
-    categorical = [c for c in X_train if _is_categorical(X_train[c])]
-    for column in X_train:
+    columns = [c for c in X_train if not c.endswith(REFERENCE_DATE_SUFFIX)]
+    categorical = [c for c in columns if _is_categorical(X_train[c])]
+    for column in columns:
         fit = X_train[column]
         if not row_local:
             dates = _parse_dates(fit)
@@ -320,7 +321,10 @@ def add_fold_entity_history(fit, queries, columns, clock):
         positions = hits["position"].to_numpy()
         counts[positions] = hits.events.fillna(0).to_numpy()
         gaps[positions] = (hits.when - hits.previous).dt.total_seconds().to_numpy()
-        available = np.searchsorted(np.sort(fit[clock].dropna().to_numpy()), all_times.to_numpy(), side="left")
+        # Compare UTC nanoseconds. Object arrays of timezone-aware timestamps with
+        # NaT make NumPy searchsorted's result depend on query order.
+        observed = np.sort(fit[clock].dropna().array.asi8)
+        available = np.searchsorted(observed, all_times.array.asi8, side="left")
         frequency = counts / np.maximum(1, available)
         for name, values in ((col + "__past_events", counts), (col + "__past_frequency", frequency),
                              (col + "__since_previous_s", gaps)):

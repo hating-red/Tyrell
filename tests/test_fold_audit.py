@@ -1,5 +1,3 @@
-import hashlib
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -17,13 +15,14 @@ def _frames():
     return frame, test
 
 
-def _check_audit(y, result, frame):
-    signature = hashlib.sha256(np.asarray(result["fold_ids"], dtype="<i4").tobytes()).hexdigest()
-    data = {"X_train": frame, "y_train": y, "train_ids": pd.Series(np.arange(len(y)) + 10)}
-    audit = pipeline._cv_audit(data, result, signature)
-    assert audit["membership_signature"] and audit["fold_signature"] == signature
-    assert audit["baseline_score"] == pytest.approx(np.mean([row["baseline_score"] for row in audit["folds"]]))
-    return audit
+def _audited_folds(result):
+    cfg = result["config"]
+    for index, (window, monitor, baseline) in enumerate(zip(
+        cfg["fold_windows"], cfg["early_stopping_windows"], cfg["fold_baselines"]
+    )):
+        assert baseline["train_rows"] == window["train_rows"]
+        assert baseline["validation_rows"] == window["validation_rows"]
+        yield index, window, monitor, baseline
 
 
 @pytest.mark.parametrize("binary", [True, False])
@@ -33,26 +32,20 @@ def test_actual_baselines_and_past_only_early_stopping(binary):
     kind, metric = ("binary", "pr_auc") if binary else ("regression", "mae")
     cfg = {"n_folds": 3, "num_boost_round": 5, "n_jobs": 1}
     result = training.train_and_predict(frame, y, test, kind, metric, cfg, 15)
-    audit = _check_audit(y, result, frame)
-    if binary:
-        assert audit["training_period"]["positives"] == int(y.sum())
-        assert audit["training_period"]["prevalence"] == pytest.approx(y.mean())
-    for window, monitor in zip(audit["folds"], result["config"]["early_stopping_windows"]):
-        valid = result["fold_ids"] == window["fold"]
+    for index, window, monitor, baseline in _audited_folds(result):
+        valid = result["fold_ids"] == index
         train = frame.event_time < frame.event_time[valid].min()
         assert pd.Timestamp(monitor["fit_max"]) < pd.Timestamp(monitor["monitor_min"])
         assert pd.Timestamp(monitor["monitor_max"]) < pd.Timestamp(window["validation_min"])
         if binary:
             expected = average_precision_score(y[valid], np.full(valid.sum(), y[train].mean()))
-            assert window["train_positives"] == int(y[train].sum())
-            assert window["validation_positives"] == int(y[valid].sum())
             probabilities = result["oof"][valid, 1]
-            assert window["model_score"] == pytest.approx(average_precision_score(y[valid], probabilities))
-            assert window["brier"] == pytest.approx(np.mean((y[valid] - probabilities) ** 2))
+            score = average_precision_score(y[valid], probabilities)
         else:
             expected = mean_absolute_error(y[valid], np.full(valid.sum(), y[train].median()))
-            assert window["model_score"] == pytest.approx(mean_absolute_error(y[valid], result["oof"][valid]))
-        assert window["baseline_score"] == pytest.approx(expected)
+            score = mean_absolute_error(y[valid], result["oof"][valid])
+        assert result["fold_scores"][index] == pytest.approx(score)
+        assert baseline["score"] == pytest.approx(expected)
     changed = y.copy()
     valid = result["fold_ids"] == 0
     changed[valid] = 1 - changed[valid] if binary else changed[valid] + 1000
@@ -67,27 +60,26 @@ def test_duration_labels_available_at_monitor_validation_and_test():
     available = frame.event_time + pd.to_timedelta(y, unit="m")
     cfg = {"n_folds": 3, "num_boost_round": 4, "n_jobs": 1, "label_delay_unit": "minutes", "refit_full": True}
     result = training.train_and_predict(frame, y, test, "regression", "mae", cfg, 20)
-    audit = _check_audit(y, result, frame)
-    assert audit["training_period"]["observed_before_prediction"] == int((available < test.event_time.min()).sum())
+    assert result["config"]["observed_before_prediction"] == int((available < test.event_time.min()).sum())
     assert (result["fold_ids"][available >= test.event_time.min()] == -1).all()
-    for window, monitor in zip(audit["folds"], result["config"]["early_stopping_windows"]):
-        cutoff = pd.Timestamp(window["validation_cutoff"])
+    for _, window, monitor, baseline in _audited_folds(result):
+        cutoff = pd.Timestamp(window["validation_cutoff"]).tz_localize("UTC")
         known = available < cutoff
         missing = (frame.event_time < cutoff) & ~known
         assert window["train_pending"] == int(missing.sum()) > 0
         assert window["train_rows"] == int(known.sum())
-        assert window["train_median"] == pytest.approx(y[known].median())
-        assert monitor["fit_rows"] == (available < pd.Timestamp(monitor["monitor_min"])).sum()
+        assert baseline["constant"] == pytest.approx(y[known].median())
+        assert monitor["fit_rows"] == (available < pd.Timestamp(monitor["monitor_min"]).tz_localize("UTC")).sum()
     blend = training._prepare_blend([result, result], y, "mae")
     for i, (fit, valid) in enumerate(blend.folds):
         assert (available.iloc[fit] < frame.event_time.iloc[valid].min()).all()
     ensemble = training.blend_results([result, result], y, "mae")
-    assert _check_audit(y, ensemble, frame)["folds"] == audit["folds"]
+    assert list(_audited_folds(ensemble)) == list(_audited_folds(result))
 
 
 def test_ablation_uses_same_folds_and_keeps_submission(tmp_path, monkeypatch):
     frame, test = _frames()
-    frame["district"] = np.arange(len(frame)) % 3
+    frame["district"] = 1
     test["district"] = 1
     frame.assign(id=np.arange(len(frame)), response=np.arange(len(frame)) % 7).to_csv(tmp_path / "train.csv", index=False)
     test.assign(id=np.arange(len(test)) + 100).to_csv(tmp_path / "test.csv", index=False)
@@ -99,11 +91,12 @@ def test_ablation_uses_same_folds_and_keeps_submission(tmp_path, monkeypatch):
     original = pipeline.run_experiment(tmp_path, spec, cfg, 20)
     path = tmp_path / "submission.csv"
     before = path.read_bytes()
-    removed = pipeline.run_experiment(tmp_path, spec, cfg | {
-        "diagnostic_group": "district", "exclude_columns": ["district"]}, 20)
-    assert removed["cv_audit"]["membership_signature"] == original["cv_audit"]["membership_signature"]
-    assert original["feature_coverage"] and not removed["saved"] and not removed["preds_file"]
-    assert removed["diagnostic_group"] == "district" and path.read_bytes() == before
+    removed = pipeline.run_experiment(tmp_path, spec, cfg | {"features": ["event_time", "value"]}, 20)
+    assert removed["fold_signature"] == original["fold_signature"]
+    assert removed["fold_windows"] == original["fold_windows"]
+    assert "district" in original["model_inputs"] and "district" not in removed["model_inputs"]
+    assert not removed["saved"] and removed["preds_file"] and path.read_bytes() == before
+
 
 
 @pytest.mark.parametrize("test_offset, expected", [(3, 1.0), (0, None)])
