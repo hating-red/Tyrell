@@ -5,8 +5,9 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -387,6 +388,14 @@ def _fetch_size(rows, bytes_read):
     return max(1, min(32768, (4 * 1024**2 * rows) // max(bytes_read, 1)))
 
 
+@contextmanager
+def _staged_template(path):
+    with tempfile.TemporaryDirectory(prefix=".template-", dir=path.parent) as folder:
+        staged = Path(folder) / path.name
+        yield staged
+        os.replace(staged, path)
+
+
 def _export(conn, table, columns, path, deadline, *, order=None, descending=False, check_order=False,
             memory_budget=_FRAME_BUDGET, id_column=None, progress=None, template_columns=()):
     fields = list(columns)
@@ -412,8 +421,9 @@ def _export(conn, table, columns, path, deadline, *, order=None, descending=Fals
     # For an absent sample, emit placeholders alongside this same test cursor. A second
     # scan, even in a repeatable snapshot, need not return rows in the same order.
     sample_path = path.with_name("sample_submission.csv")
-    sample_context = sample_path.open("x", newline="", encoding="utf-8") if template_columns else nullcontext()
-    with (sample_context as sample_stream, conn.cursor(name="tyrell_export") as cursor,
+    sample_context = _staged_template(sample_path) if template_columns else nullcontext()
+    with (sample_context as staged, staged.open("x", newline="", encoding="utf-8") if staged else nullcontext() as sample_stream,
+           conn.cursor(name="tyrell_export") as cursor,
           path.open("x", newline="", encoding="utf-8") as stream):
         if sample_stream is not None:
             sample_writer = csv.writer(sample_stream)
@@ -550,7 +560,13 @@ def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core
                     log(f"Шаблон из {_relation(sample)}, порядок по {_identifier(order)} {'DESC' if desc else 'ASC'}.")
             if len(columns) < 2 or any(not c for c in columns) or len(set(columns)) != len(columns):
                 raise ValueError("Некорректные имена колонок шаблона submission.")
-            train, test, id_col, target = _choose_pair(tables, sample, columns, text, ordinals)
+            try:
+                train, test, id_col, target = _choose_pair(tables, sample, columns, text, ordinals)
+            except ValueError as exc:
+                from data_tools import REGRESSION_METRICS, detect_metric
+                if detect_metric(text) in REGRESSION_METRICS and len(set(columns) - set(ordinals)) > 2:
+                    raise ValueError("Неподдерживаемый формат: мультитаргетная регрессия") from exc
+                raise
             columns = [c for c in columns if c == id_col or c not in ordinals]
             if len(columns) < 2:
                 raise ValueError("Отсутствует столбец ответа в шаблоне.")
@@ -565,9 +581,9 @@ def prepare_postgres(task_path, output_dir, *, deadline=None, log=print, on_core
                 shutil.copyfile(local, output_dir / "sample_submission.csv")
                 available -= local.stat().st_size
             elif sample is not None:
-                available -= _export(conn, sample, columns, output_dir / "sample_submission.csv", deadline,
-                                     order=order, descending=desc, check_order=True, id_column=id_col,
-                                     progress=export_progress)
+                with _staged_template(output_dir / "sample_submission.csv") as staged:
+                    available -= _export(conn, sample, columns, staged, deadline, order=order, descending=desc,
+                                         check_order=True, id_column=id_col, progress=export_progress)
             train_cols = [c for c in train.columns if c in test.columns or c == target]
             test_cols = [c for c in test.columns if c != target and (c in train_cols or c == id_col)]
             pair_order = id_col if os.environ.get("TYRELL_PAIR_ARM") in ("automl", "qwen") else None

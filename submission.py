@@ -13,6 +13,7 @@
 """
 
 import os
+import sys
 import tempfile
 from publication import prepare_publication
 from pathlib import Path
@@ -26,8 +27,13 @@ ROW_SUM_TOLERANCE = 0.01  # сумма вероятностей в строке 
 
 # ---------- Проверка ----------
 
+def _is_real_number(dtype):
+    return pd.api.types.is_integer_dtype(dtype) or pd.api.types.is_float_dtype(dtype)
+
+
 def validate_submission(submission: pd.DataFrame, expected_ids: pd.Series, columns: list[str],
-                        allowed_labels: set | None = None, probabilities: bool = False) -> list[str]:
+                        allowed_labels: set | None = None, probabilities: bool = False, *,
+                        answer_kind=None) -> list[str]:
     """Проверяет таблицу ответа по правилам task.md. Возвращает список проблем (пустой = всё OK).
 
     columns: ожидаемые столбцы в нужном порядке (как в sample_submission.csv)
@@ -38,6 +44,8 @@ def validate_submission(submission: pd.DataFrame, expected_ids: pd.Series, colum
         return [f"столбцы {list(submission.columns)}, ожидались {columns}"]
 
     id_col = expected_ids.name if expected_ids.name in columns else columns[0]
+    probabilities = answer_kind == "probabilities" if answer_kind else probabilities
+    numeric = probabilities or answer_kind == "regression"
     answer_cols = [c for c in columns if c != id_col]
     problems = []
 
@@ -52,13 +60,14 @@ def validate_submission(submission: pd.DataFrame, expected_ids: pd.Series, colum
         answers = submission[col]
         if answers.isna().any():
             problems.append(f"пропусков в '{col}': {int(answers.isna().sum())}")
-        if pd.api.types.is_numeric_dtype(answers) and not np.isfinite(answers.dropna()).all():
+        is_number = _is_real_number(answers.dtype)
+        if numeric and not is_number:
+            problems.append(f"в '{col}' ожидались числа, а пришёл тип {answers.dtype}")
+        if is_number and not np.isfinite(answers.dropna()).all():
             problems.append(f"бесконечности в '{col}'")
-        if probabilities and pd.api.types.is_numeric_dtype(answers):
+        if probabilities and is_number:
             if ((answers < 0) | (answers > 1)).any():
                 problems.append(f"в '{col}' значения вне [0, 1]: возможно, переданы классы вместо вероятностей")
-        elif probabilities:
-            problems.append(f"в '{col}' ожидались вероятности (числа), а пришёл тип {answers.dtype}")
 
     if probabilities and len(answer_cols) > 1 and not problems:
         row_sums = submission[answer_cols].sum(axis=1)
@@ -91,36 +100,74 @@ def _match_dtype(answers: pd.Series, sample_column: pd.Series) -> tuple[pd.Serie
     return answers, []
 
 
-def _repair_single(answers: pd.Series, allowed_labels: set | None, probabilities: bool) -> tuple[pd.Series, list[str]]:
+def target_filler(y, metric, n_classes=0):
+    """Compute the repair value from the caller's eligible fit labels."""
+    if n_classes:
+        return (np.bincount(y, minlength=n_classes) / len(y)).tolist(), "class_prior"
+    y = np.asarray(y)
+    y = y[np.isfinite(y)]
+    if not len(y):
+        raise ValueError("No eligible training labels to repair a prediction")
+    if metric in ("mae", "mape"):
+        return float(np.median(y)), "median"
+    return float(np.mean(y)), "mean"
+
+
+def repair_numeric(values, filler, *, probabilities=False, stage="submission"):
+    """Repair whole rows using the fit prior, preserving the count before clipping."""
+    p = np.asarray(values)
+    nonfinite = ~np.isfinite(p)
+    bad = nonfinite
+    if probabilities:
+        outside = ~nonfinite & ((p < -PROBA_TOLERANCE) | (p > 1 + PROBA_TOLERANCE))
+        bad = nonfinite | outside
+    rows = bad.any(axis=1) if p.ndim == 2 else bad
+    if not rows.any():
+        return p
+    count = int(rows.sum())
+    level = "Warning" if count * 100 >= len(p) else "INFO"
+    reasons = f" nonfinite_values={int(nonfinite.sum())}"
+    if probabilities:
+        reasons += f" out_of_range_values={int(outside.sum())}"
+    print(f"{level}: PREDICTION_REPAIR stage={stage} invalid_rows={count}/{len(p)} fraction={count/len(p):.6f}{reasons}",
+          file=sys.stderr, flush=True)
+    if rows.all():
+        raise ValueError(f"All predictions are unusable ({stage})")
+    if filler is None:
+        raise ValueError("Невалидные прогнозы: значения вне [0, 1] или отсутствует статистика train для ремонта")
+    repaired = p.astype(float, copy=True)
+    repaired[rows] = filler
+    return repaired
+
+
+def _repair_single(answers: pd.Series, allowed_labels: set | None, probabilities: bool, filler=None) -> tuple[pd.Series, list[str]]:
     """Чинит один столбец ответа. Возвращает исправленные ответы и список исправлений."""
     fixes = []
-    is_numeric = pd.api.types.is_numeric_dtype(answers) and not pd.api.types.is_bool_dtype(answers)
+    is_numeric = _is_real_number(answers.dtype)
     if is_numeric and allowed_labels is None:
-        bad = ~np.isfinite(answers.astype(float))  # NaN и ±бесконечность
-        if bad.any():
-            filler = float(answers[~bad].median()) if (~bad).any() else (0.5 if probabilities else 0.0)
-            answers = answers.where(~bad, filler)
-            fixes.append(f"{int(bad.sum())} пропусков/бесконечностей заменены медианой {filler:.4g}")
+        values = answers.to_numpy(dtype=float, na_value=np.nan)
+        answers = pd.Series(repair_numeric(values, filler, probabilities=probabilities), index=answers.index)
         if probabilities:
-            tiny = ((answers < 0) & (answers > -PROBA_TOLERANCE)) | ((answers > 1) & (answers < 1 + PROBA_TOLERANCE))
-            if tiny.any():
-                answers = answers.clip(0, 1).where(tiny, answers)
-                fixes.append(f"{int(tiny.sum())} значений чуть за [0, 1] (ошибка округления) обрезаны")
+            answers = answers.clip(0, 1)
     elif answers.isna().any():
-        filler = answers.mode().iloc[0] if answers.notna().any() else sorted(allowed_labels or {""})[0]
+        if answers.isna().all():
+            raise ValueError("All predicted labels are missing")
+        if filler is None:
+            raise ValueError("Missing training mode for label repair")
+        count = int(answers.isna().sum())
+        if count * 100 >= len(answers):
+            print(f"Warning: PREDICTION_REPAIR stage=submission invalid_rows={count}/{len(answers)}",
+                  file=sys.stderr, flush=True)
         fixes.append(f"{int(answers.isna().sum())} пропусков заменены самым частым классом '{filler}'")
         answers = answers.fillna(filler)
     return answers, fixes
 
 
-def _repair_class_probabilities(table: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """Чинит вероятности по классам: пропуски → равные доли, мелкие отклонения суммы от 1 → нормировка."""
+def _repair_class_probabilities(table: pd.DataFrame, filler=None) -> tuple[pd.DataFrame, list[str]]:
+    """Replace invalid rows with the training prior and normalize roundoff."""
     fixes = []
-    if table.isna().any().any():
-        rows = table.isna().any(axis=1)
-        table.loc[rows] = 1 / table.shape[1]
-        fixes.append(f"{int(rows.sum())} строк с пропусками заменены равными вероятностями")
-    table = table.clip(lower=0)
+    values = repair_numeric(table.to_numpy(dtype=float, na_value=np.nan), filler, probabilities=True)
+    table = pd.DataFrame(values.clip(0, 1), columns=table.columns)
     row_sums = table.sum(axis=1)
     close = (row_sums - 1).abs() <= ROW_SUM_TOLERANCE
     if close.all() and not np.allclose(row_sums, 1):
@@ -158,7 +205,8 @@ def _find_id_column(columns: list[str], test_ids: pd.Series) -> str:
 
 def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, output_path: str | Path,
                     allowed_labels: set | None = None, probabilities: bool = False,
-                    class_order: list | None = None, *, publication_state=None, score=None) -> list[str]:
+                    class_order: list | None = None, *, publication_state=None, score=None,
+                    answer_kind=None, filler=None) -> list[str]:
     """Собирает submission.csv из предсказаний, проверяет и сохраняет.
 
     predictions:    ответы по строкам test.csv в том же порядке. Варианты:
@@ -188,6 +236,9 @@ def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, o
     if len(keys) != len(expected_ids) or (positions < 0).any():
         return ["Состав ID в test и шаблоне различается"]
     answer_cols = [c for c in columns if c != id_col]
+    answer_kind = answer_kind or ("probabilities" if probabilities or len(answer_cols) > 1 else
+                                  "labels" if allowed_labels is not None else "regression")
+    probabilities = answer_kind == "probabilities"
     if len(test_ids) == 0:
         return ["test пустой: нечего записывать"]
 
@@ -198,28 +249,49 @@ def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, o
             values = values.reshape(-1)  # (n, 1) → (n,)
         if values.ndim != 1:
             return [f"шаблон ждёт один столбец ответа, а пришло предсказаний формы {values.shape}"]
-        answers, fixes = _repair_single(pd.Series(values), allowed_labels, probabilities)
-        if allowed_labels is not None:
+        answers = pd.Series(values)
+        if answer_kind != "labels" or allowed_labels is not None:
+            try:
+                answers, fixes = _repair_single(answers, allowed_labels, probabilities, filler)
+            except ValueError as exc:
+                return [str(exc)]
+        if answer_kind == "labels" and allowed_labels is not None:
             answers, dtype_fixes = _match_dtype(answers, sample[answer_cols[0]])
             fixes += dtype_fixes
         answer_table = pd.DataFrame({answer_cols[0]: answers.to_numpy()})
+    elif answer_kind == "regression":
+        values = np.asarray(predictions)
+        if publication_state != "SCHEMA_FALLBACK" or values.shape != (len(test_ids), len(answer_cols)):
+            return ["Неподдерживаемый формат: мультитаргетная регрессия"]
+        answer_table = pd.DataFrame(values, columns=answer_cols)
     else:
         # Вероятности по классам: выстраиваем столбцы в порядке шаблона
         if isinstance(predictions, pd.DataFrame):
             missing = [c for c in answer_cols if c not in predictions.columns]
             if missing:
                 return [f"в предсказаниях нет столбцов для классов {missing[:5]}"]
-            answer_table = predictions[answer_cols].reset_index(drop=True).astype(float)
+            answer_table = predictions[answer_cols].reset_index(drop=True)
         else:
-            values = np.asarray(predictions, dtype=float)
+            values = np.asarray(predictions)
             if values.ndim != 2 or values.shape[1] != len(answer_cols):
                 return [f"шаблон ждёт {len(answer_cols)} столбцов вероятностей, а пришло форма {values.shape}"]
             names = [str(c) for c in class_order] if class_order is not None else answer_cols
             if sorted(names) != sorted(answer_cols):
                 return [f"class_order {names[:5]} не совпадает с классами шаблона {answer_cols[:5]}"]
             answer_table = pd.DataFrame(values, columns=names)[answer_cols]
-        answer_table, fixes = _repair_class_probabilities(answer_table)
-        probabilities = True
+        if not probabilities:
+            return ["Ожидался один столбец меток класса"]
+        if not all(map(_is_real_number, answer_table.dtypes)):
+            return ["В столбцах вероятностей ожидались числа"]
+        if filler is not None and class_order is not None:
+            by_class = dict(zip(map(str, class_order), filler))
+            if not set(answer_cols) <= by_class.keys():
+                return ["Столбцы prior не совпадают с классами шаблона"]
+            filler = [by_class[c] for c in answer_cols]
+        try:
+            answer_table, fixes = _repair_class_probabilities(answer_table, filler)
+        except ValueError as exc:
+            return [str(exc)]
 
     if len(answer_table) != len(test_ids):
         return [f"предсказаний {len(answer_table)}, а строк в test {len(test_ids)}"]
@@ -229,7 +301,7 @@ def make_submission(predictions, test_ids: pd.Series, sample_path: str | Path, o
     answer_table = answer_table.iloc[positions].reset_index(drop=True)
     answer_table.insert(0, id_col, expected_ids)
     submission = answer_table[columns]  # порядок столбцов как в шаблоне
-    problems = validate_submission(submission, expected_ids, columns, allowed_labels, probabilities)
+    problems = validate_submission(submission, expected_ids, columns, allowed_labels, answer_kind=answer_kind)
     if problems:
         print(f"[submission] НЕ записан: {'; '.join(problems)}", flush=True)
         return problems

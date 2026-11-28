@@ -33,7 +33,7 @@ def test_regression_written(tmp_path, sample_reg):
 
 def test_nan_and_inf_repaired(tmp_path, sample_reg):
     out = tmp_path / "submission.csv"
-    assert make_submission([1.0, np.nan, np.inf, 3.0], IDS, sample_reg, out) == []
+    assert make_submission([1.0, np.nan, np.inf, 3.0], IDS, sample_reg, out, filler=2.0) == []
     assert np.isfinite(pd.read_csv(out)["site_eui"]).all()
 
 
@@ -59,7 +59,7 @@ def test_unknown_class_rejected(tmp_path, sample_clf):
 
 def test_missing_class_filled_with_most_common(tmp_path, sample_clf):
     out = tmp_path / "submission.csv"
-    assert make_submission(["DoS", None, "DoS", "Normal"], IDS, sample_clf, out, {"Normal", "DoS"}) == []
+    assert make_submission(["DoS", None, "DoS", "Normal"], IDS, sample_clf, out, {"Normal", "DoS"}, filler="DoS") == []
     assert pd.read_csv(out)["attack_cat"].tolist() == ["DoS", "DoS", "DoS", "Normal"]
 
 

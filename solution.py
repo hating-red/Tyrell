@@ -415,7 +415,7 @@ def log_error():
 
 
 def resolve_task(directory, text, model, deadline, early=None):
-    from data_tools import guess_task_spec, inspect_data, load_data, target_constraints, PROBA_METRICS
+    from data_tools import guess_task_spec, inspect_data, load_data, positive_class_spec, target_constraints, PROBA_METRICS
     from training import METRICS
     guess = None
     try:
@@ -448,7 +448,7 @@ def resolve_task(directory, text, model, deadline, early=None):
             continue
         if kind in ("binary", "multiclass") and (data["y_train"].nunique() > 2) != (kind == "multiclass"):
             continue
-        return spec | target_constraints(text,target,data["y_train"],kind)
+        return spec | positive_class_spec(text, data["y_train"], kind) | target_constraints(text,target,data["y_train"],kind)
     if guess:
         return guess
     raise ValueError("Could not identify a supported task from the schema and template")
@@ -727,7 +727,7 @@ def research(task_path, directory, deadline):
         safety_started = time.monotonic()
         def publish(guess):
             nonlocal spec
-            problems = write_fallback(directory, guess)
+            problems = write_fallback(directory, guess | {"audit_required": True})
             if problems:
                 raise ValueError(problems)
             spec = guess

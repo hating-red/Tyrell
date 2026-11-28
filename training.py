@@ -22,6 +22,7 @@ limit_openmp()
 
 from data_tools import label_available_at as _label_available_at
 from leak_audit import LeakAuditError
+from submission import repair_numeric, target_filler
 
 import numpy as np
 import pandas as pd
@@ -218,6 +219,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "log_target": None,           # log1p таргета в регрессии, None - авто (только для rmsle)
     "sqrt_target": False,
     "class_weight": None,         # None или "balanced"
+    "positive_class": None,
     "postprocess": True,          # подбор весов классов под метрику по меткам
     "n_jobs": None,               # None - min(8, число CPU)
     "split": None,                # None - случайные фолды; {"type": "group", "column": c} - группы
@@ -1068,7 +1070,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     y_lab = y_series[labeled]
 
     # Кодирование таргета
-    encoder = None
+    class_order = None
     if task_type == "regression":
         try:
             y_fit = pd.to_numeric(y_lab, errors="raise").to_numpy(dtype=float)
@@ -1078,7 +1080,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
     else:
         encoder = LabelEncoder()
         y_fit = encoder.fit_transform(y_lab.to_numpy())
-        n_classes = len(encoder.classes_)
+        class_order = encoder.classes_
+        n_classes = len(class_order)
         if n_classes < 2:
             raise ValueError("В таргете меньше двух классов")
         # При расхождении верим данным
@@ -1088,6 +1091,13 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         elif task_type == "multiclass" and n_classes == 2:
             logger.warning("Задача объявлена multiclass, но классов 2, переключаюсь на binary")
             task_type = "binary"
+        positive = cfg["positive_class"]
+        if task_type == "binary" and positive is not None:
+            if positive not in class_order:
+                raise ValueError("positive_class is absent from training labels")
+            if class_order[0] == positive:
+                y_fit = 1 - y_fit
+                class_order = class_order[::-1]
 
     metric_obj = get_metric(metric, task_type)
     if cfg["regularized_ap"]:
@@ -1203,6 +1213,8 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             if not folds:
                 raise ValueError("No grouped validation window has sufficient class coverage")
     clip = task_type == "regression" and bool(cfg["audit_required"] or cfg["clip_target"])
+    final_y = y_fit[refit_idx]
+    filler, _ = target_filler(final_y, metric_obj.name, n_classes)
     cfg["n_folds"] = len(folds)
     fit_fn = _BACKENDS[cfg["model"]]
     extra = {}
@@ -1429,9 +1441,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             task_type, metric_obj, n_classes, rcfg, deadline, **extra,
         )
         preds = original_scale(preds)
-        if not np.isfinite(preds).all():
-            raise ValueError("Refit returned nonfinite predictions")
-        return preds, stopped
+        return repair_numeric(preds, filler, probabilities=bool(n_classes), stage="refit"), stopped
 
     if refit_rounds is not None:
         predicted, stopped = fit_full(max(1, int(refit_rounds)))
@@ -1525,8 +1535,11 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
             raise RuntimeError(f"Ошибка обучения {cfg['model']} на фолде {i + 1}: "
                                f"{type(e).__name__}: {e}") from e
         pva, pte = original_scale(pva), original_scale(pte)
-        if not np.isfinite(pva).all() or not np.isfinite(pte).all():
+        if not np.isfinite(pva).all():
             raise ValueError("Model returned nonfinite predictions")
+        local_filler, _ = target_filler(y_fit[tr_idx], metric_obj.name, n_classes)
+        if not temporal:
+            pte = repair_numeric(pte, local_filler, probabilities=bool(n_classes), stage=f"fold_{i + 1}_test")
         prediction = pva[:, 1] if task_type == "binary" else pva
         fold_diagnostics.append({"fold": i, "best_iteration": int(best_iter), "last_iteration": int(last_iter),
                                  "stopped_for_time": bool(stopped), "prediction_std": float(prediction.std())})
@@ -1559,13 +1572,11 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         else:
             fold_scores.append(fold_scores_raw[-1])
         if task_type == "regression":
-            fit_target = y_fit[tr_idx]
-            constant = float(np.median(fit_target) if metric_obj.name in ("mae", "mape") else fit_target.mean())
+            constant = local_filler
             guess = np.full(len(va_idx), constant)
         else:
-            rates = np.bincount(y_fit[tr_idx], minlength=n_classes) / len(tr_idx)
-            constant = float(rates[1]) if n_classes == 2 else rates.tolist()
-            guess = np.broadcast_to(rates, (len(va_idx), n_classes))
+            constant = local_filler[1] if n_classes == 2 else local_filler
+            guess = np.broadcast_to(local_filler, (len(va_idx), n_classes))
         baseline = _score_fold(y_fit[va_idx], guess, metric_obj)
         fold_baselines.append({"fold": i + 1, "constant": constant, "score": baseline,
                                "train_rows": len(tr_idx), "validation_rows": len(va_idx)})
@@ -1645,26 +1656,27 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         weights, cross_scores, postprocess_info = _cross_fit_class_weights(
             oof, y_fit, [folds[i] for i in done_folds], metric_obj, score_raw)
         postprocess_info["weights"] = dict(zip(
-            encoder.classes_.tolist(), postprocess_info.pop("weights_raw").round(4).tolist()))
+            class_order.tolist(), postprocess_info.pop("weights_raw").round(4).tolist()))
         if cross_scores is not None:
             fold_scores = cross_scores
 
     # Финальные предсказания
     if task_type == "regression":
-        predictions = _finalize_regression(test_pred, y_fit[refit_idx], clip)
+        predictions = _finalize_regression(test_pred, final_y, clip, metric_obj.name)
         if temporal and metric_obj.name == "mae" and cfg["mae_shift"] and len(done_folds) == len(folds):
             adjusted, shifted_scores, shifts = causal_mae_shift(oof, y_fit, folds, labeled_times, available_at,
                                                                test_cutoff, clip=clip)
             fold_info = {"greater_is_better": False, "config": {"fold_baselines": fold_baselines}}
             if _quality_pair(fold_info | {"fold_scores": fold_scores}, fold_info | {"fold_scores": shifted_scores}):
                 oof, fold_scores = adjusted, shifted_scores
-                predictions = _finalize_regression(predictions + shifts[-1], y_fit[refit_idx], clip)
+                predictions = _finalize_regression(predictions + shifts[-1], final_y, clip, metric_obj.name)
                 postprocess_info = {"type": "causal_mae_shift", "shifts": shifts}
         probabilities, class_order = None, None
     else:
         probabilities = test_pred
-        predictions = encoder.inverse_transform(_apply_weights(test_pred, weights))
-        class_order = encoder.classes_.tolist()
+        probabilities = repair_numeric(test_pred, filler, probabilities=True, stage="classification")
+        predictions = class_order[_apply_weights(probabilities, weights)]
+        class_order = class_order.tolist()
 
     # OOF в разрезе исходных строк X
     if labeled.all():
@@ -1716,6 +1728,7 @@ def train_and_predict(X: pd.DataFrame, y: pd.Series, X_test: pd.DataFrame, task_
         "predictions": predictions,
         "probabilities": probabilities,
         "class_order": class_order,
+        "repair_filler": filler,
         "oof": oof_full,
         "fit_time": fit_time,
         "config": cfg,
@@ -1781,12 +1794,9 @@ def _fold_ids(folds: list, done_folds: list, labeled: np.ndarray) -> np.ndarray:
     return ids
 
 
-def _finalize_regression(pred: np.ndarray, y_fit: np.ndarray, clip: bool) -> np.ndarray:
-    pred = pred.copy()
-    bad = ~np.isfinite(pred)
-    if bad.any():
-        logger.warning("В предсказаниях %d нечисловых значений, заменяю средним таргета", bad.sum())
-        pred[bad] = float(np.mean(y_fit))
+def _finalize_regression(pred: np.ndarray, y_fit: np.ndarray, clip: bool, metric="rmse") -> np.ndarray:
+    filler, _ = target_filler(y_fit, metric)
+    pred = repair_numeric(pred, filler, stage="regression")
     if clip:
         pred = np.clip(pred, y_fit.min(), y_fit.max())
     return pred
@@ -1851,7 +1861,8 @@ def _prepare_blend(results: list[dict], y: pd.Series, metric: str) -> _BlendData
     if oofs.shape[1] != len(y_enc):
         raise ValueError("Длина OOF не совпадает с длиной y")
 
-    cfg0 = results[0]["config"]
+    cfg0 = results[0]["config"] | {
+        "repair_filler": results[0].get("repair_filler", results[0]["config"].get("repair_filler"))}
     if any((r["config"].get("split") or {}) != (cfg0.get("split") or {}) for r in results):
         raise ValueError("Cannot blend results with different split strategies")
     meta_known_from = results[0].get("meta_known_from")
@@ -1895,7 +1906,7 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
         predictions = (test_pred if probabilities is None else
                        np.asarray(data.class_order, dtype=object)[test_pred.argmax(axis=1)])
     elif data.task_type == "regression" and temporal:
-        predictions = _finalize_regression(test_pred, y_enc, False)
+        predictions = repair_numeric(test_pred, data.cfg0.get("repair_filler"), stage="regression_blend")
         probabilities = None
     elif data.task_type == "regression":
         # Клиппинг по диапазону train фолда, оставляем только при улучшении
@@ -1908,7 +1919,7 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
                 oof[va] = p
         postprocess_info = {"type": "clip", "applied": clip,
                             "score_after": float(np.nanmean(clip_scores))}
-        predictions = _finalize_regression(test_pred, y_enc, clip)
+        predictions = _finalize_regression(test_pred, y_enc, clip, metric_obj.name)
         probabilities = None
     else:
         cls_w = np.ones(len(data.class_order))
@@ -1945,6 +1956,7 @@ def _finish_blend(data: _BlendData, oof: np.ndarray, test_pred: np.ndarray, conf
         "predictions": predictions,
         "probabilities": probabilities,
         "class_order": data.class_order,
+        "repair_filler": cfg0.get("repair_filler"),
         "oof": oof_full,
         "fit_time": time.monotonic() - t_start,
         "config": config,
@@ -2140,7 +2152,8 @@ def _from_ensemble_space(values, space, classification):
         return softmax(values, axis=1)
     p = np.clip(values, 0., 1.)
     total = p.sum(axis=1, keepdims=True)
-    return np.divide(p, total, out=np.full_like(p, 1. / p.shape[1]), where=total > 0)
+    valid = np.isfinite(values).all(axis=1, keepdims=True) & (total > 0)
+    return np.divide(p, total, out=np.full_like(p, np.nan), where=valid)
 
 
 def _fit_stacker_matrix(values, y, metric, classification, block_ids, temporal, deadline):
@@ -2242,15 +2255,14 @@ def _fit_ensemble_strategy(kind, space, inputs, y, metric, classification, n_cla
     return lambda array: decode(np.tensordot(weights, array, axes=1)), {"weights": weights.tolist()}
 
 
-def _constrain_ensemble(pred, bounds, classification, nonnegative):
+def _constrain_ensemble(pred, bounds, classification, nonnegative, filler=None):
+    pred = repair_numeric(pred, filler, probabilities=classification, stage="ensemble")
     if classification:
-        p = np.where(np.isfinite(pred), pred, 0.)
-        return _from_ensemble_space(p, "prob", True)
+        return _from_ensemble_space(pred, "prob", True)
     low, high = bounds if bounds is not None else (-np.inf, np.inf)
     if nonnegative:
         low, high = max(0., low), max(0., high)
-    replacement = (low + high) / 2 if np.isfinite(low) and np.isfinite(high) else 0.
-    return np.clip(np.where(np.isfinite(pred), pred, replacement), low, high)
+    return np.clip(pred, low, high)
 
 
 def _fit_ensemble_postprocess(pred, y, metric, allow_round):
@@ -2295,15 +2307,16 @@ def apply_ensemble_meta(meta, predictions, task_type, metric, bounds=None, nonne
         prediction = _from_ensemble_space(np.tensordot(weights, inputs, axes=1), space, classification)
         if "shift" in meta:
             prediction = prediction + meta["shift"]
-    prediction = _constrain_ensemble(prediction, bounds, classification, nonnegative)
+    filler = meta.get("repair_filler")
+    prediction = _constrain_ensemble(prediction, bounds, classification, nonnegative, filler)
     post = meta.get("postprocess", {})
     if post.get("type") == "round":
         prediction = np.round(prediction)
     elif post.get("type") == "temperature":
         prediction = softmax(np.log(np.clip(prediction, 1e-8, 1.)) / post["temperature"], axis=1)
     elif post.get("type") == "class_weights":
-        prediction *= np.asarray(post["weights"])
-    return _constrain_ensemble(prediction, bounds, classification, nonnegative)
+        prediction = _from_ensemble_space(prediction * post["weights"], "prob", True)
+    return _constrain_ensemble(prediction, bounds, classification, nonnegative, filler)
 
 
 def _quality_pair(control, candidate):
@@ -2356,7 +2369,7 @@ def _crossfit_ensemble(data, results, setup, kind, space, deadline, nonnegative,
     if bounds_final is None and not classification:
         bounds_final = (float(data.y_enc.min()), float(data.y_enc.max()))
 
-    def program(ids, train, bounds, integer):
+    def program(ids, train, bounds, integer, filler):
         if time.monotonic() >= deadline:
             raise TimeoutError("Ensemble fit deadline")
         take = train[_sample_fit(data.y_enc[train], 6500, 42, classification)]
@@ -2375,23 +2388,28 @@ def _crossfit_ensemble(data, results, setup, kind, space, deadline, nonnegative,
             integral = not classification and (integer if integer is not None else
                                                    np.equal(data.y_enc[train], np.round(data.y_enc[train])).all())
             post, post_info = _fit_ensemble_postprocess(
-                _constrain_ensemble(predict(features), bounds, classification, nonnegative), y, data.metric, integral)
+                _constrain_ensemble(predict(features), bounds, classification, nonnegative, filler), y, data.metric, integral)
 
         def apply(predictions):
-            p = _constrain_ensemble(predict(_ensemble_space(predictions, use_space)), bounds, classification, nonnegative)
-            return _constrain_ensemble(post(p), bounds, classification, nonnegative)
+            p = _constrain_ensemble(predict(_ensemble_space(predictions, use_space)), bounds, classification, nonnegative, filler)
+            return _constrain_ensemble(post(p), bounds, classification, nonnegative, filler)
 
         return apply, diagnostics | {"members": list(ids), "space": use_space, "fit_rows": len(take),
-                                     "postprocess": post_info}
+                                     "postprocess": post_info, "repair_filler": filler}
 
     oof = np.full_like(data.oofs[0], np.nan)
     fold_meta = []
+    baselines = data.cfg0.get("fold_baselines", [])
     for k, (fit, valid) in enumerate(folds):
         ids = pools[k]
-        predict, meta = program(ids, fit, bound_folds[k], integer_folds[k])
+        filler = baselines[k]["constant"] if k < len(baselines) else None
+        if n_classes == 2 and filler is not None:
+            filler = [1. - filler, filler]
+        predict, meta = program(ids, fit, bound_folds[k], integer_folds[k], filler)
         oof[valid] = predict(data.oofs[np.ix_(ids, valid)])
         fold_meta.append(meta)
-    fitted, plan = program(final, np.flatnonzero(fold_ids >= 0), bounds_final, data.cfg0.get("integer_target"))
+    filler = data.cfg0.get("repair_filler")
+    fitted, plan = program(final, np.flatnonzero(fold_ids >= 0), bounds_final, data.cfg0.get("integer_target"), filler)
     config = {"blend_type": kind, "blend_space": space, "blend_weights": plan.get("weights"),
               "blend_fold_weights": [m.get("weights") for m in fold_meta],
               "fold_meta": fold_meta, "final_meta": plan, "blend_of": [results[i]["config"] for i in final]}
@@ -2420,7 +2438,7 @@ def select_ensemble(results, y, metric, *, limit=16, deadline=float("inf"), nonn
     classification = data.class_order is not None
     bounds = data.cfg0.get("target_bounds") or ((float(data.y_enc.min()), float(data.y_enc.max()))
                                                 if not classification else None)
-    one = lambda p: _constrain_ensemble(p[0], bounds, classification, nonnegative)
+    one = lambda p: _constrain_ensemble(p[0], bounds, classification, nonnegative, data.cfg0.get("repair_filler"))
     best = dict(results[best_idx])
     best["config"] = best["config"] | {"blend_type": "best_single", "blend_space": "prob"}
     if classification:

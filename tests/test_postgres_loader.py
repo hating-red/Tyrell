@@ -136,6 +136,28 @@ class AdapterTest(unittest.TestCase):
         with (self.output / name).open(encoding="utf-8-sig", newline="") as file:
             return list(csv.reader(file))
 
+    def test_interrupted_database_template_is_never_visible(self):
+        cursor = self.conn.cursor
+
+        @contextmanager
+        def interrupted(name):
+            with cursor(name) as real:
+                def fetch(_):
+                    if (self.output / "sample_submission.csv").exists():
+                        self.fail("Database template was visible before the cursor finished")
+                    if real.fetchone() is None:
+                        raise TimeoutError("second batch interrupted")
+                    return [("0002", 0, 1)]
+
+                yield types.SimpleNamespace(execute=real.execute, fetchmany=fetch)
+
+        self.conn.db.execute("DELETE FROM sample_submission WHERE case_key = '01'")
+        with patch.object(self.conn, "cursor", interrupted):
+            with self.assertRaises(TimeoutError):
+                self.export()
+        self.assertFalse((self.output / "sample_submission.csv").exists())
+        self.assertFalse(list(self.output.glob(".template-*")))
+
     def test_database_order_snapshot_and_callback(self):
         def ready():
             self.assertEqual(self.read_csv("test.csv")[1][0], "02")

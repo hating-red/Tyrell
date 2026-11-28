@@ -360,12 +360,35 @@ def detect_metric(task_text):
     return None
 
 
+def positive_class_spec(text, y, task_type):
+    if task_type != "binary":
+        return {}
+    declared = re.findall(
+        r"""(?:\bpositive (?:class|label)|положительный класс)\s*[:=]\s*(?:`([^`]+)`|"([^"]+)"|'([^']+)'|([^\s,;.]+))""",
+        text.replace("**", ""), re.I)
+    names = {next(value for value in match if value) for match in declared}
+    labels = y.dropna()
+    if names:
+        matches = [value for value in labels.unique() if str(value) in names or (
+            not isinstance(value, str) and value in (0, 1) and str(int(value)) in names)]
+        if len(names) != 1 or len(matches) != 1:
+            raise ValueError("Positive class declaration is ambiguous or absent from the training labels")
+        value = matches[0]
+        return {"positive_class": value.item() if isinstance(value, np.generic) else value}
+    if len(labels) and labels.isin([0, 1]).all():
+        return {"positive_class": 1}
+    return {}
+
+
 def guess_task_spec(task_dir, task_text=""):
     """task_spec без LLM: таргет и id из data_dictionary, метрика из task.md, тип по данным.
 
     Возвращает (spec, confident). confident=False, если таргет или метрику пришлось угадывать.
     """
     folder, train, test, sample, dictionary = _read_files(task_dir)
+    metric = detect_metric(task_text)
+    if metric in REGRESSION_METRICS and len(sample.columns) > 2:
+        raise ValueError("Неподдерживаемый формат: мультитаргетная регрессия")
     targets, ids = _candidates(train, test, sample, dictionary)
     confident = len(targets) == 1 and bool(ids)
     if not targets or not ids:
@@ -392,7 +415,6 @@ def guess_task_spec(task_dir, task_text=""):
     identifier = matching_ids[0]
     y = train[target].dropna()
 
-    metric = detect_metric(task_text)
     confident = confident and metric is not None
     if metric is not None:
         is_regression = metric in REGRESSION_METRICS
@@ -415,8 +437,7 @@ def guess_task_spec(task_dir, task_text=""):
         "metric": metric,
         "probabilities": metric in PROBA_METRICS or len(sample.columns) > 2,
     }
-    if task_type == "binary" and spec["probabilities"] and len(y) and y.isin([0, 1]).all():
-        spec["positive_class"] = 1
+    spec.update(positive_class_spec(task_text, y, task_type))
     explicit_clock = _task_clock(task_text)
     if explicit_clock:
         spec["time_column"] = detect_time_column(train, test, explicit_clock)

@@ -21,7 +21,7 @@ import pandas as pd
 from data_tools import (INTERVAL_FEATURE_SUFFIXES, REFERENCE_DATE_SUFFIX, detect_split, load_data,
                         parse_event_datetime, label_available_at)
 from publication import MODEL_SUCCESS, TRAINED_FALLBACK, SCHEMA_FALLBACK, csv_digest, prepare_publication, receipt_directory
-from submission import make_submission, validate_submission
+from submission import make_submission, target_filler, validate_submission
 
 PREDS_DIR = ".tyrell_preds"       # OOF и предсказания test завершенных экспериментов для ансамбля
 output_directory = ContextVar("output_directory", default=None)
@@ -121,8 +121,9 @@ def prepare_features(task_dir, task_spec, config, *, data=None, feature_code=Non
     for key in ("n_folds", "fold_seed", "split", "n_jobs"):
         cfg.pop(key, None)
     fixed = {"n_folds": 5, "fold_seed": 42, "n_jobs": available_cpus(), "split": split, "audit_required": audited}
-    if task_spec.get("label_delay_unit"):
-        fixed["label_delay_unit"] = task_spec["label_delay_unit"]
+    for key in ("label_delay_unit", "positive_class"):
+        if key in task_spec:
+            fixed[key] = task_spec[key]
     return X_train, X_test, cfg | fixed
 
 
@@ -161,8 +162,9 @@ def run_experiment(task_dir, task_spec, config=None, time_budget=300, recipe="si
         return {"skipped": f"leak_audit_failed: {exc}"}
     y_train = data["y_train"].reset_index(drop=True)
     fixed = {key: cfg.pop(key) for key in ("n_folds", "fold_seed", "n_jobs", "audit_required", "split")}
-    if task_spec.get("label_delay_unit"):
-        fixed["label_delay_unit"] = cfg.pop("label_delay_unit")
+    for key in ("label_delay_unit", "positive_class"):
+        if key in cfg:
+            fixed[key] = cfg.pop(key)
     split = fixed["split"]
 
     # Фолды одинаковые во всех экспериментах, иначе скоры несравнимы: агент их не меняет.
@@ -272,7 +274,7 @@ def _archive_metadata(result):
             "effective_seed": cfg.get("seed"), "effective_class_weight": cfg.get("class_weight"),
             "best_iterations": result.get("best_iterations", []), "fold_baselines": cfg.get("fold_baselines", []),
             "fold_windows": cfg.get("fold_windows", []), "early_stopping_windows": cfg.get("early_stopping_windows", []),
-            "target_bounds": result.get("target_bounds"),
+            "target_bounds": result.get("target_bounds"), "repair_filler": result.get("repair_filler", cfg.get("repair_filler")),
             "fold_target_bounds": result.get("fold_target_bounds"), "integer_target": result.get("integer_target"),
             "fold_integer_target": result.get("fold_integer_target"), "postprocess": result.get("postprocess")}
 
@@ -488,14 +490,17 @@ def _nonnegative(spec):
 def _write_submission(output_path, task_spec, data, result):
     """Сабмит по формату sample_submission: метки, вероятность одного класса или всех классов."""
     task_type = task_spec["task_type"]
-    probabilities = task_spec.get("probabilities", False)
+    regression = task_type == "regression"
+    probabilities = not regression and task_spec.get("probabilities", False)
     predictions = result["predictions"]
-    if task_type == "regression" and _nonnegative(task_spec):
-        predictions = np.asarray(predictions, dtype=float)
+    if regression and _nonnegative(task_spec) and np.asarray(predictions).dtype.kind in "iuf":
         predictions = np.where(np.isfinite(predictions), np.maximum(predictions, 0), predictions)
     sample = pd.read_csv(data["sample_path"], nrows=0)
     answer_count = len(sample.columns) - 1
-    if probabilities or answer_count > 1:
+    filler = result.get("repair_filler", result.get("config", {}).get("repair_filler"))
+    if regression and answer_count != 1:
+        return ["Неподдерживаемый формат: мультитаргетная регрессия"]
+    if not regression and (probabilities or answer_count > 1):
         predictions = result["probabilities"]
         probabilities = True
         if predictions is None:
@@ -508,10 +513,31 @@ def _write_submission(output_path, task_spec, data, result):
             if positive not in classes:
                 raise ValueError("positive_class отсутствует среди меток обучения.")
             predictions = predictions[:, classes.index(positive)]
-    labels = set(result["class_order"]) if task_type != "regression" and not probabilities else None
+            if filler is not None:
+                filler = filler[classes.index(positive)]
+    labels = set(result["class_order"]) if not regression and not probabilities else None
+    if labels is not None and filler is not None:
+        filler = result["class_order"][int(np.argmax(filler))]
+    if regression and "y_train" in data:
+        y = _fallback_labels(data, task_spec)
+        if len(y) and np.asarray(predictions).dtype.kind in "iuf":
+            center = float(y.median())
+            q1, q3 = y.quantile([.25, .75])
+            finite = np.asarray(predictions)[np.isfinite(predictions)]
+            scale = max(q3 - q1, abs(center) * .1, 1e-8)
+            if len(finite) and abs(float(np.median(finite)) - center) > 3 * scale:
+                print("Warning: PREDICTION_DRIFT regression median differs from train",
+                      file=sys.stderr, flush=True)
+    if probabilities and task_spec["metric"] == "logloss" and filler is not None:
+        values = np.asarray(predictions)
+        if values.dtype.kind in "iuf" and np.isfinite(values).all() and (
+                np.abs(values.mean(axis=0) - np.asarray(filler)) > .25).any():
+            print("Warning: PREDICTION_DRIFT mean probability differs from train prior",
+                  file=sys.stderr, flush=True)
     return make_submission(
         predictions, data["test_ids"], data["sample_path"], output_path,
         allowed_labels=labels, probabilities=probabilities, class_order=result["class_order"],
+        answer_kind="regression" if regression else "probabilities" if probabilities else "labels", filler=filler,
         publication_state=MODEL_SUCCESS, score=float(result["score"]),
     )
 
@@ -644,7 +670,8 @@ def run_ensemble(task_dir, task_spec, max_members=16, *, time_budget=None, refit
         labels = values if is_regression else order[stored.get("predicted_class", values.argmax(1))]
         params = row["config"] | {
             "task_type": task_spec["task_type"], "split": row.get("split"), "fold_windows": row.get("fold_windows", []),
-            "fold_baselines": row.get("fold_baselines", []), "n_folds": row["n_folds_done"],
+            "fold_baselines": row.get("fold_baselines", []), "repair_filler": row.get("repair_filler"),
+            "n_folds": row["n_folds_done"],
             "n_folds_done": row["n_folds_done"], "seed": 42, "fold_seed": 42,
             "model": row.get("effective_model") or row["config"].get("model") or "auto",
             "class_weight": row.get("effective_class_weight", row["config"].get("class_weight")),
@@ -680,7 +707,8 @@ def run_ensemble(task_dir, task_spec, max_members=16, *, time_budget=None, refit
             indices = [i]
             result = results[i] | {"config": results[i]["config"] | {"blend_type": "best_single", "blend_space": "prob"}}
             bounds = result["config"].get("target_bounds")
-            predict = lambda p: _constrain_ensemble(p[0], bounds, not is_regression, _nonnegative(task_spec))
+            predict = lambda p: _constrain_ensemble(p[0], bounds, not is_regression, _nonnegative(task_spec),
+                                                    result["config"].get("repair_filler"))
         elif (cfg.get("final_meta") and cfg.get("selected") and all(tag in positions for tag in cfg["selected"])
               and incumbent.get("preds_file") and Path(incumbent["preds_file"]).is_file()):
             indices = [positions[tag] for tag in cfg["selected"]]
@@ -772,10 +800,12 @@ def verify_template_output(sample_path, task_text, output):
     key = template_id(sample[ordered])
     answers = raw.columns.drop(key)
     metric = detect_metric(task_text)
-    proba = len(answers) > 1 or metric in PROBA_METRICS
-    if proba or metric in REGRESSION_METRICS:
+    regression = metric in REGRESSION_METRICS
+    proba = not regression and (len(answers) > 1 or metric in PROBA_METRICS)
+    if proba or regression:
         raw[answers] = raw[answers].apply(pd.to_numeric, errors="raise")
-    problems = validate_submission(raw, sample[key], list(sample), probabilities=proba)
+    kind = "regression" if regression else "probabilities" if proba else "labels"
+    problems = validate_submission(raw, sample[key], list(sample), answer_kind=kind)
     if metric in REGRESSION_METRICS and re.search(r"non[- ]?negative|неотрицательн", task_text, re.I):
         if (raw[answers] < 0).any().any():
             problems.append("negative regression prediction")
@@ -786,12 +816,17 @@ def verify_template_output(sample_path, task_text, output):
 
 
 def schema_fallback(sample_path, task, output):
-    from data_tools import detect_metric, PROBA_METRICS
+    from data_tools import detect_metric, PROBA_METRICS, REGRESSION_METRICS
     sample = pd.read_csv(sample_path, dtype=str, keep_default_na=False)
     key = template_id(sample)
     answer = [c for c in sample if c != key]
-    probabilities = len(answer) > 1 or detect_metric(task) in PROBA_METRICS
-    if len(answer) > 1:
+    metric = detect_metric(task)
+    regression = metric in REGRESSION_METRICS
+    probabilities = not regression and (len(answer) > 1 or metric in PROBA_METRICS)
+    kind = "regression" if regression else "probabilities" if probabilities else "labels"
+    if regression and len(answer) > 1:
+        values = np.ones((len(sample), len(answer)))
+    elif len(answer) > 1:
         values = np.full((len(sample), len(answer)), 1 / len(answer))
     elif probabilities:
         values = np.full(len(sample), 0.5)
@@ -799,36 +834,54 @@ def schema_fallback(sample_path, task, output):
         mode = sample[answer[0]].mode()
         label_metric = detect_metric(task) in ("f1", "macro_f1", "accuracy", "balanced_accuracy", "weighted_f1")
         values = np.full(len(sample), mode.iloc[0] if label_metric and len(mode) else 1.)
-    problems = make_submission(values, sample[key], sample_path, output, probabilities=probabilities,
+    problems = make_submission(values, sample[key], sample_path, output, answer_kind=kind,
                                publication_state=SCHEMA_FALLBACK)
     if problems:
         raise ValueError(problems)
     return key
 
 
+def _fallback_labels(data, task_spec, *, profile=False):
+    raw = data["y_train"]
+    y = raw.dropna()
+    if task_spec["task_type"] == "regression":
+        y = pd.to_numeric(y, errors="coerce")
+        y = y[np.isfinite(y)]
+    if task_spec.get("label_delay_unit") or (task_spec.get("audit_required") and "X_train" in data):
+        split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"),
+                             group_column=task_spec.get("group_column"))
+        if task_spec.get("label_delay_unit") and (not split or split["type"] != "time"):
+            raise ValueError("A duration target needs an event clock for the early submission")
+        if (split or {}).get("type") == "time":
+            from training import _time_values
+            col = split["column"]
+            train_time = _time_values(data["X_train"].loc[y.index, col])
+            test_time = _time_values(data["X_test"][col])
+            unit = task_spec.get("label_delay_unit")
+            available = label_available_at(train_time, y, unit) if unit else train_time
+            y = y[available < test_time.min()] if test_time.notna().all() else y.iloc[:0]
+            if profile:
+                past = _time_values(data["X_train"][col]).lt(test_time.min())
+                raw = raw.loc[past & (raw.isna() | raw.index.isin(y.index))]
+    if profile:
+        return y, float(raw.isna().mean()) if len(raw) else 0.
+    return y
+
+
 def write_fallback(task_dir, task_spec):
     """Всегда публикует прогноз текущего запуска по доступным обучающим меткам."""
     task_dir = Path(task_dir)
     data = load_data(task_dir, task_spec)
-    y = data["y_train"].dropna()
-    if task_spec["task_type"] == "regression":
-        y = pd.to_numeric(y, errors="coerce")
-        y = y[np.isfinite(y)]
-    if task_spec.get("label_delay_unit"):
-        split = detect_split(data["X_train"], data["X_test"], time_column=task_spec.get("time_column"))
-        if not split or split["type"] != "time":
-            raise ValueError("A duration target needs an event clock for the early submission")
-        col = split["column"]
-        train_time = parse_event_datetime(data["X_train"].loc[y.index, col])
-        test_time = parse_event_datetime(data["X_test"][col])
-        available = label_available_at(train_time, y, task_spec["label_delay_unit"])
-        y = y[available < test_time.min()] if test_time.notna().all() else y.iloc[:0]
+    y, missing_fraction = _fallback_labels(data, task_spec, profile=True)
     if y.empty:
         raise ValueError("No eligible training labels to calculate a fallback prediction")
     sample = pd.read_csv(data["sample_path"], nrows=0)
     n = len(data["test_ids"])
-    if task_spec["task_type"] == "regression":
-        value = float(y.median() if task_spec["metric"] == "mae" or _nonnegative(task_spec) else y.mean())
+    regression = task_spec["task_type"] == "regression"
+    if regression:
+        if len(sample.columns) != 2:
+            return ["Неподдерживаемый формат: мультитаргетная регрессия"]
+        value, reason = target_filler(y.to_numpy(), task_spec["metric"])
         if not np.isfinite(value):
             raise ValueError("Non-finite training statistic for the fallback prediction")
         predictions = np.full(n, max(0., value) if _nonnegative(task_spec) else value)
@@ -843,20 +896,27 @@ def write_fallback(task_dir, task_spec):
                 if len(class_order) == 1 and str(default) in {"0", "1", "-1"}:
                     default = "1" if isinstance(default, str) else 1
                 positive = task_spec.get("positive_class", default)
-                predictions = np.full(n, shares.get(positive, 0.0), dtype=float)
+                value = float(shares.get(positive, 0.0))
+                predictions = np.full(n, value, dtype=float)
             else:
                 answers = [c for c in sample.columns if c != data["id_column"]]
                 by_label = {str(label): share for label, share in shares.items()}
                 if not set(by_label).issubset(answers):
                     return ["Training classes are absent from the probability template"]
                 predictions = pd.DataFrame({col: np.full(n, by_label.get(col, 0.0)) for col in answers})
+                value = [float(by_label.get(col, 0.0)) for col in answers]
             labels = None
+            reason = "class_prior"
         else:
             probabilities, labels = False, set(class_order)
-            predictions = np.full(n, shares.idxmax(), dtype=object)
+            value, reason = shares.idxmax(), "mode"
+            predictions = np.full(n, value, dtype=object)
+    print(f"TRAIN_EDA available_labels={len(y)} target_missing_fraction={missing_fraction:.6f} "
+          f"fallback={value!r} reason={reason}", file=sys.stderr, flush=True)
     return make_submission(
         predictions, data["test_ids"], data["sample_path"], _output_path(task_dir),
         allowed_labels=labels, probabilities=probabilities, class_order=class_order,
+        answer_kind="regression" if regression else "probabilities" if probabilities else "labels",
         publication_state=TRAINED_FALLBACK,
     )
 
@@ -878,10 +938,13 @@ def check_result(task_dir, task_spec=None):
     if (not expected.is_unique or not test_ids.is_unique or expected.eq("").any()
             or set(expected) != set(test_ids)):
         raise RuntimeError("IDs in sample_submission and test must match and be unique")
-    probabilities = task_spec.get("probabilities", False) or len(sample.columns) > 2
     regression = task_spec["task_type"] == "regression"
+    probabilities = not regression and (task_spec.get("probabilities", False) or len(sample.columns) > 2)
     labels = set(data["y_train"].dropna()) if not regression and not probabilities else None
-    problems = validate_submission(frame, expected, sample.columns.tolist(), labels, probabilities)
+    if labels and all(isinstance(label, str) for label in labels):
+        frame = pd.read_csv(_output_path(task_dir), dtype=str, keep_default_na=False)
+    kind = "regression" if regression else "probabilities" if probabilities else "labels"
+    problems = validate_submission(frame, expected, sample.columns.tolist(), labels, answer_kind=kind)
     if regression and not problems:
         values = pd.to_numeric(frame.drop(columns=identifier).iloc[:, 0], errors="coerce")
         if not np.isfinite(values).all() or (_nonnegative(task_spec) and (values < 0).any()):
